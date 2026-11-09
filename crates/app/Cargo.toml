@@ -1,0 +1,25 @@
+[package]
+name = "rongo"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rongo-core.workspace = true
+rongo-shell.workspace = true
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "persistence"] }
+egui_extras = "0.36"
+egui = "0.36"
+egui-phosphor = "0.14"
+bson.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+crossbeam-channel.workspace = true
+rfd = "0.15"
+uuid = "1"
+directories = "6"
+memmap2 = "0.9"
+tokio.workspace = true

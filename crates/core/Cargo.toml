@@ -1,0 +1,29 @@
+[package]
+name = "rongo-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+crossbeam-channel.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bson.workspace = true
+mongodb.workspace = true
+futures-util = "0.3"
+rand = "0.9"
+regex = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+russh = { version = "0.64", default-features = false, features = ["ring", "rsa", "flate2"] }
+directories = "6"
+keyring = { version = "3", features = ["apple-native"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

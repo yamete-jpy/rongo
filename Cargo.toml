@@ -1,0 +1,33 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/shell", "crates/app"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+rongo-core = { path = "crates/core" }
+rongo-shell = { path = "crates/shell" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs"] }
+tokio-util = "0.7"
+crossbeam-channel = "0.5"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+# Key order is meaning in MongoDB (sorts, compound indexes and `_id`s).
+serde_json = { version = "1", features = ["preserve_order"] }
+bson = { version = "3", features = ["serde_json-1"] }
+mongodb = { version = "3.9", default-features = false, features = ["compat-3-3-0", "bson-3", "rustls-tls", "dns-resolver"] }
+
+# Enums with one large variant (FindSpec, profiles) cross channels a few times
+# per user action, so boxing them buys nothing.
+[workspace.lints.clippy]
+large_enum_variant = "allow"
+
+# Release builds: whole-program optimisation across crates and no debug
+# symbols in the binary. Thin LTO keeps build times reasonable.
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true

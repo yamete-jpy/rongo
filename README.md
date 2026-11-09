@@ -8,8 +8,11 @@ With [Homebrew](https://brew.sh), on a Mac with Apple silicon:
 
 ```sh
 brew tap yamete-jpy/rongo https://github.com/yamete-jpy/rongo
+brew trust --cask yamete-jpy/rongo/rongo
 brew install --cask rongo
 ```
+
+Homebrew only loads casks from other people's taps after `brew trust`.
 
 `brew upgrade --cask rongo` installs a newer release. You can also download the disk image from [Releases](https://github.com/yamete-jpy/rongo/releases) and drag rongo onto Applications.
 

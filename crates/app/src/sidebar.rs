@@ -476,7 +476,7 @@ fn conn_node(
             }
         });
         ui.separator();
-        if item(ui, icon::ARROWS_CLOCKWISE, "Refresh Selected Item", "") {
+        if item(ui, icon::ARROWS_CLOCKWISE, "Refresh Selected Item", "⇧⌘R") {
             actions.push(TreeAction::Refresh(cid));
         }
         if matches!(conn.status, Status::Failed(_)) && item(ui, icon::PLUG, "Reconnect", "") {

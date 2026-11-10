@@ -307,6 +307,9 @@ pub struct ResultView {
     /// Width of each toolbar group (paging, document buttons, view mode)
     /// as last drawn, to decide which share a row.
     toolbar_widths: [f32; 3],
+    /// Last page was pressed before the count was known: jump there when
+    /// the count arrives.
+    pending_last: bool,
     /// Bottom of the last JSON line drawn and of the visible area, last frame.
     #[cfg(test)]
     json_fill: Option<(f32, f32)>,
@@ -349,6 +352,7 @@ impl ResultView {
             json_all: false,
             json_top: 0,
             toolbar_widths: [0.0; 3],
+            pending_last: false,
             #[cfg(test)]
             json_fill: None,
         }
@@ -363,6 +367,7 @@ impl ResultView {
         self.total = None;
         // A count still running was for the old query.
         self.counting = None;
+        self.pending_last = false;
         self.set_drill(Vec::new());
         self.refresh();
     }
@@ -404,6 +409,8 @@ impl ResultView {
 
     fn fetch(&mut self, net: &mut Net) {
         self.needs_fetch = false;
+        // Any page change overrides a Last page still waiting for its count.
+        self.pending_last = false;
         self.refreshing = None;
         self.error = None;
         self.selected.clear();
@@ -495,7 +502,59 @@ impl ResultView {
                 Source::Find { max: Some(m), .. } => *m,
                 _ => u64::MAX,
             };
-            self.total = Some(n.min(cap));
+            let total = n.min(cap);
+            self.total = Some(total);
+            if std::mem::take(&mut self.pending_last)
+                && let Some(last) = self.last_offset()
+                && last > self.offset
+            {
+                self.offset = last;
+                self.needs_fetch = true;
+            }
+        }
+    }
+
+    /// Offset of the last page, once the count is known.
+    fn last_offset(&self) -> Option<u64> {
+        let page = self.page_size as u64;
+        self.total.filter(|t| *t > 0).map(|t| (t - 1) / page * page)
+    }
+
+    /// Last page is available whenever there are pages after this one,
+    /// counted or not.
+    fn can_go_last(&self) -> bool {
+        self.loading.is_none() && !self.pending_last && (self.has_more || self.last_offset().is_some_and(|l| l > self.offset))
+    }
+
+    /// Go to the last page, counting the documents first when that is not
+    /// known yet.
+    fn go_last(&mut self, net: &mut Net) {
+        if let Some(last) = self.last_offset().filter(|l| *l > self.offset) {
+            self.offset = last;
+            self.fetch(net);
+        } else if self.total.is_none()
+            && let Source::Find { conn, spec, .. } = &self.source
+        {
+            self.pending_last = true;
+            if self.counting.is_none() {
+                let cmd = Command::Count { ns: spec.ns.clone(), filter: spec.filter.clone() };
+                self.counting = Some(net.send(Origin::View(self.id, ViewReq::Count), Some(*conn), cmd));
+            }
+        }
+    }
+
+    /// A request of this view was cancelled from the status bar: stop
+    /// waiting for it and keep what is on screen.
+    pub fn on_cancelled(&mut self, req: RequestId) {
+        if self.loading == Some(req) {
+            self.loading = None;
+        }
+        if self.counting == Some(req) {
+            self.counting = None;
+            self.pending_last = false;
+        }
+        if self.refreshing == Some(req) {
+            self.refreshing = None;
         }
     }
 
@@ -507,6 +566,7 @@ impl ResultView {
             self.error = Some(err);
         } else if self.counting == Some(req) {
             self.counting = None;
+            self.pending_last = false;
             self.error = Some(err);
         }
     }
@@ -816,12 +876,9 @@ impl ResultView {
             self.offset += page;
             self.fetch(net);
         }
-        let last_offset = self.total.filter(|t| *t > 0).map(|t| (t - 1) / page * page);
-        let can_last = last_offset.is_some_and(|l| l > self.offset) && !loading;
-        let last_hint = if self.total.is_some() { "Last page" } else { "Last page (count documents first)" };
-        if ui.add_enabled(can_last, egui::Button::new(icon::CARET_LINE_RIGHT)).on_hover_text(last_hint).clicked() {
-            self.offset = last_offset.unwrap_or(0);
-            self.fetch(net);
+        let last_hint = if self.total.is_some() { "Last page" } else { "Last page (counts the documents first)" };
+        if ui.add_enabled(self.can_go_last(), egui::Button::new(icon::CARET_LINE_RIGHT)).on_hover_text(last_hint).clicked() {
+            self.go_last(net);
         }
         // Page size: type any number (Enter applies) or pick one from ▾.
         let mut size = self.page_size;
@@ -2047,6 +2104,73 @@ mod tests {
         // "x i" ends inside İ's lowercase form ("i" + combining dot): dropped.
         assert_eq!(find_matches(&tricky, "x i", false, &go), []);
         assert_eq!(find_matches(&tricky, "x i\u{307}", false, &go), [(0, 5, 9)]);
+    }
+
+    /// A page request discarded from the status bar stops the spinner and
+    /// keeps the rows already on screen.
+    #[test]
+    fn cancelled_page_keeps_the_rows() {
+        let raw = |n: i32| (0..n).map(|i| RawDocumentBuf::try_from(&doc! { "_id": i }).unwrap()).collect::<Vec<_>>();
+        let mut v = ResultView::new(1, "c", Source::Find { conn: ConnId(uuid::Uuid::nil()), spec: FindSpec::all(Namespace::new("db", "c"), 50), max: None });
+        v.needs_fetch = false;
+        v.loading = Some(1);
+        v.on_page(1, raw(5), false, 1);
+        v.loading = Some(2);
+        v.counting = Some(3);
+        v.on_cancelled(2);
+        assert_eq!((v.loading, v.rows.len(), v.error.as_deref()), (None, 5, None));
+        assert_eq!(v.counting, Some(3), "only the cancelled request");
+        v.on_cancelled(3);
+        assert_eq!(v.counting, None);
+    }
+
+    /// Last page works before Count Documents: it counts first, then
+    /// jumps. Paging elsewhere before the count returns cancels the jump.
+    #[test]
+    fn last_page_counts_first() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let core = rongo_core::CoreHandle::start(rt.handle().clone(), Arc::new(|| {}));
+        let (mut pending, mut next) = (HashMap::new(), 0);
+        let conn = ConnId(uuid::Uuid::nil());
+        let raw = |n: i32| (0..n).map(|i| RawDocumentBuf::try_from(&doc! { "_id": i }).unwrap()).collect::<Vec<_>>();
+        let mut v = ResultView::new(1, "c", Source::Find { conn, spec: FindSpec::all(Namespace::new("db", "c"), 50), max: None });
+        v.page_size = 50;
+        v.needs_fetch = false;
+        v.loading = Some(100);
+        v.on_page(100, raw(50), true, 1);
+        assert_eq!(v.total, None);
+        assert!(v.can_go_last(), "enabled before counting");
+
+        let mut net = Net { core: &core, pending: &mut pending, next_view_id: &mut next, keys_enabled: true };
+        v.go_last(&mut net);
+        let req = v.counting.expect("pressing Last starts a count");
+        assert!(!v.can_go_last(), "disabled while it counts");
+        assert_eq!(v.offset, 0);
+        v.on_count(req, 1234);
+        assert_eq!((v.offset, v.needs_fetch), (1200, true), "jumped to the page holding document 1234");
+
+        // Counted already: Last jumps straight there.
+        v.offset = 0;
+        v.needs_fetch = false;
+        v.loading = None;
+        v.go_last(&mut net);
+        assert_eq!(v.offset, 1200);
+        assert!(v.counting.is_none(), "no second count");
+
+        // Next page pressed while the count runs: the count does not move it.
+        v.set_spec(FindSpec::all(Namespace::new("db", "c"), 50));
+        v.loading = None;
+        v.has_more = true;
+        v.go_last(&mut net);
+        let req = v.counting.unwrap();
+        v.offset = 50;
+        v.fetch(&mut net);
+        v.loading = None;
+        v.on_count(req, 1234);
+        assert_eq!(v.offset, 50, "the later Next page wins");
+        assert_eq!(v.total, Some(1234));
     }
 
     /// Replies that belong to an older state of the view are not applied

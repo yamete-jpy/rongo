@@ -223,6 +223,20 @@ impl ShellTab {
         self.running.is_some()
     }
 
+    /// When the running script started, if one is running.
+    pub fn running_since(&self) -> Option<Instant> {
+        self.running.map(|(_, t)| t)
+    }
+
+    /// Interrupt the running script, as its Stop button does.
+    pub fn stop(&self) {
+        if self.running.is_some()
+            && let Some(s) = &self.shell
+        {
+            s.interrupt();
+        }
+    }
+
     fn start(&mut self, req: RunRequest, session: Option<Session>, waker: &Waker) {
         if self.shell.is_none() {
             match session {
@@ -327,8 +341,9 @@ impl ShellTab {
                     Err(e) => self.raw = format!("could not read {}: {e}\n", path.display()),
                 }
             }
+            // ⌘S belongs to a dialog on top (the document editor saves with it).
             let save = ui.button(format!("{}  Save file", icon::FLOPPY_DISK)).clicked()
-                || ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S));
+                || (net.keys_enabled && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)));
             if save {
                 let path = self.file.clone().or_else(|| rfd::FileDialog::new().add_filter("JavaScript", &["js"]).set_file_name("script.js").save_file());
                 if let Some(path) = path {
@@ -490,5 +505,28 @@ mod tests {
         }
         let settled = &heights[3..];
         assert!(settled.windows(2).all(|w| (w[0] - w[1]).abs() < 0.5), "split moved: {heights:?}");
+    }
+
+    /// With a dialog open over the shell, ⌘S is left for the dialog (the
+    /// document editor saves with it) instead of saving the script.
+    #[test]
+    fn command_s_is_left_for_a_dialog() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let core = rongo_core::CoreHandle::start(rt.handle().clone(), Arc::new(|| {}));
+        let mut pending = HashMap::new();
+        let mut next_view = 0;
+        let waker: Waker = Arc::new(|| {});
+        let mut tab = ShellTab::new(ConnId(uuid::Uuid::nil()), "test".into(), 7, "db.x.find()".into());
+        let ctx = egui::Context::default();
+        let m = Modifiers::COMMAND;
+        let events = vec![egui::Event::ModifiersChanged(m), egui::Event::Key { key: Key::S, physical_key: None, pressed: true, repeat: false, modifiers: m }];
+        let mut left = false;
+        let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+            let mut net = Net { core: &core, pending: &mut pending, next_view_id: &mut next_view, keys_enabled: false };
+            tab.ui(ui, &mut net, None, || None, &waker);
+            left = ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S));
+        });
+        out.textures_delta.clear();
+        assert!(left, "the dialog still gets ⌘S");
     }
 }

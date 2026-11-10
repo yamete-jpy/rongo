@@ -37,7 +37,7 @@ pub struct RongoApp {
     active_tab: usize,
     next_tab_id: u64,
     next_view_id: u64,
-    pending: HashMap<RequestId, Origin>,
+    pending: HashMap<RequestId, crate::net::Sent>,
     sidebar: Sidebar,
     /// Where the sidebar was last frame, so ⌘F over it goes to its search.
     sidebar_rect: egui::Rect,
@@ -232,6 +232,29 @@ impl RongoApp {
         }
     }
 
+    /// ⇧⌘R over the tree: reload what is under the selected item, as its
+    /// Refresh Selected Item menu entry does.
+    fn refresh_selected(&mut self) {
+        let crate::sidebar::Selection { conn: Some(cid), db, coll } = &self.sidebar.selection else { return };
+        let (cid, db, coll) = (*cid, db.clone(), coll.clone());
+        let Some(conn) = self.conns.get_mut(&cid) else { return };
+        match (db, coll) {
+            (Some(db), Some(coll)) => {
+                if let Some(c) = conn.db_mut(&db).and_then(|d| d.colls.as_mut()).and_then(|cs| cs.iter_mut().find(|c| c.info.name == coll)) {
+                    c.indexes = None;
+                    c.loading = false;
+                }
+            }
+            (Some(db), None) => {
+                if let Some(d) = conn.db_mut(&db) {
+                    d.colls = None;
+                    d.loading = false;
+                }
+            }
+            _ => self.refresh_tree(cid),
+        }
+    }
+
     fn refresh_tree(&mut self, cid: ConnId) {
         let Some(conn) = self.conns.get_mut(&cid) else { return };
         if let Some(dbs) = conn.dbs.as_mut() {
@@ -312,10 +335,101 @@ impl RongoApp {
         self.tabs.iter_mut().flat_map(|t| t.views_mut()).find(|v| v.id == id)
     }
 
+    // ------------------------------------------------------------ status bar
+
+    /// Running work the status bar shows, oldest first: requests that have
+    /// taken longer than a moment (quicker ones would only flicker) and
+    /// running scripts.
+    fn operations(&self, now: Instant) -> Vec<Operation> {
+        let name = |cid: Option<ConnId>| cid.and_then(|c| self.conns.get(&c)).map(|c| c.profile.name.clone());
+        let label = |what: &str, cid: Option<ConnId>| match name(cid) {
+            Some(n) => format!("{what} · {n}"),
+            None => what.to_string(),
+        };
+        let mut ops: Vec<Operation> = self
+            .pending
+            .iter()
+            .filter(|(_, s)| now.saturating_duration_since(s.started) >= SHOW_AFTER)
+            .filter_map(|(id, s)| Some(Operation { key: OpKey::Request(*id), text: label(s.what.as_deref()?, s.conn), started: s.started }))
+            .collect();
+        for t in &self.tabs {
+            if let TabKind::Shell(sh) = &t.kind
+                && let Some(started) = sh.running_since()
+            {
+                ops.push(Operation { key: OpKey::Script(t.id), text: label(&format!("Running a script on {}", sh.db), Some(sh.conn)), started });
+            }
+        }
+        ops.sort_by_key(|o| o.started);
+        ops
+    }
+
+    /// Discard an operation: cancel the request (its reply then says
+    /// cancelled) or interrupt the script.
+    fn cancel_op(&mut self, key: OpKey) {
+        match key {
+            OpKey::Request(id) => {
+                self.core.send(None, Command::Cancel(id));
+                if let Some(s) = self.pending.get_mut(&id) {
+                    s.what = None;
+                }
+            }
+            OpKey::Script(tab) => {
+                if let Some(TabKind::Shell(sh)) = self.tabs.iter().find(|t| t.id == tab).map(|t| &t.kind) {
+                    sh.stop();
+                }
+            }
+        }
+    }
+
+    /// The bar along the bottom: the latest operation still running, how
+    /// long it has taken, a button to discard it, and the others in a menu.
+    fn status_bar(&mut self, ui: &mut Ui) {
+        let now = Instant::now();
+        let ops = self.operations(now);
+        let mut cancel = None;
+        let discard = |ui: &mut Ui| {
+            ui.add(egui::Button::new(RichText::new(icon::X_CIRCLE).color(theme::ERROR).size(15.0)).frame(false))
+                .on_hover_text("Discard this operation")
+                .clicked()
+        };
+        ui.horizontal(|ui| {
+            ui.set_min_height(20.0);
+            let Some(op) = ops.last() else { return };
+            if discard(ui) {
+                cancel = Some(op.key);
+            }
+            busy_bar(ui);
+            ui.label(format!("{}…", op.text));
+            ui.label(RichText::new(elapsed(now.saturating_duration_since(op.started))).color(theme::MUTED));
+            if ops.len() > 1 {
+                ui.menu_button(format!("+{} more", ops.len() - 1), |ui| {
+                    for o in ops.iter().rev() {
+                        ui.horizontal(|ui| {
+                            if discard(ui) {
+                                cancel = Some(o.key);
+                                ui.close();
+                            }
+                            ui.label(&o.text);
+                            ui.label(RichText::new(elapsed(now.saturating_duration_since(o.started))).color(theme::MUTED));
+                        });
+                    }
+                });
+            }
+        });
+        if let Some(k) = cancel {
+            self.cancel_op(k);
+        }
+        if !ops.is_empty() {
+            ui.ctx().request_repaint_after(Duration::from_millis(33));
+        } else if let Some(next) = self.pending.values().filter(|s| s.what.is_some()).map(|s| s.started + SHOW_AFTER).min() {
+            ui.ctx().request_repaint_after(next.saturating_duration_since(now));
+        }
+    }
+
     // ------------------------------------------------------------ responses
 
     fn handle(&mut self, r: Response) {
-        let origin = self.pending.remove(&r.id).unwrap_or(Origin::None);
+        let origin = self.pending.remove(&r.id).map(|s| s.origin).unwrap_or(Origin::None);
         match (origin, r.event) {
             (Origin::None, _) => {}
             (Origin::Connect(cid), Event::Connected(info)) => {
@@ -429,10 +543,8 @@ impl RongoApp {
                 }
             }
             (Origin::View(vid, _), Event::Failed(e)) => {
-                if e != CoreError::Cancelled
-                    && let Some(v) = self.view_mut(vid)
-                {
-                    v.on_error(r.id, e.to_string());
+                if let Some(v) = self.view_mut(vid) {
+                    if e == CoreError::Cancelled { v.on_cancelled(r.id) } else { v.on_error(r.id, e.to_string()) }
                 }
             }
             // Replies go to the dialog that sent them; a dialog cancelled
@@ -1173,6 +1285,15 @@ impl RongoApp {
             self.sidebar.open = true;
             ctx.memory_mut(|m| m.request_focus(egui::Id::new("tree-search")));
         }
+        // Over the tree, ⌘R and ⇧⌘R refresh it (as its menus say) rather
+        // than the results.
+        if over_sidebar {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::R)) {
+                self.refresh_selected();
+            } else if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::R)) {
+                self.tree_action(TreeAction::RefreshAll);
+            }
+        }
         // ⌥⌘C arrives as a Copy event (like ⌘C); with ⌥ held it copies the
         // selected collection's name.
         let alt_copy = ctx.input(|i| i.modifiers.alt && i.modifiers.command && i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
@@ -1215,6 +1336,10 @@ impl eframe::App for RongoApp {
         egui::Panel::top("toolbar")
             .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(10, 6)))
             .show(ui, |ui| self.toolbar(ui));
+        egui::Panel::bottom("status-bar")
+            .resizable(false)
+            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(10, 3)))
+            .show(ui, |ui| self.status_bar(ui));
         egui::Panel::left("strip")
             .exact_size(26.0)
             .resizable(false)
@@ -1251,6 +1376,42 @@ impl eframe::App for RongoApp {
         self.dialogs(&ctx);
         self.toasts(&ctx);
     }
+}
+
+/// Requests quicker than this never show in the status bar.
+const SHOW_AFTER: Duration = Duration::from_millis(300);
+
+/// Something the status bar can discard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpKey {
+    Request(RequestId),
+    /// The script running in the shell tab with this tab id.
+    Script(u64),
+}
+
+struct Operation {
+    key: OpKey,
+    text: String,
+    started: Instant,
+}
+
+/// A bar with a block sliding along it: work is going on, length unknown.
+fn busy_bar(ui: &mut Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(110.0, 6.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 3.0, theme::RAISED);
+    let seg = 36.0;
+    let x = (ui.input(|i| i.time) as f32 * 0.8).fract() * (rect.width() + seg) - seg;
+    let block = egui::Rect::from_min_size(egui::pos2(rect.left() + x, rect.top()), egui::vec2(seg, rect.height())).intersect(rect);
+    if block.width() > 0.0 {
+        painter.rect_filled(block, 3.0, theme::ACCENT);
+    }
+}
+
+/// "4s", "2m 05s".
+fn elapsed(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 { format!("{s}s") } else { format!("{}m {:02}s", s / 60, s % 60) }
 }
 
 /// A one-line summary of a write's outcome for a toast.
@@ -1340,6 +1501,102 @@ mod tests {
         }
         assert!(app.connect_dialog.is_none());
         assert!(app.conns.contains_key(&a.conn_id()) && app.conns.contains_key(&b.conn_id()), "both opened");
+    }
+
+    /// A request that takes more than a moment shows along the bottom with
+    /// its connection's name and how long it has run; ✕ cancels it and it
+    /// leaves the bar at once. Quick requests and background work never show.
+    #[test]
+    fn status_bar_shows_and_discards_slow_work() {
+        use crate::net::Sent;
+        let ctx = egui::Context::default();
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = RongoApp::new(&cc, rt, false);
+        let p = ConnectionProfile { name: "alpha".into(), ..ConnectionProfile::mock() };
+        let cid = p.conn_id();
+        app.conns.insert(cid, OpenConn::new(p));
+        let ago = |ms| Instant::now() - Duration::from_millis(ms);
+        let slow = Sent { conn: Some(cid), what: Some("Running find on db.c".into()), started: ago(2500), ..Sent::new(Origin::View(1, ViewReq::Page)) };
+        let quick = Sent { conn: Some(cid), what: Some("Loading databases".into()), started: ago(50), ..Sent::new(Origin::Databases(cid)) };
+        let unseen = Sent { conn: Some(cid), what: None, started: ago(5000), ..Sent::new(Origin::Fields(cid, Namespace::new("db", "c"))) };
+        app.pending.insert(41, slow);
+        app.pending.insert(42, quick);
+        app.pending.insert(43, unseen);
+
+        let ops = app.operations(Instant::now());
+        assert_eq!(ops.iter().map(|o| o.text.as_str()).collect::<Vec<_>>(), ["Running find on db.c · alpha"]);
+
+        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 30.0)));
+        let draw = |app: &mut RongoApp, events: Vec<egui::Event>| {
+            let mut out = ctx.run_ui(egui::RawInput { screen_rect: screen, events, ..Default::default() }, |ui| app.status_bar(ui));
+            out.textures_delta.clear();
+            let mut texts = Vec::new();
+            for s in &out.shapes {
+                if let egui::Shape::Text(t) = &s.shape {
+                    texts.push((t.galley.text().to_string(), t.visual_bounding_rect().center()));
+                }
+            }
+            texts
+        };
+        let texts = draw(&mut app, vec![]);
+        assert!(texts.iter().any(|(t, _)| t == "Running find on db.c · alpha…"), "{texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == "2s"), "how long it has run: {texts:?}");
+        let (_, x) = texts.iter().find(|(t, _)| t == icon::X_CIRCLE).cloned().expect("a discard button");
+        let press = |pressed| egui::Event::PointerButton { pos: x, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        draw(&mut app, vec![egui::Event::PointerMoved(x), press(true)]);
+        draw(&mut app, vec![press(false)]);
+        assert!(app.operations(Instant::now()).is_empty(), "discarded");
+        assert!(app.pending.contains_key(&41), "its reply (cancelled) still finds its way back");
+        let texts = draw(&mut app, vec![]);
+        assert!(!texts.iter().any(|(t, _)| t.contains("Running find")), "{texts:?}");
+    }
+
+    /// ⌘R and ⇧⌘R do what the tree's menus say when the pointer is over
+    /// the tree: ⇧⌘R reloads the selected database's collections, ⌘R
+    /// reloads every connection. Away from the tree they are left for the
+    /// results.
+    #[test]
+    fn tree_refresh_shortcuts() {
+        use crate::sidebar::{CollNode, DbNode, OpenConn};
+        use rongo_core::{CollInfo, CollKind, DbInfo};
+        let ctx = egui::Context::default();
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = RongoApp::new(&cc, rt, false);
+        let p = ConnectionProfile::mock();
+        let cid = p.conn_id();
+        let mut conn = OpenConn::new(p);
+        let coll = CollNode::new(CollInfo { name: "c".into(), kind: CollKind::Collection });
+        conn.dbs = Some(vec![DbNode { info: DbInfo { name: "db".into(), size_on_disk: 0 }, colls: Some(vec![coll]), loading: false }]);
+        app.conns.insert(cid, conn);
+        app.sidebar.open = true;
+        app.sidebar.selection = crate::sidebar::Selection { conn: Some(cid), db: Some("db".into()), coll: None };
+        app.sidebar_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 600.0));
+
+        let press = |app: &mut RongoApp, at: egui::Pos2, m: Modifiers| {
+            let key = egui::Event::Key { key: Key::R, physical_key: None, pressed: true, repeat: false, modifiers: m };
+            let events = vec![egui::Event::PointerMoved(at), egui::Event::ModifiersChanged(m), key];
+            let mut left = false;
+            let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                app.shortcuts(ui.ctx());
+                left = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { key: Key::R, .. })));
+            });
+            out.textures_delta.clear();
+            left
+        };
+        let colls = |app: &RongoApp| app.conns[&cid].dbs.as_ref().unwrap()[0].colls.is_some();
+        let over = egui::pos2(100.0, 100.0);
+        let away = egui::pos2(500.0, 100.0);
+
+        assert!(press(&mut app, away, Modifiers::COMMAND | Modifiers::SHIFT), "left for the results");
+        assert!(colls(&app), "away from the tree, the tree is untouched");
+        assert!(!press(&mut app, over, Modifiers::COMMAND | Modifiers::SHIFT), "the tree took ⇧⌘R");
+        assert!(!colls(&app), "the database's collections will reload");
+        assert!(!app.conns[&cid].loading_dbs, "only the selected database");
+
+        assert!(!press(&mut app, over, Modifiers::COMMAND), "the tree took ⌘R");
+        assert!(app.conns[&cid].loading_dbs, "every connection reloads");
     }
 
     /// Run the whole app (demo server, theme, sidebar, shell results, a
@@ -1440,10 +1697,10 @@ mod tests {
         let mut update = ToolDialog::bulk(cid, ns.clone(), None, false, Vec::new(), doc! {}, None);
         update.running = Some(901);
         app.tool = Some(update);
-        app.pending.insert(900, Origin::Tool { view: None, tree: None });
+        app.pending.insert(900, crate::net::Sent::new(Origin::Tool { view: None, tree: None }));
         app.handle(Response { id: 900, conn: Some(cid), event: Event::Exported { count: 3, path: "/tmp/x.json".into() } });
         assert!(app.tool.as_ref().is_some_and(|t| t.running == Some(901)), "the Update dialog stayed open and busy");
-        app.pending.insert(902, Origin::Tool { view: None, tree: None });
+        app.pending.insert(902, crate::net::Sent::new(Origin::Tool { view: None, tree: None }));
         app.handle(Response { id: 902, conn: Some(cid), event: Event::Failed(CoreError::Other("old".into())) });
         assert!(app.tool.as_ref().is_some_and(|t| t.error.is_none()), "an old failure isn't shown in it");
 
@@ -1451,10 +1708,10 @@ mod tests {
         let mut d = DocDialog::edit(cid, ns.clone(), &doc! { "_id": 1 }, None);
         d.saving = Some(911);
         app.doc_dialog = Some(d);
-        app.pending.insert(910, Origin::Save { view: None });
+        app.pending.insert(910, crate::net::Sent::new(Origin::Save { view: None }));
         app.handle(Response { id: 910, conn: Some(cid), event: Event::Written(Default::default()) });
         assert!(app.doc_dialog.is_some(), "another document's save didn't close this editor");
-        app.pending.insert(911, Origin::Save { view: None });
+        app.pending.insert(911, crate::net::Sent::new(Origin::Save { view: None }));
         app.handle(Response { id: 911, conn: Some(cid), event: Event::Written(Default::default()) });
         assert!(app.doc_dialog.is_none(), "its own save did");
     }

@@ -1,6 +1,6 @@
 cask "rongo" do
-  version "0.1.1"
-  sha256 "2a7d92deff3f8f6fdc320ec1f74e555861eef7fd80409ff1669966db6e370d39"
+  version "0.1.2"
+  sha256 "ec44b738ac9bc7f2a55e06d927c3656e027163d7b7d65899a21e979a3216d800"
 
   url "https://github.com/yamete-jpy/rongo/releases/download/v#{version}/rongo-#{version}-arm64.dmg"
   name "rongo"

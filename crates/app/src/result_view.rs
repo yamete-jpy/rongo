@@ -1,7 +1,7 @@
 //! A page of documents with Table, Tree and JSON views. Used by collection
 //! tabs, shell result tabs and info tabs.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use egui::{Align, Align2, Color32, Event, Key, Layout, Modifiers, RichText, Sense, Ui, pos2, vec2};
@@ -304,6 +304,14 @@ pub struct ResultView {
     json_all: bool,
     /// First JSON line in view last frame, where a new search starts.
     json_top: usize,
+    /// Column order chosen by dragging headers, per drill level (keyed by
+    /// the drill path). Columns not in the list keep their own order, after.
+    col_order: HashMap<String, Vec<String>>,
+    /// Each column's width as last drawn, so a column keeps its width when
+    /// it moves (the table's own widths go by position).
+    col_widths: HashMap<String, f32>,
+    /// The header being dragged.
+    dragging_col: Option<String>,
     /// Width of each toolbar group (paging, document buttons, view mode)
     /// as last drawn, to decide which share a row.
     toolbar_widths: [f32; 3],
@@ -313,6 +321,9 @@ pub struct ResultView {
     /// Bottom of the last JSON line drawn and of the visible area, last frame.
     #[cfg(test)]
     json_fill: Option<(f32, f32)>,
+    /// Header cells as last drawn.
+    #[cfg(test)]
+    header_rects: Vec<(String, egui::Rect)>,
 }
 
 impl ResultView {
@@ -351,10 +362,15 @@ impl ResultView {
             refreshing: None,
             json_all: false,
             json_top: 0,
+            col_order: HashMap::new(),
+            col_widths: HashMap::new(),
+            dragging_col: None,
             toolbar_widths: [0.0; 3],
             pending_last: false,
             #[cfg(test)]
             json_fill: None,
+            #[cfg(test)]
+            header_rects: Vec::new(),
         }
     }
 
@@ -686,6 +702,31 @@ fn resolve<'a>(docs: &'a Docs, drill: &[Step]) -> Rows<'a> {
 
 impl ResultView {
     /// Dotted prefix shared by every row, when the drill path is all fields.
+    fn order_key(&self) -> String {
+        format!("{:?}", self.drill)
+    }
+
+    /// `cols` in the order the user dragged them into at this drill level.
+    fn ordered(&self, mut cols: Vec<String>) -> Vec<String> {
+        if let Some(order) = self.col_order.get(&self.order_key()) {
+            cols.sort_by_key(|c| order.iter().position(|o| o == c).unwrap_or(usize::MAX));
+        }
+        cols
+    }
+
+    /// Move column `from` to just before `before` (`None`: to the end).
+    fn move_column(&mut self, from: &str, before: Option<&str>) {
+        let all = self.columns_cache.clone().unwrap_or_default();
+        let mut order = self.ordered(all);
+        if !order.iter().any(|c| c == from) || before == Some(from) {
+            return;
+        }
+        order.retain(|c| c != from);
+        let at = before.and_then(|b| order.iter().position(|c| c == b)).unwrap_or(order.len());
+        order.insert(at, from.to_string());
+        self.col_order.insert(self.order_key(), order);
+    }
+
     fn shared_prefix(&self) -> Option<String> {
         self.drill.iter().try_fold(String::new(), |acc, s| match s {
             Step::Field(f) => Some(join(&acc, f)),
@@ -1161,6 +1202,11 @@ impl ResultView {
                     self.hidden.clear();
                     ui.close();
                 }
+                let key = self.order_key();
+                if ui.add_enabled(self.col_order.contains_key(&key), egui::Button::new("Reset Column Order")).on_hover_text("Drag a column header to move it").clicked() {
+                    self.col_order.remove(&key);
+                    ui.close();
+                }
             });
         }
         ui.menu_button(format!("{}  Copy", icon::CLIPBOARD_TEXT), |ui| {
@@ -1258,7 +1304,8 @@ impl ResultView {
         // for the context menu and nothing is cloned per frame.
         let data = self.rows.clone();
         let rows = resolve(&data, &self.drill);
-        let mut columns = self.columns(&rows);
+        let all = self.columns(&rows);
+        let mut columns = self.ordered(all);
         columns.retain(|c| !self.hidden.contains(c));
         let mut clicked: Option<(usize, String, Modifiers)> = None;
         let mut double: Option<(usize, String)> = None;
@@ -1277,10 +1324,23 @@ impl ResultView {
             })
             .collect();
         let mut header_click: Option<(String, Option<i32>)> = None;
+        // Header cells as drawn, for dropping a dragged header between them.
+        let mut header_rects: Vec<(String, egui::Rect)> = Vec::new();
+        let mut drag_started: Option<String> = None;
+        let mut drag_stopped = false;
+        let widths = self.col_widths.clone();
+        // The table keeps widths by position: a new order starts a new
+        // table, with each column at the width it had.
+        let order_salt = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            columns.hash(&mut h);
+            h.finish()
+        };
 
         egui::ScrollArea::horizontal().id_salt((self.id, "hscroll", depth)).auto_shrink([false, false]).show(ui, |ui| {
             let mut table = TableBuilder::new(ui)
-                .id_salt((self.id, "table", depth, columns.len()))
+                .id_salt((self.id, "table", depth, order_salt))
                 .striped(true)
                 .resizable(true)
                 .sense(Sense::click())
@@ -1288,22 +1348,41 @@ impl ResultView {
                 .auto_shrink([false, false])
                 .min_scrolled_height(0.0);
             for c in &columns {
-                let w = if c == "_id" { 210.0 } else { 160.0 };
+                let w = widths.get(c).copied().unwrap_or(if c == "_id" { 210.0 } else { 160.0 });
                 table = table.column(Column::initial(w).at_least(40.0).clip(true).resizable(true));
             }
             table = table.column(Column::remainder().at_least(20.0));
             table
                 .header(24.0, |mut header| {
                     for (c, (path, dir)) in columns.iter().zip(&sorts) {
-                        let (_, resp) = header.col(|ui| {
+                        let mut resp = None;
+                        let mut rect = egui::Rect::NOTHING;
+                        header.col(|ui| {
+                            // The whole cell, at the column's width (what
+                            // `col` returns is only the part used).
+                            rect = ui.max_rect();
                             ui.add(egui::Label::new(RichText::new(c).color(theme::TEXT).strong()).selectable(false));
                             if let Some(d) = dir {
                                 ui.label(RichText::new(if *d > 0 { icon::CARET_UP } else { icon::CARET_DOWN }).color(theme::ACCENT));
                             }
+                            // Click sorts, drag moves the column. (The column
+                            // resize handles are added later, so they win at
+                            // the edges.)
+                            resp = Some(ui.interact(ui.max_rect(), ui.id().with(("header", c)), Sense::click_and_drag()));
                         });
+                        header_rects.push((c.clone(), rect));
+                        let Some(resp) = resp else { continue };
+                        if resp.drag_started() {
+                            drag_started = Some(c.clone());
+                        }
+                        if resp.drag_stopped() {
+                            drag_stopped = true;
+                        }
+                        let cursor = if resp.dragged() { egui::CursorIcon::Grabbing } else if path.is_some() { egui::CursorIcon::PointingHand } else { egui::CursorIcon::Grab };
+                        let resp = resp.on_hover_cursor(cursor);
                         // Click: ascending, then descending, then unsorted.
                         if let Some(p) = path
-                            && resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+                            && resp.clicked()
                         {
                             let next = match dir {
                                 None => Some(1),
@@ -1359,6 +1438,41 @@ impl ResultView {
 
         if let Some((path, dir)) = header_click {
             self.sort_by(path, dir, actions);
+        }
+        // Remember widths (by name) so a moved column keeps its own.
+        if !ui.is_sizing_pass() {
+            for (c, r) in &header_rects {
+                self.col_widths.insert(c.clone(), r.width());
+            }
+        }
+        if let Some(c) = drag_started {
+            self.dragging_col = Some(c);
+        }
+        #[cfg(test)]
+        {
+            self.header_rects = header_rects.clone();
+        }
+        if let Some(from) = self.dragging_col.clone() {
+            // Drop before the first header whose middle is right of the pointer.
+            let x = ui.ctx().pointer_latest_pos().map(|p| p.x);
+            let before = x.and_then(|x| header_rects.iter().find(|(_, r)| r.center().x > x)).map(|(c, _)| c.clone());
+            if drag_stopped || !ui.input(|i| i.pointer.any_down()) {
+                self.dragging_col = None;
+                self.move_column(&from, before.as_deref());
+            } else if let Some(first) = header_rects.first().map(|(_, r)| *r) {
+                // Where it would land: a line between two headers.
+                let line_x = match &before {
+                    Some(b) => header_rects.iter().find(|(c, _)| c == b).map(|(_, r)| r.left()),
+                    None => header_rects.last().map(|(_, r)| r.right()),
+                };
+                if let Some(lx) = line_x {
+                    let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new((self.id, "col-drop"))));
+                    painter.line_segment([pos2(lx, first.top()), pos2(lx, first.bottom())], egui::Stroke::new(2.0, theme::ACCENT));
+                    if let Some(p) = ui.ctx().pointer_latest_pos() {
+                        painter.text(p + vec2(12.0, 8.0), Align2::LEFT_TOP, &from, egui::FontId::proportional(13.0), theme::TEXT);
+                    }
+                }
+            }
         }
         if let Some((i, col, m)) = clicked {
             self.click_row(i, m);
@@ -2313,6 +2427,97 @@ mod perf {
         let Source::Find { spec, .. } = &v.source else { unreachable!() };
         assert_eq!(spec.sort, Some(doc! { "name": 1 }), "the query is re-run sorted");
         assert!(actions.iter().any(|(_, a)| matches!(a, ViewAction::SortChanged(s) if *s == doc! { "name": 1 })), "the Sort field shows it");
+    }
+
+    /// Dragging a header moves its column: it lands where the blue line
+    /// shows, keeps its own width, and stays put on the next page. A plain
+    /// click still sorts (header_click_sorts).
+    #[test]
+    fn header_drag_moves_the_column() {
+        use std::collections::HashMap;
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let core = rongo_core::CoreHandle::start(rt.handle().clone(), std::sync::Arc::new(|| {}));
+        let (mut pending, mut next) = (HashMap::new(), 0);
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let names = ["_id", "name", "img", "zone"];
+        // One frame; returns each header's rect (text centre and the cell's width), left to right.
+        let mut frame = |v: &mut ResultView, events: Vec<Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                let mut net = Net { core: &core, pending: &mut pending, next_view_id: &mut next, keys_enabled: true };
+                v.ui(ui, &mut net);
+            });
+            out.textures_delta.clear();
+            let mut heads: Vec<(String, egui::Pos2)> = out
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if names.contains(&t.galley.text()) && t.pos.y < 120.0 => Some((t.galley.text().to_string(), t.pos + t.galley.rect.center().to_vec2())),
+                    _ => None,
+                })
+                .collect();
+            heads.sort_by(|a, b| a.1.x.total_cmp(&b.1.x));
+            heads
+        };
+        let order = |h: &[(String, egui::Pos2)]| h.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+        let at = |h: &[(String, egui::Pos2)], n: &str| h.iter().find(|(c, _)| c == n).unwrap().1;
+        let docs: Vec<Document> = (0..3).map(|i| doc! { "_id": i, "name": format!("n{i}"), "img": i, "zone": "z" }).collect();
+        let mut v = ResultView::new(1, "t", Source::Static { docs, truncated: false });
+        for _ in 0..3 {
+            frame(&mut v, vec![]);
+        }
+        let heads = frame(&mut v, vec![]);
+        assert_eq!(order(&heads), ["_id", "name", "img", "zone"]);
+        let id_width = v.col_widths["_id"];
+        assert!(id_width > 200.0, "_id starts wider: {id_width}");
+
+        // Drag _id to between img and zone.
+        let from = at(&heads, "_id");
+        let to = pos2((at(&heads, "img").x + at(&heads, "zone").x) / 2.0 + 30.0, from.y);
+        let button = |pos, pressed| Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        frame(&mut v, vec![Event::PointerMoved(from)]);
+        frame(&mut v, vec![button(from, true)]);
+        for k in 1..=6 {
+            frame(&mut v, vec![Event::PointerMoved(from + (to - from) * (k as f32 / 6.0))]);
+        }
+        assert_eq!(v.dragging_col.as_deref(), Some("_id"), "a drag, not a click");
+        frame(&mut v, vec![button(to, false)]);
+        for _ in 0..3 {
+            frame(&mut v, vec![]);
+        }
+        let heads = frame(&mut v, vec![]);
+        assert_eq!(order(&heads), ["name", "img", "_id", "zone"]);
+        assert!(v.dragging_col.is_none());
+        assert!((v.col_widths["_id"] - id_width).abs() < 1.0, "_id kept its width: {} vs {id_width}", v.col_widths["_id"]);
+        assert!(v.col_widths["name"] < 200.0, "the first column didn't take _id's width");
+        let Source::Static { .. } = &v.source else { unreachable!() };
+        assert!(v.local_sort.is_none(), "dragging didn't sort");
+
+        // The order holds for the next page of the same result.
+        v.refresh();
+        frame(&mut v, vec![]);
+        let heads = frame(&mut v, vec![]);
+        assert_eq!(order(&heads), ["name", "img", "_id", "zone"]);
+
+        // Dragging the edge between two headers still resizes, and moves nothing.
+        let name_w = v.col_widths["name"];
+        let cell = v.header_rects.iter().find(|(c, _)| c == "name").unwrap().1;
+        let edge = pos2(cell.right() + 2.0, cell.center().y);
+        frame(&mut v, vec![Event::PointerMoved(edge)]);
+        frame(&mut v, vec![button(edge, true)]);
+        for k in 1..=6 {
+            frame(&mut v, vec![Event::PointerMoved(edge + vec2(10.0 * k as f32, 0.0))]);
+        }
+        frame(&mut v, vec![button(edge + vec2(60.0, 0.0), false)]);
+        frame(&mut v, vec![]);
+        let heads = frame(&mut v, vec![]);
+        assert_eq!(order(&heads), ["name", "img", "_id", "zone"], "resizing moved nothing");
+        assert!(v.col_widths["name"] > name_w + 40.0, "name was widened: {name_w} -> {}", v.col_widths["name"]);
     }
 
     /// The selected cell's outline covers the whole cell and is clipped like

@@ -143,7 +143,7 @@ impl SettingsDialog {
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button(RichText::new("Save").strong()).clicked() {
+                    if ui.add(crate::theme::primary_button("Save", false)).clicked() {
                         let mut s = self.draft.clone();
                         s.timezone = self.timezone();
                         action = Some(SettingsAction::Save(s));

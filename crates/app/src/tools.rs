@@ -134,6 +134,14 @@ impl ToolDialog {
     fn ready(&self) -> bool {
         match &self.kind {
             ToolKind::Index(f) => f.ready(),
+            // An empty query over every document waits for its box to be
+            // ticked (known from the form, which parses the query only when
+            // it changes).
+            ToolKind::Bulk(b) => {
+                let empty = b.empty_query.as_ref().is_some_and(|(text, empty)| *text == b.filter && *empty);
+                !(empty && b.multi && !b.confirmed)
+            }
+            ToolKind::Export { path, .. } | ToolKind::Import { path, .. } => !path.trim().is_empty(),
             _ => true,
         }
     }
@@ -280,8 +288,7 @@ impl ToolDialog {
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let danger = matches!(&self.kind, ToolKind::Bulk(b) if b.delete);
-                    let label = if danger { RichText::new(primary).color(theme::ERROR).strong() } else { RichText::new(primary).strong() };
-                    if ui.add_enabled(!busy && self.ready(), egui::Button::new(label)).clicked() {
+                    if ui.add_enabled(!busy && self.ready(), theme::primary_button(primary, danger)).clicked() {
                         match self.build() {
                             Ok(cmd) => {
                                 self.error = None;
@@ -660,6 +667,34 @@ mod tests {
         b.pipeline = false;
         b.update = "{ name: 1 }".into();
         assert!(d.build().unwrap_err().contains("update operators"));
+    }
+
+    /// The main button waits until it can work: Delete over every document
+    /// until its box is ticked, Export until a file is chosen.
+    #[test]
+    fn main_button_waits_until_ready() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let show = |d: &mut ToolDialog| {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| _ = d.show(ui.ctx()));
+            out.textures_delta.clear();
+        };
+        let mut d = ToolDialog::bulk(ConnId(uuid::Uuid::nil()), Namespace::new("db", "c"), None, true, Vec::new(), Document::new(), None);
+        show(&mut d);
+        assert!(!d.ready(), "an empty query over every document needs the box first");
+        bulk(&mut d).confirmed = true;
+        assert!(d.ready());
+        bulk(&mut d).confirmed = false;
+        bulk(&mut d).filter = "{ code: 1 }".into();
+        show(&mut d);
+        assert!(d.ready(), "a real query needs no box");
+
+        let mut e = ToolDialog::export(ConnId(uuid::Uuid::nil()), FindSpec::all(Namespace::new("db", "c"), 50), false);
+        assert!(!e.ready(), "no file yet");
+        if let ToolKind::Export { path, .. } = &mut e.kind {
+            *path = "/tmp/x.json".into();
+        }
+        assert!(e.ready());
     }
 
     #[test]

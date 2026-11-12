@@ -237,6 +237,13 @@ pub fn discard_button(ui: &mut egui::Ui) -> bool {
         .clicked()
 }
 
+/// The button for a dialog's main action: filled with the accent colour,
+/// or red when it destroys something, so the eye finds it first.
+pub fn primary_button(text: impl Into<String>, danger: bool) -> egui::Button<'static> {
+    let fill = if danger { Color32::from_rgb(0xc4, 0x3c, 0x3c) } else { Color32::from_rgb(0x2f, 0x6f, 0xd6) };
+    egui::Button::new(egui::RichText::new(text).strong().color(Color32::WHITE)).fill(fill)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

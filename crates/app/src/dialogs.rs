@@ -230,9 +230,12 @@ impl ConnectDialog {
 
     pub fn show(&mut self, ctx: &Context, profiles: &[ConnectionProfile]) -> Vec<ConnectAction> {
         let mut actions = Vec::new();
+        // Never wider or taller than the window: a centred dialog wider
+        // than the window loses both edges, the checkboxes with them.
+        let screen = ctx.content_rect().size();
         let modal = Modal::new(Id::new("connect-dialog")).show(ctx, |ui| {
-            ui.set_width(760.0);
-            ui.set_min_height(420.0);
+            ui.set_width(760.0f32.min(screen.x - 40.0).max(240.0));
+            ui.set_min_height(420.0f32.min(screen.y - 80.0).max(200.0));
             match &mut self.form {
                 None => self.list(ui, profiles, &mut actions),
                 Some(_) => self.edit(ui, &mut actions),
@@ -267,7 +270,7 @@ impl ConnectDialog {
     fn list(&mut self, ui: &mut Ui, profiles: &[ConnectionProfile], actions: &mut Vec<ConnectAction>) {
         ui.heading(format!("{}  Connection Manager", icon::PLUGS_CONNECTED));
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button(format!("{}  New connection", icon::PLUS)).clicked() {
                 self.form = Some(Form::from_profile(&ConnectionProfile::new("New connection"), true));
                 self.test = TestState::Idle;
@@ -301,7 +304,8 @@ impl ConnectDialog {
         });
         ui.separator();
         let list_h = ui.available_height() - 40.0;
-        egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
+        // Both ways: a narrow window scrolls the columns instead of cutting them.
+        egui::ScrollArea::both().max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
             let mut rows = Vec::new();
             egui::Grid::new("profiles").num_columns(5).striped(true).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
                 let picked = profiles.iter().filter(|p| self.selected.contains(&p.id)).count();
@@ -369,9 +373,6 @@ impl ConnectDialog {
         });
         ui.separator();
         ui.horizontal(|ui| {
-            if profiles.len() > 1 {
-                ui.weak("Tick several to connect them together · drag a name to reorder");
-            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 // In list order, whatever order they were picked in.
                 let ids: Vec<Uuid> = profiles.iter().filter(|p| self.selected.contains(&p.id)).map(|p| p.id).collect();
@@ -379,11 +380,17 @@ impl ConnectDialog {
                     0 | 1 => format!("{}  Connect", icon::PLUG),
                     n => format!("{}  Connect {n}", icon::PLUG),
                 };
-                if ui.add_enabled(!ids.is_empty(), egui::Button::new(RichText::new(text).strong())).clicked() {
+                if ui.add_enabled(!ids.is_empty(), theme::primary_button(text, false)).clicked() {
                     actions.extend(ids.into_iter().map(ConnectAction::Connect));
                 }
                 if ui.button("Close").clicked() {
                     actions.push(ConnectAction::Close);
+                }
+                // The hint gets what the buttons leave, cut short if need be.
+                if profiles.len() > 1 {
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.add(egui::Label::new(RichText::new("Tick several to connect them together · drag a name to reorder").weak()).truncate());
+                    });
                 }
             });
         });
@@ -395,7 +402,8 @@ impl ConnectDialog {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label("Name");
-            ui.add(egui::TextEdit::singleline(&mut f.name).desired_width(320.0));
+            let w = (ui.available_width() - 60.0).clamp(120.0, 320.0);
+            ui.add(egui::TextEdit::singleline(&mut f.name).desired_width(w));
             ui.add_space(16.0);
             ui.label("Color");
             if let Some(c) = theme::color_swatches(ui, f.color.as_deref()) {
@@ -409,7 +417,10 @@ impl ConnectDialog {
             }
         });
         ui.separator();
-        let body_h = 250.0;
+        // The body takes the height the footer leaves, so the buttons sit at
+        // the bottom of the dialog rather than above an empty strip.
+        let notes = usize::from(f.error.is_some()) + usize::from(!matches!(self.test, TestState::Idle));
+        let body_h = (ui.available_height() - 46.0 - 24.0 * notes as f32).max(250.0);
         ui.allocate_ui(vec2(ui.available_width(), body_h), |ui| {
             ui.set_min_height(body_h);
             match f.tab {
@@ -471,7 +482,7 @@ impl ConnectDialog {
                         false
                     }
                 };
-                if ui.button(RichText::new(format!("{}  Save & Connect", icon::PLUG)).strong()).clicked() {
+                if ui.add(theme::primary_button(format!("{}  Save & Connect", icon::PLUG), false)).clicked() {
                     close = save(true, f);
                 }
                 if ui.button("Save").clicked() {
@@ -675,7 +686,7 @@ impl DocDialog {
                     ui.spinner();
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let save = ui.add_enabled(self.saving.is_none(), egui::Button::new(RichText::new("Save").strong()));
+                    let save = ui.add_enabled(self.saving.is_none(), theme::primary_button("Save", false));
                     let shortcut = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::S));
                     if save.clicked() || (shortcut && self.saving.is_none()) {
                         match rongo_shell::parse_document(&self.text) {
@@ -766,6 +777,9 @@ pub struct Confirm {
     pub input: Option<String>,
     /// An optional checkbox: (label, ticked).
     pub checkbox: Option<(String, bool)>,
+    /// The text that must be typed (exactly) before OK can be pressed,
+    /// such as a database's name before dropping it.
+    pub must_type: Option<String>,
 }
 
 pub enum ConfirmResult {
@@ -774,6 +788,16 @@ pub enum ConfirmResult {
 }
 
 impl Confirm {
+    /// OK waits for typed text, and for exactly the right text when a
+    /// name must be typed.
+    pub fn ok_enabled(&self) -> bool {
+        match (&self.input, &self.must_type) {
+            (Some(s), Some(want)) => s.trim() == want,
+            (Some(s), None) => !s.trim().is_empty(),
+            (None, _) => true,
+        }
+    }
+
     pub fn show(&mut self, ctx: &Context) -> Option<ConfirmResult> {
         let mut result = None;
         let modal = Modal::new(Id::new("confirm")).show(ctx, |ui| {
@@ -784,7 +808,7 @@ impl Confirm {
             if let Some(input) = &mut self.input {
                 let r = ui.add(egui::TextEdit::singleline(input).desired_width(f32::INFINITY));
                 r.request_focus();
-                if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && !input.trim().is_empty() {
+                if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && !input.trim().is_empty() && self.must_type.as_ref().is_none_or(|want| input.trim() == want) {
                     result = Some(ConfirmResult::Yes);
                 }
             }
@@ -795,10 +819,8 @@ impl Confirm {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let text = RichText::new(&self.ok_label).strong();
-                    let label = if self.danger { text.color(theme::ERROR) } else { text };
-                    let ok_enabled = self.input.as_ref().is_none_or(|s| !s.trim().is_empty());
-                    if ui.add_enabled(ok_enabled, egui::Button::new(label)).clicked() {
+                    let ok_enabled = self.ok_enabled();
+                    if ui.add_enabled(ok_enabled, theme::primary_button(self.ok_label.clone(), self.danger)).clicked() {
                         result = Some(ConfirmResult::Yes);
                     }
                     if ui.button("Cancel").clicked() {
@@ -819,6 +841,49 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    /// In a window narrower than the dialog, the dialog shrinks to fit:
+    /// every row's checkbox and the Connect button stay on screen and work,
+    /// and the columns scroll instead of being cut.
+    #[test]
+    fn manager_fits_a_narrow_window() {
+        let ctx = Context::default();
+        theme::install(&ctx);
+        let names = ["alpha-with-a-very-long-connection-name-1", "bravo-with-a-very-long-connection-name-2", "charlie-3"];
+        let profiles = names.map(ConnectionProfile::new);
+        let mut dialog = ConnectDialog::new();
+        let width = 380.0;
+        let frame = |dialog: &mut ConnectDialog, events: Vec<egui::Event>| {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(width, 700.0))), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| _ = dialog.show(ui.ctx(), &profiles));
+            out.textures_delta.clear();
+            let boxes: Vec<egui::Rect> = out.shapes.iter().filter_map(|s| match &s.shape {
+                egui::Shape::Rect(r) if (13.5..=16.5).contains(&r.rect.width()) && (r.rect.width() - r.rect.height()).abs() < 0.5 => Some(r.rect),
+                _ => None,
+            }).collect();
+            let connect = out.shapes.iter().find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text().ends_with("Connect") => Some(t.galley.rect.translate(t.pos.to_vec2())),
+                _ => None,
+            });
+            (boxes, connect)
+        };
+        for _ in 0..30 {
+            frame(&mut dialog, vec![]);
+        }
+        let (boxes, connect) = frame(&mut dialog, vec![]);
+        assert_eq!(boxes.len(), names.len() + 1, "a checkbox per row and one in the header: {boxes:?}");
+        assert!(boxes.iter().all(|b| b.left() >= 0.0 && b.right() <= width), "checkboxes on screen: {boxes:?}");
+        let connect = connect.expect("Connect button");
+        assert!(connect.left() >= 0.0 && connect.right() <= width, "Connect on screen: {connect:?}");
+
+        // Tick the first row.
+        let first = boxes.iter().filter(|b| b.top() > boxes.iter().map(|b| b.top()).fold(f32::MAX, f32::min) + 1.0).min_by(|a, b| a.top().total_cmp(&b.top())).unwrap().center();
+        let press = |pressed| egui::Event::PointerButton { pos: first, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        frame(&mut dialog, vec![egui::Event::PointerMoved(first)]);
+        frame(&mut dialog, vec![press(true)]);
+        frame(&mut dialog, vec![press(false)]);
+        assert_eq!(dialog.selected, vec![profiles[0].id]);
+    }
 
     /// ⌘-click or a row's checkbox adds rows, ⇧-click picks a range, the
     /// header checkbox picks all or none, and Connect opens every picked row

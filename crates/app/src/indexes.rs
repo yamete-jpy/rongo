@@ -148,7 +148,7 @@ impl IndexTab {
                 actions.push(IndexAction::Add(conn_id, ns.clone()));
             }
             let can_drop = sel.is_some() && !is_id;
-            if ui.add_enabled(can_drop, egui::Button::new(RichText::new(format!("{}  Drop index", icon::TRASH)).color(if can_drop { theme::ERROR } else { theme::MUTED }))).clicked()
+            if ui.add_enabled(can_drop, egui::Button::new(RichText::new(format!("{}  Drop index", icon::TRASH)).color(theme::ERROR))).clicked()
                 && let Some(n) = &sel_name
             {
                 actions.push(IndexAction::Drop(conn_id, ns.clone(), n.clone()));

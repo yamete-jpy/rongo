@@ -41,6 +41,8 @@ pub struct RongoApp {
     sidebar: Sidebar,
     /// Where the sidebar was last frame, so ⌘F over it goes to its search.
     sidebar_rect: egui::Rect,
+    /// The tab last scrolled into view in the tab bar.
+    shown_tab: u64,
     connect_dialog: Option<ConnectDialog>,
     doc_dialog: Option<DocDialog>,
     confirm: Option<Confirm>,
@@ -98,6 +100,7 @@ impl RongoApp {
             pending: HashMap::new(),
             sidebar: Sidebar::default(),
             sidebar_rect: egui::Rect::NOTHING,
+            shown_tab: u64::MAX,
             connect_dialog: None,
             doc_dialog: None,
             confirm: None,
@@ -129,7 +132,7 @@ impl RongoApp {
 
     #[allow(clippy::too_many_arguments)]
     fn ask(&mut self, title: &str, message: String, ok_label: &str, danger: bool, pending: Pending, input: Option<String>, checkbox: Option<(String, bool)>) {
-        self.confirm = Some(Confirm { title: title.into(), message, ok_label: ok_label.into(), danger, pending, input, checkbox });
+        self.confirm = Some(Confirm { title: title.into(), message, ok_label: ok_label.into(), danger, pending, input, checkbox, must_type: None });
     }
 
     /// The collection tab's view for `ns`, if one is open.
@@ -749,8 +752,11 @@ impl RongoApp {
                 self.ask("Drop Collection", msg, "Drop", true, Pending::DropCollection { conn, ns }, None, None);
             }
             TreeAction::DropDatabase(conn, db) => {
-                let msg = format!("Type the database name to drop {db} and everything in it. This cannot be undone.");
-                self.ask("Drop Database", msg, "Drop", true, Pending::DropDatabase { conn, db }, Some(String::new()), None);
+                let msg = format!("Type {db} to drop it and everything in it. This cannot be undone.");
+                self.ask("Drop Database", msg, "Drop", true, Pending::DropDatabase { conn, db: db.clone() }, Some(String::new()), None);
+                if let Some(c) = &mut self.confirm {
+                    c.must_type = Some(db);
+                }
             }
             TreeAction::Export(conn, ns) => self.tool = Some(ToolDialog::export(conn, FindSpec::all(ns, 50), false)),
             TreeAction::Import(conn, db, coll) => self.tool = Some(ToolDialog::import(conn, db, coll.unwrap_or_default())),
@@ -1064,7 +1070,12 @@ impl RongoApp {
         let names: HashMap<ConnId, String> = self.conns.iter().map(|(id, c)| (*id, c.profile.name.clone())).collect();
         let colors: HashMap<ConnId, egui::Color32> = self.conns.iter().filter_map(|(id, c)| Some((*id, theme::conn_color(c.profile.color.as_deref())?))).collect();
         let mut close = None;
-        egui::ScrollArea::horizontal().id_salt("tabbar").show(ui, |ui| {
+        let mut scrolled = None;
+        let mut pick = None;
+        ui.horizontal(|ui| {
+        // Room on the right for the list of every tab, when they overflow.
+        let list_w = 30.0;
+        let bar = egui::ScrollArea::horizontal().id_salt("tabbar").max_width(ui.available_width() - list_w).show(ui, |ui| {
             ui.horizontal(|ui| {
                 for (i, tab) in self.tabs.iter().enumerate() {
                     let title = tab.title(|c| names.get(&c).cloned().unwrap_or_else(|| "?".into()));
@@ -1089,9 +1100,36 @@ impl RongoApp {
                         let r = frame.inner.response.rect;
                         ui.painter().rect_filled(egui::Rect::from_min_size(r.left_top(), egui::vec2(r.width(), 3.0)), egui::CornerRadius { nw: 5, ne: 5, sw: 0, se: 0 }, c);
                     }
+                    // A newly active tab (just opened, or picked from the
+                    // list) scrolls into view.
+                    if active && tab.id != self.shown_tab {
+                        frame.response.scroll_to_me(None);
+                        scrolled = Some(tab.id);
+                    }
                 }
             });
         });
+        // Tabs off the edge: ▾ lists them all.
+        if bar.content_size.x > bar.inner_rect.width() + 1.0 {
+            ui.menu_button(icon::CARET_DOWN, |ui| {
+                for (i, tab) in self.tabs.iter().enumerate() {
+                    let title = tab.title(|c| names.get(&c).cloned().unwrap_or_else(|| "?".into()));
+                    if ui.selectable_label(i == self.active_tab, title).clicked() {
+                        pick = Some(i);
+                        ui.close();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("All tabs");
+        }
+        });
+        if let Some(id) = scrolled {
+            self.shown_tab = id;
+        }
+        if let Some(i) = pick {
+            self.active_tab = i;
+        }
         if let Some(i) = close {
             self.close_tab(i);
         }
@@ -1544,6 +1582,55 @@ mod tests {
         assert!(texts.is_empty(), "nothing running, nothing drawn: {texts:?}");
     }
 
+    /// Drop Database's button waits for the database's exact name.
+    #[test]
+    fn drop_database_needs_the_exact_name() {
+        let ctx = egui::Context::default();
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = RongoApp::new(&cc, rt, false);
+        let cid = ConnectionProfile::mock().conn_id();
+        app.tree_action(TreeAction::DropDatabase(cid, "shop".into()));
+        let typed = |app: &mut RongoApp, t: &str| {
+            let c = app.confirm.as_mut().expect("asks first");
+            c.input = Some(t.into());
+            c.ok_enabled()
+        };
+        assert!(!typed(&mut app, ""));
+        assert!(!typed(&mut app, "sh"));
+        assert!(!typed(&mut app, "shopping"));
+        assert!(typed(&mut app, "shop"));
+        assert!(typed(&mut app, " shop "), "spaces around it are fine");
+    }
+
+    /// With more tabs than fit, the newly opened tab is scrolled into view
+    /// and ▾ lists every tab.
+    #[test]
+    fn tab_bar_shows_the_new_tab_when_crowded() {
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+        let mut h = Harness::builder().with_size(egui::vec2(760.0, 600.0)).build_eframe(|cc| {
+            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+            RongoApp::new(cc, rt, false)
+        });
+        let cid = ConnectionProfile::mock().conn_id();
+        for i in 0..8 {
+            let id = h.state_mut().next_tab();
+            let tab = Tab { id, kind: TabKind::Collection(Box::new(CollectionTab::new(cid, Namespace::new("db", format!("collection_number_{i}")), 1000 + i))) };
+            h.state_mut().tabs.push(tab);
+        }
+        let last = h.state().tabs.len() - 1;
+        h.state_mut().active_tab = last;
+        h.run_steps(4);
+        let title = h.state().tabs[last].title(|_| "?".into());
+        let shown = h.query_by_label_contains(&title).map(|n| n.rect());
+        let r = shown.expect("the new tab is drawn");
+        assert!(r.right() <= 760.0 && r.left() >= 0.0, "the new tab is on screen: {r:?}");
+        assert!(h.query_by_label_contains(&h.state().tabs[0].title(|_| "?".into())).is_none_or(|n| n.rect().right() < 340.0), "earlier tabs scrolled away");
+        let tab_row = r.center().y;
+        assert!(h.query_all_by_label(icon::CARET_DOWN).any(|n| (n.rect().center().y - tab_row).abs() < 12.0 && n.rect().left() > 700.0), "▾ at the end of the tab bar lists every tab");
+    }
+
     /// ⌘R and ⇧⌘R do what the tree's menus say when the pointer is over
     /// the tree: ⇧⌘R reloads the selected database's collections, ⌘R
     /// reloads every connection. Away from the tree they are left for the
@@ -1589,6 +1676,99 @@ mod tests {
 
         assert!(!press(&mut app, over, Modifiers::COMMAND), "the tree took ⌘R");
         assert!(app.conns[&cid].loading_dbs, "every connection reloads");
+    }
+
+    /// Screenshots of every screen on the demo server, for reviewing the
+    /// UI by eye. Writes PNGs to $RONGO_TOUR_DIR. Run with
+    /// `RONGO_TOUR_DIR=/tmp/tour cargo test -p rongo ui_tour -- --ignored`.
+    #[test]
+    #[ignore = "writes screenshots; run by hand"]
+    fn ui_tour() {
+        use egui_kittest::Harness;
+        let dir = std::path::PathBuf::from(std::env::var("RONGO_TOUR_DIR").expect("RONGO_TOUR_DIR"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sizes: Vec<(&str, egui::Vec2)> = match std::env::var("RONGO_TOUR_SIZE").as_deref() {
+            Ok("narrow") => vec![("narrow", egui::vec2(760.0, 720.0))],
+            _ => vec![("wide", egui::vec2(1400.0, 860.0))],
+        };
+        for (tag, size) in sizes {
+            let mut h = Harness::builder().with_size(size).wgpu().build_eframe(|cc| {
+                let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+                RongoApp::new(cc, rt, true)
+            });
+            let settle = |h: &mut Harness<RongoApp>, ms: u64| {
+                let end = Instant::now() + Duration::from_millis(ms);
+                while Instant::now() < end {
+                    h.step();
+                    std::thread::sleep(Duration::from_millis(16));
+                }
+            };
+            let shot = |h: &mut Harness<RongoApp>, name: &str| {
+                h.step();
+                let img = h.render().expect("render");
+                img.save(dir.join(format!("{tag}-{name}.png"))).unwrap();
+            };
+            settle(&mut h, 2500);
+            shot(&mut h, "01-shell");
+
+            let cid = ConnectionProfile::mock().conn_id();
+            let ns = Namespace::new("demo-games", "providers");
+            h.state_mut().tree_action(TreeAction::OpenCollectionTab(cid, ns.clone()));
+            settle(&mut h, 1200);
+            shot(&mut h, "02-collection-table");
+            let set_mode = |h: &mut Harness<RongoApp>, m: Mode| {
+                let app = h.state_mut();
+                let i = app.active_tab;
+                if let TabKind::Collection(c) = &mut app.tabs[i].kind {
+                    c.view.mode = m;
+                }
+            };
+            set_mode(&mut h, Mode::Tree);
+            settle(&mut h, 400);
+            shot(&mut h, "03-collection-tree");
+            set_mode(&mut h, Mode::Json);
+            settle(&mut h, 600);
+            shot(&mut h, "04-collection-json");
+            set_mode(&mut h, Mode::Table);
+            settle(&mut h, 200);
+
+            h.state_mut().tree_action(TreeAction::OpenIndexes(cid, ns.clone()));
+            settle(&mut h, 800);
+            shot(&mut h, "05-index-manager");
+
+            // Dialogs, one at a time.
+            let dialog = |h: &mut Harness<RongoApp>, name: &str, open: &dyn Fn(&mut RongoApp)| {
+                open(h.state_mut());
+                settle(h, 700);
+                shot(h, name);
+                let app = h.state_mut();
+                app.connect_dialog = None;
+                app.doc_dialog = None;
+                app.tool = None;
+                app.settings_dialog = None;
+                app.view_doc = None;
+                app.confirm = None;
+                settle(h, 300);
+            };
+            dialog(&mut h, "06-connection-manager", &|app| {
+                if let Some(store) = app.store.as_mut() {
+                    for (n, (name, color)) in [("alpha-sit", Some("green")), ("alpha-prod", Some("red")), ("bravo-dev", Some("purple")), ("local", None)].into_iter().enumerate() {
+                        let p = ConnectionProfile { id: uuid::Uuid::from_u128(100 + n as u128), color: color.map(str::to_string), ..ConnectionProfile::new(name) };
+                        let _ = store.upsert(p, None);
+                    }
+                }
+                app.connect_dialog = Some(ConnectDialog::new());
+            });
+            dialog(&mut h, "07-new-connection", &|app| app.connect_dialog = Some(ConnectDialog::new_connection()));
+            let sample = doc! { "_id": 1, "code": "ALPHA", "name": "Alpha Gaming", "enabled": true, "config": { "currency": "THB", "timeoutMs": 5000 } };
+            dialog(&mut h, "08-edit-document", &|app| app.doc_dialog = Some(DocDialog::edit(cid, ns.clone(), &sample, None)));
+            dialog(&mut h, "09-update-dialog", &|app| app.tool = Some(ToolDialog::bulk(cid, ns.clone(), None, false, Vec::new(), doc! { "enabled": true }, Some(("name".into(), rongo_core::bson::Bson::String("Alpha".into()))))));
+            dialog(&mut h, "10-delete-dialog", &|app| app.tool = Some(ToolDialog::bulk(cid, ns.clone(), None, true, Vec::new(), doc! {}, None)));
+            dialog(&mut h, "11-add-index", &|app| app.tool = Some(ToolDialog::index(cid, ns.clone(), vec!["code".into(), "name".into(), "config.currency".into()])));
+            dialog(&mut h, "12-export", &|app| app.tool = Some(ToolDialog::export(cid, FindSpec::all(ns.clone(), 50), true)));
+            dialog(&mut h, "13-settings", &|app| app.settings_dialog = Some(SettingsDialog::new(&app.settings)));
+            dialog(&mut h, "14-drop-database", &|app| app.tree_action(TreeAction::DropDatabase(cid, "demo-games".into())));
+        }
     }
 
     /// Run the whole app (demo server, theme, sidebar, shell results, a

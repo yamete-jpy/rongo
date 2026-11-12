@@ -1544,7 +1544,10 @@ impl ResultView {
         let header_rect = ui.available_rect_before_wrap();
         let key_w = (header_rect.width() * 0.35).clamp(160.0, 360.0);
         ui.horizontal(|ui| {
-            ui.add_sized([key_w, 20.0], egui::Label::new(RichText::new("Key").strong()));
+            ui.allocate_ui_with_layout(vec2(key_w, 20.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.set_min_width(key_w);
+                ui.label(RichText::new("Key").strong());
+            });
             ui.label(RichText::new("Value").strong());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_sized([100.0, 20.0], egui::Label::new(RichText::new("Type").strong()));
@@ -1576,6 +1579,9 @@ impl ResultView {
                 };
                 let id = ui.make_persistent_id((self.id, "node", self.offset, i, self.drill.len()));
                 let top = ui.cursor().top();
+                // Every other document striped across the full width, so the
+                // eye can follow a key to its type on the far right.
+                let stripe = ui.painter().add(egui::Shape::Noop);
                 let r = tree_node(ui, id, &label, value, left, key_w, self.selected.contains(&i));
                 if r.clicked() || (r.secondary_clicked() && !self.selected.contains(&i)) {
                     clicked = Some(i);
@@ -1585,6 +1591,10 @@ impl ResultView {
                     self.cell_menu(ui, net, i, origin, None, &path, None, actions);
                 });
                 let h = (ui.cursor().top() - top).max(1.0);
+                if i % 2 == 1 {
+                    let band = egui::Rect::from_x_y_ranges(left..=ui.max_rect().right(), top..=top + h - ui.spacing().item_spacing.y);
+                    ui.painter().set(stripe, egui::Shape::rect_filled(band, 0.0, ui.visuals().faint_bg_color));
+                }
                 self.tree_heights[i] = h;
                 y += h;
                 i += 1;

@@ -121,14 +121,25 @@ impl CollectionTab {
         ui.add_space(4.0);
         let mut run = false;
         egui::Frame::new().fill(theme::RAISED).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
-            egui::Grid::new(("query", self.view.id)).num_columns(4).spacing(egui::vec2(8.0, 6.0)).show(ui, |ui| {
-                let mono = |ui: &mut Ui, text: &mut String, hint: &str, w: f32| {
-                    let r = ui.add(egui::TextEdit::singleline(text).font(theme::mono(13.0)).hint_text(hint).desired_width(w));
-                    r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))
-                };
-                let wide = (ui.available_width() - 170.0).max(240.0);
-                ui.label("Query");
-                run |= mono(ui, &mut self.filter, "{ status: \"active\" }", wide);
+            // The fields share the full width (a query can be long); on a
+            // narrow tab the buttons wrap below instead of going off screen.
+            let full = ui.available_width();
+            let label_w = 72.0;
+            let gap = ui.spacing().item_spacing.x;
+            let mono = |ui: &mut Ui, text: &mut String, hint: &str, w: f32| {
+                let r = ui.add(egui::TextEdit::singleline(text).font(theme::mono(13.0)).hint_text(hint).desired_width(w));
+                r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))
+            };
+            let label = |ui: &mut Ui, text: &str| {
+                ui.allocate_ui_with_layout(egui::vec2(label_w, 20.0), Layout::left_to_right(Align::Center), |ui| {
+                    ui.set_min_width(label_w);
+                    ui.label(text);
+                });
+            };
+            ui.horizontal_wrapped(|ui| {
+                label(ui, "Query");
+                let buttons = 130.0;
+                run |= mono(ui, &mut self.filter, "{ status: \"active\" }", (full - label_w - buttons - 3.0 * gap).max(160.0));
                 if ui.button(RichText::new(format!("{}  Run", icon::PLAY)).color(theme::OK)).clicked() {
                     run = true;
                 }
@@ -139,17 +150,18 @@ impl CollectionTab {
                     self.skip.clear();
                     run = true;
                 }
-                ui.end_row();
-                ui.label("Projection");
-                ui.horizontal(|ui| {
-                    let w = (wide - 260.0) / 2.0;
-                    run |= mono(ui, &mut self.projection, "{ name: 1 }", w.max(120.0));
-                    ui.label("Sort");
-                    run |= mono(ui, &mut self.sort, "{ _id: -1 }", w.max(120.0));
-                    ui.label("Skip");
-                    run |= mono(ui, &mut self.skip, "0", 60.0);
-                });
-                ui.end_row();
+            });
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                label(ui, "Projection");
+                let text_w = |ui: &Ui, t: &str| ui.fonts_mut(|f| f.layout_no_wrap(t.into(), egui::TextStyle::Body.resolve(ui.style()), egui::Color32::WHITE).size().x);
+                let fixed = label_w + text_w(ui, "Sort") + text_w(ui, "Skip") + 60.0 + 7.0 * gap;
+                let w = ((full - fixed) / 2.0).max(80.0);
+                run |= mono(ui, &mut self.projection, "{ name: 1 }", w);
+                ui.label("Sort");
+                run |= mono(ui, &mut self.sort, "{ _id: -1 }", w);
+                ui.label("Skip");
+                run |= mono(ui, &mut self.skip, "0", 60.0);
             });
             if let Some(e) = &self.query_error {
                 ui.colored_label(theme::ERROR, e);
@@ -505,6 +517,39 @@ mod tests {
         }
         let settled = &heights[3..];
         assert!(settled.windows(2).all(|w| (w[0] - w[1]).abs() < 0.5), "split moved: {heights:?}");
+    }
+
+    /// The query field takes the tab's width (queries can be long), and on
+    /// a narrow tab Run and Clear wrap rather than leave the screen.
+    #[test]
+    fn query_bar_uses_the_width_and_keeps_its_buttons() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let core = rongo_core::CoreHandle::start(rt.handle().clone(), Arc::new(|| {}));
+        let mut pending = HashMap::new();
+        let mut next_view = 0;
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut tab = CollectionTab::new(ConnId(uuid::Uuid::nil()), Namespace::new("db", "c"), 3);
+        let mut at = |width: f32| {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 600.0))), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                let mut net = Net { core: &core, pending: &mut pending, next_view_id: &mut next_view, keys_enabled: true };
+                tab.ui(ui, &mut net, None);
+            });
+            out.textures_delta.clear();
+            let find = |t: &str| out.shapes.iter().find_map(|s| match &s.shape {
+                egui::Shape::Text(g) if g.galley.text().ends_with(t) => Some(g.galley.rect.translate(g.pos.to_vec2())),
+                _ => None,
+            });
+            (find("Run").expect("Run"), find("Clear").expect("Clear"), find("{ status: \"active\" }").expect("query hint"))
+        };
+        at(1400.0);
+        let (run, clear, hint) = at(1400.0);
+        assert!(run.left() > 1100.0, "the field pushes Run to the right edge: {run:?}");
+        assert!(clear.right() <= 1400.0 && hint.left() < 200.0);
+        at(520.0);
+        let (run, clear, _) = at(520.0);
+        assert!(run.right() <= 520.0 && clear.right() <= 520.0, "buttons stay on screen: {run:?} {clear:?}");
     }
 
     /// With a dialog open over the shell, ⌘S is left for the dialog (the

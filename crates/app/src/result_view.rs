@@ -1115,6 +1115,45 @@ impl ResultView {
         }
     }
 
+    /// Right-click under the rows: the selected row's menu (its selected
+    /// cell, if any), or what makes sense with no row.
+    fn background_menu(&mut self, ui: &mut Ui, net: &mut Net, rows: &Rows, actions: &mut Vec<ViewAction>) {
+        if let Some(i) = self.selected.iter().next().copied()
+            && let Some(Row { origin, value, path }) = rows.get(i)
+        {
+            let col = self.selected_col.clone();
+            let cell = col.as_deref().and_then(|c| if c == "(value)" { (!matches!(value, Bson::Document(_))).then_some(value) } else { value.as_document().and_then(|d| d.get(c)) });
+            self.cell_menu(ui, net, i, origin, col.as_deref(), &path, cell, actions);
+            return;
+        }
+        self.empty_menu(ui, actions);
+        ui.separator();
+        if ui.add(egui::Button::new("Refresh View").shortcut_text("⌘R")).clicked() {
+            self.fetch(net);
+            ui.close();
+        }
+        let editable = self.editable().map(|(c, n)| (c, n.clone()));
+        if ui.add_enabled(editable.is_some(), egui::Button::new(format!("{}  Update Dialog…", icon::PENCIL_LINE)).shortcut_text("⌘U")).clicked()
+            && let Some((conn, ns)) = editable.clone()
+        {
+            actions.push(ViewAction::Bulk { conn, ns, delete: false, selected: Vec::new(), query: self.query(), field: None });
+            ui.close();
+        }
+        if ui.add_enabled(editable.is_some(), egui::Button::new(RichText::new(format!("{}  Delete Dialog…", icon::BROOM)).color(theme::ERROR)).shortcut_text("F8")).clicked()
+            && let Some((conn, ns)) = editable.clone()
+        {
+            actions.push(ViewAction::Bulk { conn, ns, delete: true, selected: Vec::new(), query: self.query(), field: None });
+            ui.close();
+        }
+        ui.separator();
+        if ui.add_enabled(editable.is_some(), egui::Button::new(format!("{}  Export Documents…", icon::EXPORT))).clicked()
+            && let Source::Find { conn, spec, .. } = &self.source
+        {
+            actions.push(ViewAction::Export { conn: *conn, spec: spec.clone() });
+            ui.close();
+        }
+    }
+
     /// The right-click menu for a cell (`col` is `None` in the Tree view).
     #[allow(clippy::too_many_arguments)]
     fn cell_menu(&mut self, ui: &mut Ui, net: &mut Net, row: usize, origin: usize, col: Option<&str>, path_prefix: &str, cell: Option<&Bson>, actions: &mut Vec<ViewAction>) {
@@ -1324,6 +1363,9 @@ impl ResultView {
             })
             .collect();
         let mut header_click: Option<(String, Option<i32>)> = None;
+        // The space under the last row answers a right-click too. Added
+        // before the table, so rows and headers drawn over it come first.
+        let background = ui.interact(ui.available_rect_before_wrap(), ui.id().with((self.id, "table-bg", depth)), Sense::click());
         // Header cells as drawn, for dropping a dragged header between them.
         let mut header_rects: Vec<(String, egui::Rect)> = Vec::new();
         let mut drag_started: Option<String> = None;
@@ -1474,6 +1516,10 @@ impl ResultView {
                 }
             }
         }
+        background.context_menu(|ui| {
+            ui.set_min_width(230.0);
+            self.background_menu(ui, net, &rows, actions);
+        });
         if let Some((i, col, m)) = clicked {
             self.click_row(i, m);
             self.selected_col = (!col.is_empty()).then_some(col);
@@ -1835,15 +1881,31 @@ impl ResultView {
             if let Source::Static { truncated: true, .. } = &self.source {
                 ui.colored_label(theme::WARN, format!("{} showing the first {} documents", icon::WARNING, self.total.unwrap_or(0)));
             }
+            // What this view is waiting for, once it has taken more than a
+            // moment: the query, a count or a document refresh.
+            let now = std::time::Instant::now();
+            let waiting = [self.loading, self.counting, self.refreshing]
+                .into_iter()
+                .flatten()
+                .filter_map(|id| net.pending.get(&id).map(|s| (id, s.what.clone(), s.started)))
+                .min_by_key(|(_, _, t)| *t);
+            let shown = waiting.clone().filter(|(_, _, t)| now.saturating_duration_since(*t) >= theme::SHOW_BUSY_AFTER);
+            match (&shown, &waiting) {
+                (Some(_), _) => ui.ctx().request_repaint_after(std::time::Duration::from_millis(33)),
+                (None, Some((_, _, t))) => ui.ctx().request_repaint_after((*t + theme::SHOW_BUSY_AFTER).saturating_duration_since(now)),
+                _ => {}
+            }
+            let mut discard = None;
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if let Some(ms) = self.elapsed_ms {
                     ui.label(format!("{}  {}", icon::TIMER, elapsed_text(ms)));
                     ui.separator();
                 }
                 match (&self.source, self.total, self.counting) {
-                    (_, _, Some(_)) => {
+                    (_, _, Some(_)) if shown.is_none() => {
                         ui.spinner();
                     }
+                    (_, _, Some(_)) => {}
                     (Source::Find { conn, spec, .. }, total, None) => {
                         let label = match total {
                             Some(t) => format!("{}  {} documents", icon::HASH, thousands(t)),
@@ -1859,7 +1921,21 @@ impl ResultView {
                     }
                     _ => {}
                 }
+                // Right to left: drawn as ⊗ ▬▬ Running find on db.c… 4s.
+                if let Some((id, what, started)) = &shown {
+                    ui.separator();
+                    ui.label(RichText::new(theme::elapsed(now.saturating_duration_since(*started))).color(theme::MUTED));
+                    ui.label(format!("{}…", what.as_deref().unwrap_or("Working")));
+                    theme::busy_bar(ui, 80.0);
+                    if theme::discard_button(ui) {
+                        discard = Some(*id);
+                    }
+                }
             });
+            if let Some(id) = discard {
+                net.send(Origin::None, None, Command::Cancel(id));
+                self.on_cancelled(id);
+            }
         });
     }
 }
@@ -2427,6 +2503,111 @@ mod perf {
         let Source::Find { spec, .. } = &v.source else { unreachable!() };
         assert_eq!(spec.sort, Some(doc! { "name": 1 }), "the query is re-run sorted");
         assert!(actions.iter().any(|(_, a)| matches!(a, ViewAction::SortChanged(s) if *s == doc! { "name": 1 })), "the Sort field shows it");
+    }
+
+    /// A query running for more than a moment shows in the view's own status
+    /// line (not in a bar across the window): what it is, a moving bar, the
+    /// time, and ⊗, which cancels it and keeps the rows on screen.
+    #[test]
+    fn slow_query_shows_in_the_status_line() {
+        use std::collections::HashMap;
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let core = rongo_core::CoreHandle::start(rt.handle().clone(), std::sync::Arc::new(|| {}));
+        let (mut pending, mut next) = (HashMap::new(), 0);
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut v = big_view(5);
+        v.loading = Some(77);
+        let started = std::time::Instant::now() - std::time::Duration::from_millis(2300);
+        pending.insert(77, crate::net::Sent { what: Some("Running find on d.c".into()), started, ..crate::net::Sent::new(Origin::View(1, ViewReq::Page)) });
+        let mut frame = |v: &mut ResultView, events: Vec<Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                let mut net = Net { core: &core, pending: &mut pending, next_view_id: &mut next, keys_enabled: true };
+                v.ui(ui, &mut net);
+            });
+            out.textures_delta.clear();
+            out.shapes.iter().filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) => Some((t.galley.text().to_string(), t.pos + t.galley.rect.center().to_vec2())),
+                _ => None,
+            }).collect::<Vec<_>>()
+        };
+        frame(&mut v, vec![]);
+        let texts = frame(&mut v, vec![]);
+        let find = |label: &str| texts.iter().find(|(t, _)| t == label).map(|(_, p)| *p);
+        let what = find("Running find on d.c…").expect("the query shows");
+        let selected = find("0 documents selected").expect("status line");
+        assert!((what.y - selected.y).abs() < 4.0, "on the status line: {what:?} vs {selected:?}");
+        assert!(find("2s").is_some(), "time taken: {texts:?}");
+        let x = texts.iter().filter(|(t, p)| t == icon::X_CIRCLE && (p.y - selected.y).abs() < 6.0).map(|(_, p)| *p).next().expect("⊗ on the status line");
+        let press = |pressed| Event::PointerButton { pos: x, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        frame(&mut v, vec![Event::PointerMoved(x), press(true)]);
+        frame(&mut v, vec![press(false)]);
+        assert_eq!((v.loading, v.rows.len()), (None, 5), "cancelled, rows kept");
+        let texts = frame(&mut v, vec![]);
+        assert!(!texts.iter().any(|(t, _)| t.starts_with("Running find")), "gone: {texts:?}");
+    }
+
+    /// Right-click in the empty space under the rows opens a menu, as in
+    /// Studio 3T: the selected row's menu when a row is selected, otherwise
+    /// the one for the whole result (Insert, Refresh View, Export…).
+    #[test]
+    fn right_click_under_the_rows() {
+        use std::collections::HashMap;
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let core = rongo_core::CoreHandle::start(rt.handle().clone(), std::sync::Arc::new(|| {}));
+        let (mut pending, mut next) = (HashMap::new(), 0);
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut frame = |v: &mut ResultView, events: Vec<Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                let mut net = Net { core: &core, pending: &mut pending, next_view_id: &mut next, keys_enabled: true };
+                v.ui(ui, &mut net);
+            });
+            out.textures_delta.clear();
+            out.shapes.iter().filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            }).collect::<Vec<_>>()
+        };
+        let empty = pos2(600.0, 700.0);
+        let right_click = |v: &mut ResultView, frame: &mut dyn FnMut(&mut ResultView, Vec<Event>) -> Vec<String>| {
+            let button = |pressed| Event::PointerButton { pos: empty, button: egui::PointerButton::Secondary, pressed, modifiers: Modifiers::NONE };
+            frame(v, vec![Event::PointerMoved(empty)]);
+            frame(v, vec![button(true)]);
+            frame(v, vec![button(false)]);
+            let mut texts = Vec::new();
+            for _ in 0..3 {
+                texts = frame(v, vec![]);
+            }
+            frame(v, vec![Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }]);
+            for _ in 0..3 {
+                frame(v, vec![]);
+            }
+            texts
+        };
+        let has = |texts: &[String], label: &str| texts.iter().any(|t| t.contains(label));
+
+        let mut v = big_view(3);
+        frame(&mut v, vec![]);
+        let texts = right_click(&mut v, &mut frame);
+        assert!(has(&texts, "Insert Document") && has(&texts, "Refresh View") && has(&texts, "Export Documents"), "{texts:?}");
+        assert!(!has(&texts, "Copy Value"), "no row, so no cell items");
+
+        v.selected = BTreeSet::from([1]);
+        v.selected_col = Some("name".into());
+        let texts = right_click(&mut v, &mut frame);
+        assert!(has(&texts, "Field") && has(&texts, "Copy") && has(&texts, "Refresh Document"), "the selected row's menu: {texts:?}");
+        assert_eq!(v.selected, BTreeSet::from([1]), "the selection stays");
     }
 
     /// Dragging a header moves its column: it lands where the blue line

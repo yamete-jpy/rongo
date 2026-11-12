@@ -208,6 +208,35 @@ pub fn install(ctx: &egui::Context) {
     });
 }
 
+/// Work slower than this shows a busy indicator; quicker work would only flicker.
+pub const SHOW_BUSY_AFTER: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// A bar with a block sliding along it: work is going on, length unknown.
+pub fn busy_bar(ui: &mut egui::Ui, width: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 6.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 3.0, RAISED);
+    let seg = (width / 3.0).min(36.0);
+    let x = (ui.input(|i| i.time) as f32 * 0.8).fract() * (rect.width() + seg) - seg;
+    let block = egui::Rect::from_min_size(egui::pos2(rect.left() + x, rect.top()), egui::vec2(seg, rect.height())).intersect(rect);
+    if block.width() > 0.0 {
+        painter.rect_filled(block, 3.0, ACCENT);
+    }
+}
+
+/// "4s", "2m 05s".
+pub fn elapsed(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 { format!("{s}s") } else { format!("{}m {:02}s", s / 60, s % 60) }
+}
+
+/// The red ⊗ that discards running work.
+pub fn discard_button(ui: &mut egui::Ui) -> bool {
+    ui.add(egui::Button::new(egui::RichText::new(egui_phosphor::regular::X_CIRCLE).color(ERROR).size(15.0)).frame(false))
+        .on_hover_text("Discard this operation")
+        .clicked()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

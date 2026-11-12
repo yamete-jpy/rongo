@@ -349,11 +349,15 @@ impl RongoApp {
         let mut ops: Vec<Operation> = self
             .pending
             .iter()
-            .filter(|(_, s)| now.saturating_duration_since(s.started) >= SHOW_AFTER)
+            // A result view shows its own requests in its status line.
+            .filter(|(_, s)| !matches!(s.origin, Origin::View(..)))
+            .filter(|(_, s)| now.saturating_duration_since(s.started) >= theme::SHOW_BUSY_AFTER)
             .filter_map(|(id, s)| Some(Operation { key: OpKey::Request(*id), text: label(s.what.as_deref()?, s.conn), started: s.started }))
             .collect();
-        for t in &self.tabs {
+        for (i, t) in self.tabs.iter().enumerate() {
+            // The shell on screen shows "Running…" and Stop itself.
             if let TabKind::Shell(sh) = &t.kind
+                && i != self.active_tab
                 && let Some(started) = sh.running_since()
             {
                 ops.push(Operation { key: OpKey::Script(t.id), text: label(&format!("Running a script on {}", sh.db), Some(sh.conn)), started });
@@ -381,48 +385,53 @@ impl RongoApp {
         }
     }
 
-    /// The bar along the bottom: the latest operation still running, how
-    /// long it has taken, a button to discard it, and the others in a menu.
-    fn status_bar(&mut self, ui: &mut Ui) {
+    /// Work running outside the result view on screen (connecting, the
+    /// tree, writes, scripts in other tabs), floating in the bottom-left
+    /// corner only while there is some: the latest, how long it has taken,
+    /// ⊗ to discard it, and the others under "+n more".
+    fn activity(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         let ops = self.operations(now);
         let mut cancel = None;
-        let discard = |ui: &mut Ui| {
-            ui.add(egui::Button::new(RichText::new(icon::X_CIRCLE).color(theme::ERROR).size(15.0)).frame(false))
-                .on_hover_text("Discard this operation")
-                .clicked()
-        };
-        ui.horizontal(|ui| {
-            ui.set_min_height(20.0);
-            let Some(op) = ops.last() else { return };
-            if discard(ui) {
-                cancel = Some(op.key);
-            }
-            busy_bar(ui);
-            ui.label(format!("{}…", op.text));
-            ui.label(RichText::new(elapsed(now.saturating_duration_since(op.started))).color(theme::MUTED));
-            if ops.len() > 1 {
-                ui.menu_button(format!("+{} more", ops.len() - 1), |ui| {
-                    for o in ops.iter().rev() {
+        if let Some(op) = ops.last() {
+            egui::Area::new(egui::Id::new("activity"))
+                .order(egui::Order::Foreground)
+                .anchor(Align2::LEFT_BOTTOM, egui::vec2(10.0, -10.0))
+                .interactable(true)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).inner_margin(egui::Margin::symmetric(8, 4)).show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            if discard(ui) {
-                                cancel = Some(o.key);
-                                ui.close();
+                            if theme::discard_button(ui) {
+                                cancel = Some(op.key);
                             }
-                            ui.label(&o.text);
-                            ui.label(RichText::new(elapsed(now.saturating_duration_since(o.started))).color(theme::MUTED));
+                            theme::busy_bar(ui, 80.0);
+                            ui.label(format!("{}…", op.text));
+                            ui.label(RichText::new(theme::elapsed(now.saturating_duration_since(op.started))).color(theme::MUTED));
+                            if ops.len() > 1 {
+                                ui.menu_button(format!("+{} more", ops.len() - 1), |ui| {
+                                    for o in ops.iter().rev() {
+                                        ui.horizontal(|ui| {
+                                            if theme::discard_button(ui) {
+                                                cancel = Some(o.key);
+                                                ui.close();
+                                            }
+                                            ui.label(&o.text);
+                                            ui.label(RichText::new(theme::elapsed(now.saturating_duration_since(o.started))).color(theme::MUTED));
+                                        });
+                                    }
+                                });
+                            }
                         });
-                    }
+                    });
                 });
-            }
-        });
+        }
         if let Some(k) = cancel {
             self.cancel_op(k);
         }
         if !ops.is_empty() {
-            ui.ctx().request_repaint_after(Duration::from_millis(33));
-        } else if let Some(next) = self.pending.values().filter(|s| s.what.is_some()).map(|s| s.started + SHOW_AFTER).min() {
-            ui.ctx().request_repaint_after(next.saturating_duration_since(now));
+            ctx.request_repaint_after(Duration::from_millis(33));
+        } else if let Some(next) = self.pending.values().filter(|s| s.what.is_some()).map(|s| s.started + theme::SHOW_BUSY_AFTER).min() {
+            ctx.request_repaint_after(next.saturating_duration_since(now));
         }
     }
 
@@ -1336,10 +1345,6 @@ impl eframe::App for RongoApp {
         egui::Panel::top("toolbar")
             .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(10, 6)))
             .show(ui, |ui| self.toolbar(ui));
-        egui::Panel::bottom("status-bar")
-            .resizable(false)
-            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(10, 3)))
-            .show(ui, |ui| self.status_bar(ui));
         egui::Panel::left("strip")
             .exact_size(26.0)
             .resizable(false)
@@ -1373,13 +1378,11 @@ impl eframe::App for RongoApp {
                 });
             });
 
+        self.activity(&ctx);
         self.dialogs(&ctx);
         self.toasts(&ctx);
     }
 }
-
-/// Requests quicker than this never show in the status bar.
-const SHOW_AFTER: Duration = Duration::from_millis(300);
 
 /// Something the status bar can discard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1393,25 +1396,6 @@ struct Operation {
     key: OpKey,
     text: String,
     started: Instant,
-}
-
-/// A bar with a block sliding along it: work is going on, length unknown.
-fn busy_bar(ui: &mut Ui) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(110.0, 6.0), egui::Sense::hover());
-    let painter = ui.painter();
-    painter.rect_filled(rect, 3.0, theme::RAISED);
-    let seg = 36.0;
-    let x = (ui.input(|i| i.time) as f32 * 0.8).fract() * (rect.width() + seg) - seg;
-    let block = egui::Rect::from_min_size(egui::pos2(rect.left() + x, rect.top()), egui::vec2(seg, rect.height())).intersect(rect);
-    if block.width() > 0.0 {
-        painter.rect_filled(block, 3.0, theme::ACCENT);
-    }
-}
-
-/// "4s", "2m 05s".
-fn elapsed(d: Duration) -> String {
-    let s = d.as_secs();
-    if s < 60 { format!("{s}s") } else { format!("{}m {:02}s", s / 60, s % 60) }
 }
 
 /// A one-line summary of a write's outcome for a toast.
@@ -1503,9 +1487,11 @@ mod tests {
         assert!(app.conns.contains_key(&a.conn_id()) && app.conns.contains_key(&b.conn_id()), "both opened");
     }
 
-    /// A request that takes more than a moment shows along the bottom with
-    /// its connection's name and how long it has run; ✕ cancels it and it
-    /// leaves the bar at once. Quick requests and background work never show.
+    /// Work that takes more than a moment floats in the bottom-left corner
+    /// with its connection's name and how long it has run; ⊗ cancels it and
+    /// it goes at once. Quick requests, background work and a result view's
+    /// own requests (it shows those itself) never show there, and with
+    /// nothing running the corner is empty.
     #[test]
     fn status_bar_shows_and_discards_slow_work() {
         use crate::net::Sent;
@@ -1517,7 +1503,10 @@ mod tests {
         let cid = p.conn_id();
         app.conns.insert(cid, OpenConn::new(p));
         let ago = |ms| Instant::now() - Duration::from_millis(ms);
-        let slow = Sent { conn: Some(cid), what: Some("Running find on db.c".into()), started: ago(2500), ..Sent::new(Origin::View(1, ViewReq::Page)) };
+        let slow = Sent { conn: Some(cid), what: Some("Dropping db.c".into()), started: ago(2500), ..Sent::new(Origin::Notify { view: None, tree: Some(cid) }) };
+        // A result view's own request shows in that view instead.
+        let in_view = Sent { conn: Some(cid), what: Some("Running find on db.c".into()), started: ago(2500), ..Sent::new(Origin::View(1, ViewReq::Page)) };
+        app.pending.insert(44, in_view);
         let quick = Sent { conn: Some(cid), what: Some("Loading databases".into()), started: ago(50), ..Sent::new(Origin::Databases(cid)) };
         let unseen = Sent { conn: Some(cid), what: None, started: ago(5000), ..Sent::new(Origin::Fields(cid, Namespace::new("db", "c"))) };
         app.pending.insert(41, slow);
@@ -1525,11 +1514,11 @@ mod tests {
         app.pending.insert(43, unseen);
 
         let ops = app.operations(Instant::now());
-        assert_eq!(ops.iter().map(|o| o.text.as_str()).collect::<Vec<_>>(), ["Running find on db.c · alpha"]);
+        assert_eq!(ops.iter().map(|o| o.text.as_str()).collect::<Vec<_>>(), ["Dropping db.c · alpha"]);
 
-        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 30.0)));
+        let screen = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0)));
         let draw = |app: &mut RongoApp, events: Vec<egui::Event>| {
-            let mut out = ctx.run_ui(egui::RawInput { screen_rect: screen, events, ..Default::default() }, |ui| app.status_bar(ui));
+            let mut out = ctx.run_ui(egui::RawInput { screen_rect: screen, events, ..Default::default() }, |ui| app.activity(ui.ctx()));
             out.textures_delta.clear();
             let mut texts = Vec::new();
             for s in &out.shapes {
@@ -1539,8 +1528,11 @@ mod tests {
             }
             texts
         };
+        // A new area is measured on its first frame and shown from the next.
+        draw(&mut app, vec![]);
         let texts = draw(&mut app, vec![]);
-        assert!(texts.iter().any(|(t, _)| t == "Running find on db.c · alpha…"), "{texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == "Dropping db.c · alpha…"), "{texts:?}");
+        assert!(texts.iter().all(|(_, p)| p.x < 450.0 && p.y > 500.0), "in the bottom-left corner: {texts:?}");
         assert!(texts.iter().any(|(t, _)| t == "2s"), "how long it has run: {texts:?}");
         let (_, x) = texts.iter().find(|(t, _)| t == icon::X_CIRCLE).cloned().expect("a discard button");
         let press = |pressed| egui::Event::PointerButton { pos: x, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
@@ -1549,7 +1541,7 @@ mod tests {
         assert!(app.operations(Instant::now()).is_empty(), "discarded");
         assert!(app.pending.contains_key(&41), "its reply (cancelled) still finds its way back");
         let texts = draw(&mut app, vec![]);
-        assert!(!texts.iter().any(|(t, _)| t.contains("Running find")), "{texts:?}");
+        assert!(texts.is_empty(), "nothing running, nothing drawn: {texts:?}");
     }
 
     /// ⌘R and ⇧⌘R do what the tree's menus say when the pointer is over

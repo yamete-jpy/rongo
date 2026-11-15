@@ -10,7 +10,8 @@ workspace = true
 [dependencies]
 rongo-core.workspace = true
 rquickjs = "0.14"
-serde_json.workspace = true
+# Pasted JSON is read directly: every double must come back bit for bit.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 tokio.workspace = true
 crossbeam-channel.workspace = true
 uuid = { version = "1", features = ["v4"] }

@@ -6,6 +6,9 @@ with signed distance fields for smooth edges. Writes:
 
   assets/icon-1024.png   source for the .icns (scripts/bundle-macos.sh)
   assets/icon-256.rgba   raw RGBA the app sets as its window/Dock icon
+  assets/icon.ico        the Windows icon (16 to 256 px, each size drawn
+                         afresh rather than scaled down), embedded in
+                         rongo.exe and used by the installer
 
 Usage: python3 scripts/make-icon.py
 """
@@ -117,21 +120,42 @@ def render(size):
     return rows
 
 
-def write_png(path, size, rows):
+ICO_SIZES = (16, 24, 32, 48, 64, 128, 256)
+
+
+def png_bytes(size, rows):
     raw = b"".join(b"\x00" + r for r in rows)
     chunk = lambda tag, data: struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
     png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
-    png += chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b"")
+    return png + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b"")
+
+
+def write_png(path, size, rows):
     with open(path, "wb") as f:
-        f.write(png)
+        f.write(png_bytes(size, rows))
+
+
+def write_ico(path, images):
+    """An .ico of PNG-compressed entries (Windows Vista and later); 256 px is stored as 0."""
+    head = struct.pack("<HHH", 0, 1, len(images))
+    offset = 6 + 16 * len(images)
+    entries, data = b"", b""
+    for size, png in images:
+        entries += struct.pack("<BBBBHHII", size % 256, size % 256, 0, 0, 1, 32, len(png), offset + len(data))
+        data += png
+    with open(path, "wb") as f:
+        f.write(head + entries + data)
 
 
 def main():
     os.makedirs(ASSETS, exist_ok=True)
     write_png(os.path.join(ASSETS, "icon-1024.png"), 1024, render(1024))
+    rows256 = render(256)
     with open(os.path.join(ASSETS, "icon-256.rgba"), "wb") as f:
-        f.write(b"".join(render(256)))
-    print("wrote assets/icon-1024.png and assets/icon-256.rgba")
+        f.write(b"".join(rows256))
+    images = [(size, png_bytes(size, rows256 if size == 256 else render(size))) for size in ICO_SIZES]
+    write_ico(os.path.join(ASSETS, "icon.ico"), images)
+    print("wrote assets/icon-1024.png, assets/icon-256.rgba and assets/icon.ico")
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ members = ["crates/core", "crates/shell", "crates/app"]
 
 [workspace.package]
 edition = "2024"
-version = "0.1.4"
+version = "0.1.5"
 license = "MIT"
 
 [workspace.dependencies]
@@ -31,3 +31,10 @@ large_enum_variant = "allow"
 lto = "thin"
 codegen-units = 4
 strip = true
+
+# The vault's Argon2id key derivation takes about 0.5 s optimised but over 8 s
+# unoptimised: debug builds optimise just these two crates.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

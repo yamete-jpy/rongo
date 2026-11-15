@@ -9,7 +9,8 @@ use rongo_shell::{ResultItem, ShellError, ShellEvent, ShellHandle};
 
 use crate::editor::{CodeEditor, RunRequest};
 use crate::net::{Net, Origin};
-use crate::result_view::{ResultView, Source, ViewAction};
+use crate::result_view::{ResultView, Source, TextLines, ViewAction, line_view};
+use crate::shortcut;
 use crate::sidebar::{self, OpenConn};
 use crate::theme;
 
@@ -20,6 +21,7 @@ pub enum TabKind {
     /// A command reply (statistics, server info) shown as a document.
     Info { conn: ConnId, view: Box<ResultView> },
     Indexes(Box<crate::indexes::IndexTab>),
+    History(Box<crate::history_tab::HistoryTab>),
 }
 
 pub struct Tab {
@@ -35,6 +37,7 @@ impl Tab {
             TabKind::Shell(s) => format!("{}  IntelliShell: {}", icon::TERMINAL_WINDOW, conn_name(s.conn)),
             TabKind::Info { view, .. } => format!("{}  {}", icon::INFO, view.title),
             TabKind::Indexes(t) => format!("{}  Index Manager - {}", icon::LIGHTNING, t.ns.coll),
+            TabKind::History(h) => format!("{}  Collection History - {}", icon::CLOCK_COUNTER_CLOCKWISE, h.ns.coll),
         }
     }
 
@@ -45,6 +48,7 @@ impl Tab {
             TabKind::Shell(s) => Some(s.conn),
             TabKind::Info { conn, .. } => Some(*conn),
             TabKind::Indexes(t) => Some(t.conn),
+            TabKind::History(h) => Some(h.conn),
         }
     }
 
@@ -55,6 +59,7 @@ impl Tab {
             TabKind::Shell(s) => s.results.iter_mut().map(|r| &mut r.view).collect(),
             TabKind::Info { view, .. } => vec![view.as_mut()],
             TabKind::Indexes(_) => Vec::new(),
+            TabKind::History(h) => h.views_mut(),
         }
     }
 }
@@ -172,13 +177,19 @@ impl CollectionTab {
         }
         ui.add_space(4.0);
         let actions = self.view.ui(ui, net);
-        // A column menu sort shows up in the Sort field.
         for (_, a) in &actions {
             if let ViewAction::SortChanged(sort) = a {
-                self.sort = if sort.is_empty() { String::new() } else { rongo_core::format::doc_to_shell(sort, rongo_core::format::Style::Editable).replace('\n', " ").split_whitespace().collect::<Vec<_>>().join(" ") };
+                self.show_sort(sort);
             }
         }
         actions
+    }
+
+    /// A column menu sort shows up in the Sort field, on one line. The text
+    /// is not rewritten: spaces inside a quoted field name are the name.
+    fn show_sort(&mut self, sort: &rongo_core::bson::Document) {
+        use rongo_core::format::{Style, to_shell};
+        self.sort = if sort.is_empty() { String::new() } else { to_shell(&rongo_core::bson::Bson::Document(sort.clone()), Style::Editable) };
     }
 }
 
@@ -190,6 +201,50 @@ pub struct ShellResult {
     pub pinned: bool,
 }
 
+/// How much printed output a shell tab keeps (the end of it).
+const RAW_MAX: usize = 1 << 20;
+const RAW_DROPPED: &str = "[earlier output dropped]";
+
+/// What a shell tab's runs printed, as lines: a frame lays out only the
+/// lines in view (`line_view`, as the JSON view does), and printing adds
+/// only what was printed.
+#[derive(Default)]
+struct RawOutput {
+    lines: TextLines,
+    /// ⌘A: all of it is selected, on screen or not.
+    all: bool,
+}
+
+impl RawOutput {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// `text` (a line, or several) at the end. Past RAW_MAX bytes only the
+    /// last three quarters or so are kept, from a line start (from inside
+    /// the last line when that alone is longer), after a note that more
+    /// came before: a script printing in a loop can't fill memory. Copying
+    /// what is kept is rare (every quarter of RAW_MAX printed).
+    fn push(&mut self, text: &str) {
+        self.lines.push_text(text);
+        let all = self.lines.text();
+        if all.len() > RAW_MAX {
+            let from = all.ceil_char_boundary(all.len() - RAW_MAX * 3 / 4);
+            let cut = all[from..].find('\n').map_or(from, |i| from + i + 1);
+            let mut kept = TextLines::default();
+            kept.push(RAW_DROPPED);
+            kept.push_text(&all[cut..]);
+            self.lines = kept;
+        }
+    }
+
+    /// Only `text`.
+    fn set(&mut self, text: &str) {
+        self.clear();
+        self.push(text);
+    }
+}
+
 pub struct ShellTab {
     tab_id: u64,
     pub conn: ConnId,
@@ -197,7 +252,7 @@ pub struct ShellTab {
     editor: CodeEditor,
     shell: Option<ShellHandle>,
     running: Option<(u64, Instant)>,
-    raw: String,
+    raw: RawOutput,
     pub results: Vec<ShellResult>,
     /// 0 is the raw output; n is `results[n - 1]`.
     active: usize,
@@ -220,7 +275,7 @@ impl ShellTab {
             editor: CodeEditor::new(egui::Id::new(("shell-editor", tab_id)), initial),
             shell: None,
             running: None,
-            raw: String::new(),
+            raw: RawOutput::default(),
             results: Vec::new(),
             active: 0,
             status: None,
@@ -259,26 +314,78 @@ impl ShellTab {
                 }
             }
         }
-        let Some(shell) = self.shell.as_mut() else { return };
-        if req.code.trim().is_empty() {
+        if self.shell.is_none() || req.code.trim().is_empty() {
             return;
         }
-        self.results.retain(|r| r.pinned);
-        self.active = if self.results.is_empty() { 0 } else { self.active.min(self.results.len()) };
+        self.keep_pinned();
         self.editor.error_line = None;
         self.status = None;
         self.raw.clear();
+        let Some(shell) = self.shell.as_mut() else { return };
         let run = shell.run(req.code, self.db.clone(), req.line_offset);
         self.running = Some((run, Instant::now()));
     }
 
+    /// A new run starts: only pinned results stay. The one on screen stays
+    /// on screen if it is kept; if not, the raw output shows, where the run
+    /// prints. (`active` counts from 1; 0 is the raw output.)
+    fn keep_pinned(&mut self) {
+        let shown = self.active.checked_sub(1).and_then(|i| self.results.get(i)).map(|r| r.view.id);
+        self.results.retain(|r| r.pinned);
+        self.active = shown.and_then(|id| self.results.iter().position(|r| r.view.id == id)).map_or(0, |i| i + 1);
+    }
+
+    /// The result tab `i` was closed. The one on screen stays on screen;
+    /// closing that one shows the next (or the last).
+    fn close_result(&mut self, i: usize) {
+        self.results.remove(i);
+        if i + 1 < self.active {
+            self.active -= 1;
+        } else if self.active > self.results.len() {
+            self.active = self.results.len();
+        }
+    }
+
+    /// One printed line onto the raw output, which keeps only its last
+    /// `RAW_MAX` bytes or so (`RawOutput::push`).
+    fn append_raw(&mut self, text: &str) {
+        self.raw.push(text);
+    }
+
+    /// The raw output: only the lines in view laid out, following the end
+    /// while a script prints. With nothing focused, ⌘A selects all of it,
+    /// on screen or not, and ⌘C copies that; a click or Esc clears it.
+    fn raw_ui(&mut self, ui: &mut Ui, net: &Net, salt: u64) {
+        let raw = &mut self.raw;
+        if net.keys_enabled && ui.memory(|m| m.focused().is_none()) {
+            if ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::A)) {
+                raw.all = true;
+                // A drag selection would fight it.
+                ui.ctx().with_plugin(|s: &mut egui::text_selection::LabelSelectionState| s.clear_selection());
+            }
+            if raw.all && ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) {
+                ui.ctx().copy_text(raw.lines.text().to_owned());
+            }
+            if raw.all && ui.input(|i| i.key_pressed(Key::Escape)) {
+                raw.all = false;
+            }
+        }
+        let font = theme::mono(12.5);
+        let row_h = ui.fonts_mut(|f| f.row_height(&font)).round();
+        let area = egui::ScrollArea::both().id_salt(("raw", salt)).auto_shrink([false, false]).stick_to_bottom(true);
+        let out = line_view(ui, area, &raw.lines, &font, row_h, raw.all, false, |_, _| {});
+        if raw.all && ui.input(|i| i.pointer.any_pressed()) && ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| out.inner_rect.contains(p)) {
+            raw.all = false;
+        }
+    }
+
     pub fn poll(&mut self, net: &mut Net) {
-        let Some(shell) = &self.shell else { return };
-        while let Some(ev) = shell.try_recv() {
+        while let Some(ev) = self.shell.as_ref().and_then(ShellHandle::try_recv) {
             match ev {
-                ShellEvent::Print { text, .. } => {
-                    self.raw.push_str(&text);
-                    self.raw.push('\n');
+                ShellEvent::Print { texts, .. } => {
+                    for text in texts {
+                        self.append_raw(&text);
+                    }
                 }
                 ShellEvent::Result { item, .. } => {
                     let id = net.view_id();
@@ -305,7 +412,7 @@ impl ShellTab {
                     }
                     self.db = db;
                     if let Some(e) = &error {
-                        self.raw.push_str(&format!("{e}\n"));
+                        self.raw.push(&e.to_string());
                         self.editor.error_line = e.line;
                         self.active = 0;
                     } else if self.results.iter().all(|r| r.pinned) {
@@ -319,17 +426,43 @@ impl ShellTab {
 
     pub fn ui(&mut self, ui: &mut Ui, net: &mut Net, conn: Option<&OpenConn>, session: impl FnOnce() -> Option<Session>, waker: &Waker) -> Vec<(u64, ViewAction)> {
         self.poll(net);
-        let collections = conn.map(|c| c.collection_names(&self.db)).unwrap_or_default();
         sidebar::breadcrumb(ui, conn, &self.db);
         ui.add_space(2.0);
 
+        let mut run = self.toolbar(ui, net);
+        if let Some(r) = self.editor_pane(ui, conn) {
+            run = Some(r);
+        }
+
+        // Fetch sample documents once per collection for field suggestions.
+        if let Some(coll) = self.editor.wanted_fields() {
+            let ns = Namespace::new(&self.db, coll);
+            if self.requested_fields.insert(ns.to_string()) {
+                net.send(Origin::Fields(self.conn, ns.clone()), Some(self.conn), rongo_core::Command::Find(FindSpec::all(ns, 100)));
+            }
+        }
+        if run.is_none() && self.run_when_ready && conn.is_some_and(|c| c.info().is_some()) {
+            self.run_when_ready = false;
+            run = Some(self.editor.run_all());
+        }
+        if let Some(req) = run {
+            self.start(req, session(), waker);
+        }
+
+        self.result_tabs(ui, net)
+    }
+
+    /// The toolbar: Run, Run current statement, Stop, New, Load file, Save
+    /// file. Returns the run a button asked for.
+    fn toolbar(&mut self, ui: &mut Ui, net: &Net) -> Option<RunRequest> {
         let mut run: Option<RunRequest> = None;
-        ui.horizontal(|ui| {
+        // Wraps on a narrow tab rather than widening it.
+        ui.horizontal_wrapped(|ui| {
             let busy = self.running.is_some();
-            if ui.add_enabled(!busy, egui::Button::new(RichText::new(icon::PLAY).color(theme::OK).size(16.0))).on_hover_text("Run all or selection (⌘↩ / F5)").clicked() {
+            if ui.add_enabled(!busy, egui::Button::new(RichText::new(icon::PLAY).color(theme::OK).size(16.0))).on_hover_text(shortcut::label("Run all or selection (⌘↩ / F5)")).clicked() {
                 run = Some(self.editor.run_all());
             }
-            if ui.add_enabled(!busy, egui::Button::new(RichText::new(icon::SKIP_FORWARD).color(theme::OK).size(16.0))).on_hover_text("Run current statement (⇧⌘↩)").clicked() {
+            if ui.add_enabled(!busy, egui::Button::new(RichText::new(icon::SKIP_FORWARD).color(theme::OK).size(16.0))).on_hover_text(shortcut::label("Run current statement (⇧⌘↩)")).clicked() {
                 run = Some(self.editor.run_current());
             }
             if ui.add_enabled(busy, egui::Button::new(RichText::new(icon::STOP).color(theme::ERROR).size(16.0))).on_hover_text("Stop").clicked()
@@ -350,7 +483,7 @@ impl ShellTab {
                         self.editor.set_text(text);
                         self.file = Some(path);
                     }
-                    Err(e) => self.raw = format!("could not read {}: {e}\n", path.display()),
+                    Err(e) => self.raw.set(&format!("could not read {}: {e}", path.display())),
                 }
             }
             // ⌘S belongs to a dialog on top (the document editor saves with it).
@@ -361,7 +494,7 @@ impl ShellTab {
                 if let Some(path) = path {
                     match std::fs::write(&path, &self.editor.text) {
                         Ok(()) => self.file = Some(path),
-                        Err(e) => self.raw = format!("could not save {}: {e}\n", path.display()),
+                        Err(e) => self.raw.set(&format!("could not save {}: {e}", path.display())),
                     }
                 }
             }
@@ -369,11 +502,17 @@ impl ShellTab {
                 ui.weak(f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
             }
         });
+        run
+    }
 
+    /// The editor and its footer, and under them the handle that drags
+    /// the split. Returns the run the editor asked for (⌘↩, F5), unless a
+    /// script is running.
+    fn editor_pane(&mut self, ui: &mut Ui, conn: Option<&OpenConn>) -> Option<RunRequest> {
+        let mut run: Option<RunRequest> = None;
         // Editor on top, results below. The split is a stored height that only
         // changes when the user drags the handle: sizing it from the content
         // made it creep a pixel every frame.
-        let tab_salt = self.tab_id;
         let width = ui.available_width();
         let max_split = (ui.available_height() - 140.0).max(90.0);
         self.split = self.split.clamp(90.0, max_split);
@@ -388,6 +527,8 @@ impl ShellTab {
                 let footer_h = 24.0;
                 ui.allocate_ui(egui::vec2(width, (inner.height() - footer_h).max(20.0)), |ui| {
                     let db = self.db.clone();
+                    // Read when completing, not copied every frame.
+                    let collections = || conn.map(|c| c.collection_names(&db)).unwrap_or_default();
                     let fields = |coll: &str| conn.and_then(|c| c.fields.get(&Namespace::new(&db, coll)).cloned());
                     let out = self.editor.ui(ui, &collections, &fields);
                     if out.run.is_some() && self.running.is_none() {
@@ -410,7 +551,10 @@ impl ShellTab {
                                 ui.colored_label(theme::OK, format!("Done in {ms} ms"));
                             }
                             Some(Err(e)) => {
-                                ui.colored_label(theme::ERROR, e.to_string()).on_hover_text(&e.message);
+                                // One line from the left: in this right-to-left
+                                // row a long error ran over the hint and lost its start.
+                                let w = ui.available_width();
+                                theme::clipped_text(ui, &e.to_string(), theme::ERROR, 1, w);
                             }
                             None => {
                                 ui.colored_label(theme::OK, "No errors");
@@ -431,22 +575,13 @@ impl ShellTab {
         }
         let line = if drag.hovered() || drag.dragged() { theme::ACCENT } else { theme::BORDER };
         ui.painter().hline(handle.x_range(), handle.center().y, egui::Stroke::new(1.0, line));
+        run
+    }
 
-        // Fetch sample documents once per collection for field suggestions.
-        if let Some(coll) = self.editor.wanted_fields() {
-            let ns = Namespace::new(&self.db, coll);
-            if self.requested_fields.insert(ns.to_string()) {
-                net.send(Origin::Fields(self.conn, ns.clone()), Some(self.conn), rongo_core::Command::Find(FindSpec::all(ns, 100)));
-            }
-        }
-        if run.is_none() && self.run_when_ready && conn.is_some_and(|c| c.info().is_some()) {
-            self.run_when_ready = false;
-            run = Some(self.editor.run_all());
-        }
-        if let Some(req) = run {
-            self.start(req, session(), waker);
-        }
-
+    /// The result tabs (the raw output, then each result, with its pin and
+    /// close buttons), and under them the one shown.
+    fn result_tabs(&mut self, ui: &mut Ui, net: &mut Net) -> Vec<(u64, ViewAction)> {
+        let tab_salt = self.tab_id;
         // Result tabs.
         let mut close = None;
         ui.horizontal_wrapped(|ui| {
@@ -463,19 +598,14 @@ impl ShellTab {
             }
         });
         if let Some(i) = close {
-            self.results.remove(i);
-            if self.active > self.results.len() {
-                self.active = self.results.len();
-            }
+            self.close_result(i);
         }
         ui.separator();
         if self.active == 0 {
-            egui::ScrollArea::both().id_salt(("raw", tab_salt)).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-                let mut text = self.raw.as_str();
-                ui.add(egui::TextEdit::multiline(&mut text).font(theme::mono(12.5)).frame(egui::Frame::NONE).desired_width(f32::INFINITY));
-            });
+            self.raw_ui(ui, net, tab_salt);
             Vec::new()
         } else {
+            self.raw.all = false;
             let idx = self.active - 1;
             self.results[idx].view.ui(ui, net)
         }
@@ -489,6 +619,100 @@ mod tests {
 
     use super::*;
 
+    /// A script printing without end leaves the raw output its last
+    /// megabyte or so, starting at a line, with a note that more came before;
+    /// its lines are found where they are, after every trim.
+    #[test]
+    fn raw_output_keeps_only_its_end() {
+        let mut tab = ShellTab::new(ConnId(uuid::Uuid::nil()), "test".into(), 7, String::new());
+        let lines_hold_up = |tab: &ShellTab| {
+            let raw = &tab.raw.lines;
+            assert!((0..raw.len()).map(|i| raw.line(i)).eq(raw.text().split('\n')), "the lines are where they are in the text");
+        };
+        for i in 0..200_000 {
+            tab.append_raw(&format!("line {i} é"));
+            if i % 50_000 == 49_999 {
+                lines_hold_up(&tab);
+            }
+        }
+        let text = |tab: &ShellTab| tab.raw.lines.text().to_owned();
+        assert!(text(&tab).len() <= RAW_MAX, "{} bytes kept", text(&tab).len());
+        assert!(text(&tab).len() > RAW_MAX / 2, "{} bytes kept", text(&tab).len());
+        assert!(text(&tab).starts_with(&format!("{RAW_DROPPED}\nline ")), "{:?}", &text(&tab)[..60]);
+        assert!(text(&tab).ends_with("\nline 199999 é"));
+        // A printed text of several lines adds them all.
+        tab.append_raw("{\n  \"a\" : 1\n}");
+        assert!(text(&tab).ends_with("line 199999 é\n{\n  \"a\" : 1\n}"));
+        lines_hold_up(&tab);
+        // One line longer than what is kept: its end stays.
+        let huge = format!("{}the end", "é".repeat(600_000));
+        tab.append_raw(&huge);
+        assert!(text(&tab).len() <= RAW_MAX, "{} bytes kept", text(&tab).len());
+        assert!(text(&tab).starts_with(&format!("{RAW_DROPPED}\n")) && text(&tab).ends_with("éthe end"), "{} bytes kept", text(&tab).len());
+        assert!(text(&tab).len() > RAW_MAX / 2, "{} bytes kept", text(&tab).len());
+        assert_eq!(tab.raw.lines.len(), 2);
+        lines_hold_up(&tab);
+    }
+
+    /// One frame of a shell tab, 1200×800: the texts drawn, and what was
+    /// copied.
+    fn shell_frame(ctx: &egui::Context, tab: &mut ShellTab, events: Vec<egui::Event>) -> (Vec<Arc<egui::Galley>>, Option<String>) {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let core = rongo_core::CoreHandle::start(rt.handle().clone(), Arc::new(|| {}));
+        let (mut pending, mut next_view) = (HashMap::new(), 0);
+        let waker: Waker = Arc::new(|| {});
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))), events, ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| {
+            let mut net = Net { core: &core, pending: &mut pending, next_view_id: &mut next_view, keys_enabled: true };
+            tab.ui(ui, &mut net, None, || None, &waker);
+        });
+        out.textures_delta.clear();
+        let galleys = out.shapes.iter().filter_map(|s| if let egui::Shape::Text(t) = &s.shape { Some(t.galley.clone()) } else { None }).collect();
+        let copied = out.platform_output.commands.into_iter().find_map(|c| if let egui::OutputCommand::CopyText(t) = c { Some(t) } else { None });
+        (galleys, copied)
+    }
+
+    /// 20,000 printed lines: a frame lays out only those in view, each on
+    /// its own, and shows the end, where a running script prints.
+    #[test]
+    fn raw_output_lays_out_only_the_lines_in_view() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut tab = ShellTab::new(ConnId(uuid::Uuid::nil()), "test".into(), 7, "print(1)".into());
+        for i in 0..20_000 {
+            tab.append_raw(&format!("printed line {i}"));
+        }
+        shell_frame(&ctx, &mut tab, vec![]);
+        let (galleys, _) = shell_frame(&ctx, &mut tab, vec![]);
+        let printed: Vec<_> = galleys.iter().filter(|g| g.text().contains("printed line")).collect();
+        assert!(printed.iter().all(|g| g.rows.len() == 1), "a galley a line, not {:?} rows", printed.iter().map(|g| g.rows.len()).max());
+        assert!(!printed.is_empty() && printed.len() < 100, "{} lines laid out", printed.len());
+        assert!(printed.iter().any(|g| g.text() == "printed line 19999"), "the end is in view");
+    }
+
+    /// With nothing focused, ⌘A selects all of the raw output and ⌘C copies
+    /// it, lines off screen too; a click clears it.
+    #[test]
+    fn command_a_copies_all_of_the_raw_output() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut tab = ShellTab::new(ConnId(uuid::Uuid::nil()), "test".into(), 7, "print(1)".into());
+        let printed: Vec<String> = (0..5_000).map(|i| format!("printed line {i} สวัสดี")).collect();
+        for p in &printed {
+            tab.append_raw(p);
+        }
+        shell_frame(&ctx, &mut tab, vec![]);
+        let cmd_a = egui::Event::Key { key: Key::A, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND };
+        shell_frame(&ctx, &mut tab, vec![cmd_a]);
+        let (_, copied) = shell_frame(&ctx, &mut tab, vec![egui::Event::Copy]);
+        assert_eq!(copied.as_deref(), Some(printed.join("\n").as_str()), "all of it");
+        let at = egui::pos2(600.0, 700.0);
+        let click = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        shell_frame(&ctx, &mut tab, vec![egui::Event::PointerMoved(at), click(true)]);
+        shell_frame(&ctx, &mut tab, vec![click(false)]);
+        let (_, copied) = shell_frame(&ctx, &mut tab, vec![egui::Event::Copy]);
+        assert_ne!(copied.as_deref(), Some(printed.join("\n").as_str()), "a click cleared it");
+    }
     /// Frame after frame with no input, the editor/results split must not move.
     /// (It used to creep by a pixel per frame.)
     #[test]
@@ -552,6 +776,22 @@ mod tests {
         assert!(run.right() <= 520.0 && clear.right() <= 520.0, "buttons stay on screen: {run:?} {clear:?}");
     }
 
+    /// Column › Sort Collection writes its sort into the Sort field, and
+    /// the next Run sorts by the same field, spaces in its name and all.
+    #[test]
+    fn sort_collection_keeps_the_field_name() {
+        let mut tab = CollectionTab::new(ConnId(uuid::Uuid::nil()), Namespace::new("db", "c"), 3);
+        let sort = rongo_core::bson::doc! { "a  b": 1, "c": -1 };
+        tab.show_sort(&sort);
+        assert!(!tab.sort.contains('\n'), "one line: {:?}", tab.sort);
+        tab.run();
+        assert_eq!(tab.query_error, None);
+        let Source::Find { spec, .. } = &tab.view.source else { unreachable!() };
+        assert_eq!(spec.sort, Some(sort), "Sort field: {:?}", tab.sort);
+        tab.show_sort(&rongo_core::bson::Document::new());
+        assert_eq!(tab.sort, "");
+    }
+
     /// With a dialog open over the shell, ⌘S is left for the dialog (the
     /// document editor saves with it) instead of saving the script.
     #[test]
@@ -573,5 +813,123 @@ mod tests {
         });
         out.textures_delta.clear();
         assert!(left, "the dialog still gets ⌘S");
+    }
+
+    /// A long script error in the editor's status row is one line that
+    /// keeps its start ("line 4: …") and does not run over the hint.
+    #[test]
+    fn long_shell_error_keeps_its_start() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let core = rongo_core::CoreHandle::start(rt.handle().clone(), Arc::new(|| {}));
+        let mut pending = HashMap::new();
+        let mut next_view = 0;
+        let waker: Waker = Arc::new(|| {});
+        let mut tab = ShellTab::new(ConnId(uuid::Uuid::nil()), "test".into(), 7, "db.x.find()".into());
+        tab.status = Some(Err(rongo_shell::ShellError { message: crate::test_support::long_driver_error(), line: Some(4) }));
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let width = 1000.0;
+        let input = || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 700.0))), ..Default::default() };
+        let mut texts = Vec::new();
+        for _ in 0..3 {
+            let mut out = ctx.run_ui(input(), |ui| {
+                let mut net = Net { core: &core, pending: &mut pending, next_view_id: &mut next_view, keys_enabled: false };
+                tab.ui(ui, &mut net, None, || None, &waker);
+            });
+            out.textures_delta.clear();
+            texts = out.shapes.iter().filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) => Some((t.galley.clone(), t.galley.rect.translate(t.pos.to_vec2()))),
+                _ => None,
+            }).collect();
+        }
+        let [hint, error] = ["Ctrl+Space", "line 4: timed out"].map(|start| {
+            texts.iter().find(|(g, _)| g.text().starts_with(start)).unwrap_or_else(|| panic!("{start:?} drawn"))
+        });
+        assert_eq!(error.0.rows.len(), 1);
+        assert!(error.0.elided);
+        assert!(error.1.left() >= hint.1.right(), "the error {:?} runs over the hint {:?}", error.1, hint.1);
+        assert!(error.1.right() <= width, "{:?}", error.1);
+    }
+
+    /// The result on screen stays on screen when other result tabs go:
+    /// one closed to its left, or unpinned ones dropped as a run starts.
+    #[test]
+    fn the_shown_result_stays_when_others_close() {
+        let mut tab = ShellTab::new(ConnId(uuid::Uuid::nil()), "test".into(), 7, String::new());
+        let ids = std::cell::Cell::new(0);
+        let result = |label: &str, pinned: bool| {
+            ids.set(ids.get() + 1);
+            ShellResult { label: label.into(), view: ResultView::new(ids.get(), label, Source::Static { docs: Vec::new(), truncated: false }), pinned }
+        };
+        let shown = |tab: &ShellTab| if tab.active == 0 { "raw".to_string() } else { tab.results[tab.active - 1].label.clone() };
+        tab.results = vec![result("A", false), result("B", false), result("C", false)];
+        tab.active = 2;
+        tab.close_result(0);
+        assert_eq!(shown(&tab), "B", "closing a tab to its left");
+        tab.close_result(1);
+        assert_eq!(shown(&tab), "B", "closing a tab to its right");
+        tab.close_result(0);
+        assert_eq!(shown(&tab), "raw", "closing it: the one before");
+
+        tab.results = vec![result("A", false), result("B", true), result("C", true)];
+        tab.active = 2;
+        tab.keep_pinned();
+        assert_eq!(shown(&tab), "B", "a run drops the unpinned ones");
+        tab.active = 0;
+        tab.keep_pinned();
+        assert_eq!(shown(&tab), "raw");
+        tab.results.push(result("D", false));
+        tab.active = 3;
+        tab.keep_pinned();
+        assert_eq!(shown(&tab), "raw", "the shown one dropped: the raw output, where the run prints");
+    }
+
+    /// What the raw output costs while a script prints 200,000 lines (2,000
+    /// a frame), and a frame once it is done, with about 1 MiB kept. Run with
+    /// `cargo test -p rongo --release -- --ignored --nocapture report_shell_output_frame_time`.
+    #[test]
+    #[ignore = "timing; run explicitly in release mode"]
+    fn report_shell_output_frame_time() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let core = rongo_core::CoreHandle::start(rt.handle().clone(), Arc::new(|| {}));
+        let mut pending = HashMap::new();
+        let mut next_view = 0;
+        let waker: Waker = Arc::new(|| {});
+        let mut tab = ShellTab::new(ConnId(uuid::Uuid::nil()), "test".into(), 7, "db.x.find()".into());
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut frame = |tab: &mut ShellTab| {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                let mut net = Net { core: &core, pending: &mut pending, next_view_id: &mut next_view, keys_enabled: true };
+                tab.ui(ui, &mut net, None, || None, &waker);
+            });
+            out.textures_delta.clear();
+        };
+        frame(&mut tab);
+        frame(&mut tab);
+        let (mut appending, mut drawing, mut slowest) = (0.0, 0.0, 0.0f64);
+        for f in 0..100 {
+            let t = Instant::now();
+            for i in 0..2_000 {
+                tab.append_raw(&format!("{{ \"_id\" : {}, \"name\" : \"สล็อตมังกรทองคำ {i}\", \"rtp\" : 96.5 }}", f * 2_000 + i));
+            }
+            appending += t.elapsed().as_secs_f64() * 1000.0;
+            let t = Instant::now();
+            frame(&mut tab);
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            drawing += ms;
+            slowest = slowest.max(ms);
+        }
+        let idle = (0..5)
+            .map(|_| {
+                let t = Instant::now();
+                for _ in 0..10 {
+                    frame(&mut tab);
+                }
+                t.elapsed().as_secs_f64() * 100.0
+            })
+            .fold(f64::INFINITY, f64::min);
+        eprintln!("raw output, 200,000 lines printed 2,000 a frame: appending {appending:.1} ms in all, frames {drawing:.1} ms in all (slowest {slowest:.1} ms); then {idle:.2} ms/frame idle");
     }
 }

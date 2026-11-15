@@ -4,14 +4,16 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use rongo_core::bson::Bson;
 use rongo_core::{Command, ConnId, CoreHandle, Namespace, RequestId};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ViewReq {
     Page,
     Count,
-    /// Re-read the document at this row index (Refresh Document).
-    RefreshDoc(usize),
+    /// Re-read the document with this `_id` (Refresh Document). The reply
+    /// finds its row by the `_id`: a header sort may have moved it.
+    RefreshDoc(Bson),
 }
 
 #[derive(Clone, Debug)]
@@ -30,6 +32,15 @@ pub enum Origin {
     /// A write or admin command: toast the outcome, then refresh the view
     /// and/or the connection's tree.
     Notify { view: Option<u64>, tree: Option<ConnId> },
+    /// A write that changes database `db`'s part of the tree (add, drop or
+    /// duplicate a collection, drop an index or the database, hide an
+    /// index): toast the outcome, then refresh the connection's tree; after
+    /// a failure, which may have changed it anyway (a Duplicate's partial
+    /// copy), list that database's collections again.
+    TreeWrite { conn: ConnId, db: String },
+    /// Set to null or Remove Field on the document with this `_id`: toast
+    /// the outcome, then the view re-reads just that document.
+    UpdateOne { view: u64, id: Bson },
     /// A command whose reply opens in an info tab.
     Info { conn: ConnId, title: String },
     /// The current validator, for the validator dialog.
@@ -42,9 +53,31 @@ pub enum Origin {
     IndexTab(u64),
     /// A whole document fetched for the editor (`clone`: as a new document).
     OpenDoc { conn: ConnId, ns: Namespace, view: u64, clone: bool },
+    /// A paste: the copy's outcome is toasted and the target database
+    /// (`db` on `to`) reloaded in the tree.
+    Copy { to: ConnId, db: String },
     /// Requests from the export/import/index/validator/bulk dialogs; the reply
     /// goes back to the dialog, which then closes.
     Tool { view: Option<u64>, tree: Option<ConnId> },
+    /// A request of the History tab with this tab id, on this collection
+    /// (named in the restore's toast even if the tab has closed).
+    History { tab: u64, ns: Namespace, req: HistoryReq },
+    /// Rename Collection: once the server has renamed `from` to `to`, its
+    /// Collection History moves along, its tabs close and the tree reloads.
+    Rename { conn: ConnId, from: Namespace, to: Namespace },
+    /// Drop Collection: once the server has dropped `ns`, its tabs close
+    /// and the tree reloads.
+    Dropped { conn: ConnId, ns: Namespace },
+}
+
+/// What a History tab asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryReq {
+    /// The conflict check that comes before a restore.
+    Check,
+    Restore,
+    /// The current documents, for "Show changes".
+    Compare,
 }
 
 /// A request waiting for its reply.
@@ -56,12 +89,17 @@ pub struct Sent {
     /// (autocomplete samples, hover statistics) and once cancelled.
     pub what: Option<String>,
     pub started: Instant,
+    /// The latest `Event::Progress`: done, total (if known) and a note.
+    pub progress: Option<(u64, Option<u64>, String)>,
+    /// Whether a cancel can stop it (`Command::cancellable`): a write the
+    /// server finishes once begun can't be, and shows no ⊗.
+    pub cancellable: bool,
 }
 
 #[cfg(test)]
 impl Sent {
     pub fn new(origin: Origin) -> Self {
-        Self { origin, conn: None, what: None, started: Instant::now() }
+        Self { origin, conn: None, what: None, started: Instant::now(), progress: None, cancellable: true }
     }
 }
 
@@ -74,11 +112,12 @@ pub fn describe(origin: &Origin, cmd: &Command) -> Option<String> {
     Some(match cmd {
         Command::Connect(_) if matches!(origin, Origin::Test(_)) => "Testing the connection".into(),
         Command::Connect(_) => "Connecting".into(),
-        Command::Disconnect | Command::Cancel(_) => return None,
+        Command::Disconnect | Command::Cancel(_) | Command::SetReadOnly(_) => return None,
         Command::ListDatabases => "Loading databases".into(),
         Command::ListCollections { db } => format!("Loading collections of {db}"),
         Command::ListIndexes { ns } | Command::IndexDetails { ns } => format!("Loading indexes of {ns}"),
         Command::Find(spec) if matches!(origin, Origin::OpenDoc { .. }) => format!("Reading a document from {}", spec.ns),
+        Command::Find(spec) if matches!(origin, Origin::History { .. }) => format!("Reading the current documents of {}", spec.ns),
         Command::Find(spec) => format!("Running find on {}", spec.ns),
         Command::Count { ns, .. } => format!("Counting documents in {ns}"),
         Command::Insert { ns, .. } => format!("Inserting a document into {ns}"),
@@ -86,7 +125,7 @@ pub fn describe(origin: &Origin, cmd: &Command) -> Option<String> {
         Command::Delete { ns, ids } => format!("Deleting {} document{} from {ns}", ids.len(), plural(ids.len())),
         Command::InsertMany { ns, docs } => format!("Inserting {} document{} into {ns}", docs.len(), plural(docs.len())),
         Command::UpdateMany { ns, .. } | Command::Update { ns, .. } => format!("Updating documents in {ns}"),
-        Command::DeleteMany { ns, .. } | Command::DeleteWhere { ns, .. } => format!("Deleting documents from {ns}"),
+        Command::DeleteWhere { ns, .. } => format!("Deleting documents from {ns}"),
         Command::CreateCollection { ns } => format!("Creating {ns}"),
         Command::DropCollection { ns } => format!("Dropping {ns}"),
         Command::ClearCollection { ns } => format!("Clearing {ns}"),
@@ -105,6 +144,10 @@ pub fn describe(origin: &Origin, cmd: &Command) -> Option<String> {
         },
         Command::Export(spec) => format!("Exporting {}", spec.ns),
         Command::Import { ns, .. } => format!("Importing into {ns}"),
+        Command::CopyCollections { items, .. } => format!("Copying {} collection{}", items.len(), plural(items.len())),
+        Command::Recorded { cmd, .. } => return describe(origin, cmd),
+        Command::HistoryConflicts { entry, .. } => format!("Checking {} for conflicts", entry.ns),
+        Command::HistoryRestore { entry, .. } => format!("Restoring documents into {}", entry.ns),
     })
 }
 
@@ -119,6 +162,7 @@ pub struct Net<'a> {
 impl Net<'_> {
     pub fn send(&mut self, origin: Origin, conn: Option<ConnId>, cmd: Command) -> RequestId {
         let what = describe(&origin, &cmd);
+        let cancellable = cmd.cancellable();
         let id = self.core.send(conn, cmd);
         if !matches!(origin, Origin::None) {
             // A connect goes out before the connection exists; name it by its id.
@@ -126,7 +170,7 @@ impl Net<'_> {
                 Origin::Connect(c) => Some(c),
                 _ => None,
             });
-            self.pending.insert(id, Sent { origin, conn, what, started: Instant::now() });
+            self.pending.insert(id, Sent { origin, conn, what, started: Instant::now(), progress: None, cancellable });
         }
         id
     }

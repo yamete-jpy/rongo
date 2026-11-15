@@ -57,7 +57,12 @@ impl Tunnel {
             }
             SshAuth::Key { path } => {
                 let path = expand_home(path);
-                let key = russh::keys::load_secret_key(&path, secret.as_deref())
+                // Decrypting a key runs its KDF (up to about a second): not on
+                // one of the runtime's few workers, where finds would wait.
+                let file = path.clone();
+                let key = tokio::task::spawn_blocking(move || russh::keys::load_secret_key(&file, secret.as_deref()))
+                    .await
+                    .map_err(|e| err(&e))?
                     .map_err(|e| CoreError::Tunnel(format!("{}: {e}", path.display())))?;
                 let hash = session.best_supported_rsa_hash().await.map_err(|e| err(&e))?.flatten();
                 let key = PrivateKeyWithHashAlg::new(Arc::new(key), hash);

@@ -164,9 +164,7 @@ pub fn complete(before: &str, collections: &[String], fields: &dyn Fn(&str) -> O
                     items.extend(names.iter().map(|f| item(f, &in_string(f), Kind::Field)));
                 }
                 // "$field" references in aggregation expressions.
-                _ if prefix.starts_with('$') => {
-                    items.extend(names.iter().map(|f| item(&format!("${f}"), &in_string(&format!("${f}")), Kind::Field)));
-                }
+                _ if prefix.starts_with('$') => items.extend(field_refs(&names, in_string)),
                 _ => {}
             }
         }
@@ -214,10 +212,10 @@ pub fn complete(before: &str, collections: &[String], fields: &dyn Fn(&str) -> O
                     };
                     items.push(item(c, &insert, Kind::Collection));
                 }
-                items.extend(DB_METHODS.iter().map(|m| item(m, m, Kind::Method)));
+                items.extend(listed(DB_METHODS, Kind::Method));
             }
-            Receiver::Collection => items.extend(COLLECTION_METHODS.iter().map(|m| item(m, m, Kind::Method))),
-            Receiver::Cursor => items.extend(CURSOR_METHODS.iter().map(|m| item(m, m, Kind::Method))),
+            Receiver::Collection => items.extend(listed(COLLECTION_METHODS, Kind::Method)),
+            Receiver::Cursor => items.extend(listed(CURSOR_METHODS, Kind::Method)),
             Receiver::Unknown => {}
         }
     } else if let Some(coll) = query_collection(before, &scan.stack).filter(|_| innermost(&scan.stack).is_some()) {
@@ -229,25 +227,25 @@ pub fn complete(before: &str, collections: &[String], fields: &dyn Fn(&str) -> O
                     let insert = if is_identifier(f) { f.clone() } else { js_string(f) };
                     items.push(item(f, &insert, Kind::Field));
                 }
-                items.extend(OPERATORS.iter().map(|o| item(o, o, Kind::Operator)));
+                items.extend(listed(OPERATORS, Kind::Operator));
             }
             (Some(':' | '[' | ','), _) => {
                 if prefix.starts_with('$') {
                     let names = field_list(&coll);
-                    items.extend(names.iter().map(|f| item(&format!("${f}"), &js_string(&format!("${f}")), Kind::Field)));
-                    items.extend(OPERATORS.iter().map(|o| item(o, o, Kind::Operator)));
+                    items.extend(field_refs(&names, js_string));
+                    items.extend(listed(OPERATORS, Kind::Operator));
                 } else if !prefix.is_empty() {
-                    items.extend(VALUES.iter().map(|v| item(v, v, Kind::Global)));
+                    items.extend(listed(VALUES, Kind::Global));
                 }
             }
             _ => {}
         }
         if items.is_empty() && !prefix.is_empty() {
-            items.extend(GLOBALS.iter().map(|g| item(g, g, Kind::Global)));
+            items.extend(listed(GLOBALS, Kind::Global));
         }
     } else if !prefix.is_empty() {
-        items.extend(GLOBALS.iter().map(|g| item(g, g, Kind::Global)));
-        items.extend(KEYWORDS.iter().map(|k| item(k, k, Kind::Keyword)));
+        items.extend(listed(GLOBALS, Kind::Global));
+        items.extend(listed(KEYWORDS, Kind::Keyword));
     }
     let items = rank(items, prefix);
     Completions { start, items, needs_fields }
@@ -283,6 +281,20 @@ fn escape_in_string(s: &str, quote: char) -> String {
 
 fn item(label: &str, insert: &str, kind: Kind) -> Completion {
     Completion { label: label.into(), insert: insert.into(), kind, matched: None }
+}
+
+/// Items for words of a fixed list, inserted as they are.
+fn listed(words: &'static [&'static str], kind: Kind) -> impl Iterator<Item = Completion> {
+    words.iter().map(move |w| item(w, w, kind))
+}
+
+/// `$field` references to `names` (aggregation expressions), each inserted
+/// as `quote` writes it.
+fn field_refs<'a>(names: &'a [String], quote: impl Fn(&str) -> String + 'a) -> impl Iterator<Item = Completion> + 'a {
+    names.iter().map(move |f| {
+        let r = format!("${f}");
+        item(&r, &quote(&r), Kind::Field)
+    })
 }
 
 /// Keep items that contain the prefix. Match tiers: exact-case prefix,

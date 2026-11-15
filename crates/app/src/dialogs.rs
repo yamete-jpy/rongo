@@ -5,11 +5,13 @@ use egui::{Align, Context, Id, Key, Layout, Modal, RichText, Ui, vec2};
 use egui_phosphor::regular as icon;
 use rongo_core::bson::{Bson, Document};
 use rongo_core::format::{self, Style};
-use rongo_core::profile::{self, Auth, ConnectionProfile, SecretKind, SshAuth, SshConfig, Target, TlsConfig};
+use rongo_core::profile::{Auth, ConnectionProfile, SecretKind, SshAuth, SshConfig, Target, TlsConfig};
+use rongo_core::vault::Vault;
 use rongo_core::{ConnId, ConnectRequest, Namespace, RequestId};
 use uuid::Uuid;
 
-use crate::{highlight, theme};
+use crate::theme;
+use crate::vault_ui::{self, CatchUp};
 
 // ---------------------------------------------------------------- connection manager
 
@@ -56,12 +58,26 @@ struct Form {
     has_saved_ssh_secret: bool,
     default_db: String,
     color: Option<String>,
+    read_only: bool,
+    /// Collection History: `None` follows Settings.
+    history: Option<bool>,
     tab: FormTab,
     error: Option<String>,
 }
 
 impl Form {
-    fn from_profile(p: &ConnectionProfile, is_new: bool) -> Self {
+    /// The form for a connection not saved yet (new, or a clone): nothing is
+    /// saved for it.
+    fn new(p: &ConnectionProfile) -> Self {
+        Self::build(p, true, |_| false)
+    }
+
+    /// A saved connection's form, noting which of its secrets the vault holds.
+    fn from_profile(p: &ConnectionProfile, vault: &Vault) -> Self {
+        Self::build(p, false, |kind| vault.get(p.id, kind).is_some())
+    }
+
+    fn build(p: &ConnectionProfile, is_new: bool, in_vault: impl Fn(SecretKind) -> bool) -> Self {
         let (mode, uri, hosts, replica_set, direct) = match &p.target {
             Target::Uri { uri } => (TargetMode::Uri, uri.clone(), "localhost:27017".into(), String::new(), false),
             Target::Manual { hosts, replica_set, direct } => {
@@ -76,8 +92,9 @@ impl Form {
         let uses = |kind| match kind {
             SecretKind::Password => p.uses_password(),
             SecretKind::Ssh => p.ssh.is_some(),
+            SecretKind::HistoryKey => false, // not a connection secret
         };
-        let saved = |kind| !is_new && uses(kind) && profile::get_secret(p.id, kind).ok().flatten().is_some();
+        let saved = |kind| !is_new && uses(kind) && in_vault(kind);
         Self {
             id: p.id,
             is_new,
@@ -109,6 +126,8 @@ impl Form {
             has_saved_ssh_secret: saved(SecretKind::Ssh),
             default_db: p.default_db.clone().unwrap_or_default(),
             color: p.color.clone(),
+            read_only: p.read_only,
+            history: p.history,
             tab: FormTab::Server,
             error: None,
         }
@@ -151,9 +170,12 @@ impl Form {
         let path = |s: &str| (!s.trim().is_empty()).then(|| std::path::PathBuf::from(s.trim()));
         let tls = TlsConfig { ca_file: path(&self.ca_file), cert_key_file: path(&self.cert_file), ..self.tls.clone() };
         let ssh = if self.ssh_on {
-            let port: u16 = self.ssh_port.trim().parse().map_err(|_| "SSH port must be a number".to_string())?;
+            let port: u16 = self.ssh_port.trim().parse().ok().filter(|p| *p > 0).ok_or("SSH port must be a number from 1 to 65535")?;
             if self.ssh_host.trim().is_empty() || self.ssh_user.trim().is_empty() {
                 return Err("SSH needs a host and a user".into());
+            }
+            if self.ssh_key_mode && self.ssh_key_path.trim().is_empty() {
+                return Err("Choose the SSH private key file".into());
             }
             Some(SshConfig {
                 host: self.ssh_host.trim().into(),
@@ -168,6 +190,12 @@ impl Form {
         } else {
             None
         };
+        let default_db = self.default_db.trim();
+        if !default_db.is_empty()
+            && let Some(why) = crate::app::database_name_error(default_db)
+        {
+            return Err(format!("Default database '{default_db}' is not a valid name: {why}"));
+        }
         Ok(ConnectionProfile {
             id: self.id,
             name: name.into(),
@@ -175,16 +203,18 @@ impl Form {
             auth,
             tls,
             ssh,
-            default_db: (!self.default_db.trim().is_empty()).then(|| self.default_db.trim().to_string()),
+            default_db: (!default_db.is_empty()).then(|| default_db.to_string()),
             color: self.color.clone(),
+            read_only: self.read_only,
+            history: self.history,
         })
     }
 
-    /// The secrets to use: what was typed, or else what the keychain holds.
-    fn secrets(&self) -> (Option<String>, Option<String>) {
+    /// The secrets to use: what was typed, or else what the vault holds.
+    fn secrets(&self, vault: &Vault) -> (Option<String>, Option<String>) {
         let typed = |s: &String| (!s.is_empty()).then(|| s.clone());
-        let pw = typed(&self.password).or_else(|| self.has_saved_password.then(|| profile::get_secret(self.id, SecretKind::Password).ok().flatten()).flatten());
-        let ssh = typed(&self.ssh_secret).or_else(|| self.has_saved_ssh_secret.then(|| profile::get_secret(self.id, SecretKind::Ssh).ok().flatten()).flatten());
+        let pw = typed(&self.password).or_else(|| self.has_saved_password.then(|| vault.get(self.id, SecretKind::Password)).flatten());
+        let ssh = typed(&self.ssh_secret).or_else(|| self.has_saved_ssh_secret.then(|| vault.get(self.id, SecretKind::Ssh)).flatten());
         (pw, ssh)
     }
 }
@@ -205,6 +235,13 @@ pub enum ConnectAction {
     Move { id: Uuid, before: Option<Uuid> },
     SetColor(Uuid, Option<String>),
     Test(Box<ConnectRequest>),
+    /// Export Connection… (the toolbar or a row's right-click menu).
+    Export(Uuid),
+    /// Opening a connection's form found the vault changed in another
+    /// rongo window: it must be unlocked again.
+    VaultChanged,
+    /// Something to tell the user, as an error toast (the dialog has no toasts).
+    Notice(String),
     Close,
 }
 
@@ -215,33 +252,76 @@ pub struct ConnectDialog {
     anchor: Option<Uuid>,
     form: Option<Form>,
     pub test: TestState,
+    /// The form's footer (messages and buttons) as last drawn, so the body
+    /// can leave exactly that much room under it.
+    footer_h: f32,
+    /// The list's footer (separator and buttons) as last drawn, for the
+    /// same reason.
+    list_footer_h: f32,
+    /// The form a Save closed, until the next frame: if the save fails (the
+    /// vault changed elsewhere) `restore_form` brings it back as typed.
+    saved: Option<Form>,
 }
 
 impl ConnectDialog {
     pub fn new() -> Self {
-        Self { selected: Vec::new(), anchor: None, form: None, test: TestState::Idle }
+        Self { selected: Vec::new(), anchor: None, form: None, test: TestState::Idle, footer_h: 46.0, list_footer_h: 40.0, saved: None }
+    }
+
+    /// A Save failed and nothing was written: the form is open again, as it
+    /// was typed, with `error` on it.
+    pub fn restore_form(&mut self, error: String) {
+        if let Some(f) = self.saved.take() {
+            self.form = Some(f);
+        }
+        if let Some(f) = &mut self.form {
+            f.error = Some(error);
+        }
     }
 
     pub fn new_connection() -> Self {
         let mut d = Self::new();
-        d.form = Some(Form::from_profile(&ConnectionProfile::new("New connection"), true));
+        d.form = Some(Form::new(&ConnectionProfile::new("New connection")));
         d
     }
 
-    pub fn show(&mut self, ctx: &Context, profiles: &[ConnectionProfile]) -> Vec<ConnectAction> {
+    /// Tests: whether the form is open, and the message on it.
+    #[cfg(test)]
+    pub fn has_form(&self) -> bool {
+        self.form.is_some()
+    }
+
+    #[cfg(test)]
+    pub fn form_error(&self) -> Option<&str> {
+        self.form.as_ref()?.error.as_deref()
+    }
+
+    /// Tests: what pressing Save does to the form (closed, kept for `restore_form`).
+    #[cfg(test)]
+    pub fn close_form_for_save(&mut self) {
+        self.saved = self.form.take();
+    }
+
+    /// `vault` holds the connections' secrets: the form notes which are
+    /// saved, and Test connection uses them.
+    pub fn show(&mut self, ctx: &Context, profiles: &[ConnectionProfile], vault: &Vault) -> Vec<ConnectAction> {
         let mut actions = Vec::new();
+        // The app has answered the last Save by now.
+        self.saved = None;
         // Never wider or taller than the window: a centred dialog wider
         // than the window loses both edges, the checkboxes with them.
         let screen = ctx.content_rect().size();
+        let min_h = 420.0f32.min(screen.y - 80.0).max(200.0);
         let modal = Modal::new(Id::new("connect-dialog")).show(ctx, |ui| {
             ui.set_width(760.0f32.min(screen.x - 40.0).max(240.0));
-            ui.set_min_height(420.0f32.min(screen.y - 80.0).max(200.0));
+            ui.set_min_height(min_h);
             match &mut self.form {
-                None => self.list(ui, profiles, &mut actions),
-                Some(_) => self.edit(ui, &mut actions),
+                None => self.list(ui, min_h, profiles, vault, &mut actions),
+                Some(_) => self.edit(ui, min_h, vault, &mut actions),
             }
         });
-        if modal.should_close() && self.form.is_none() {
+        // The form, open, holds typing: Cancel goes back to the list.
+        if theme::may_close(&modal, self.form.is_some()) {
             actions.push(ConnectAction::Close);
         }
         actions
@@ -267,12 +347,12 @@ impl ConnectDialog {
         self.anchor = Some(id);
     }
 
-    fn list(&mut self, ui: &mut Ui, profiles: &[ConnectionProfile], actions: &mut Vec<ConnectAction>) {
+    fn list(&mut self, ui: &mut Ui, min_h: f32, profiles: &[ConnectionProfile], vault: &Vault, actions: &mut Vec<ConnectAction>) {
         ui.heading(format!("{}  Connection Manager", icon::PLUGS_CONNECTED));
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
             if ui.button(format!("{}  New connection", icon::PLUS)).clicked() {
-                self.form = Some(Form::from_profile(&ConnectionProfile::new("New connection"), true));
+                self.form = Some(Form::new(&ConnectionProfile::new("New connection")));
                 self.test = TestState::Idle;
             }
             // Editing, cloning and deleting work on one connection at a time.
@@ -284,8 +364,18 @@ impl ConnectDialog {
             if ui.add_enabled(sel.is_some(), egui::Button::new(format!("{}  Edit", icon::PENCIL_SIMPLE))).clicked()
                 && let Some(p) = sel
             {
-                self.form = Some(Form::from_profile(p, false));
-                self.test = TestState::Idle;
+                // Another rongo window may have saved its passwords since: caught up first.
+                match vault_ui::catch_up(vault) {
+                    CatchUp::Changed => actions.push(ConnectAction::VaultChanged),
+                    fresh => {
+                        // Busy or unreadable just now: this window's copy still serves, and a toast says why.
+                        if let CatchUp::Failed(e) = fresh {
+                            actions.push(ConnectAction::Notice(vault_ui::unreadable(&e)));
+                        }
+                        self.form = Some(Form::from_profile(p, vault));
+                        self.test = TestState::Idle;
+                    }
+                }
             }
             if ui.add_enabled(sel.is_some(), egui::Button::new(format!("{}  Clone", icon::COPY))).clicked()
                 && let Some(p) = sel
@@ -293,7 +383,12 @@ impl ConnectDialog {
                 let mut copy = p.clone();
                 copy.id = Uuid::new_v4();
                 copy.name = format!("{} (copy)", p.name);
-                self.form = Some(Form::from_profile(&copy, true));
+                self.form = Some(Form::new(&copy));
+            }
+            if ui.add_enabled(sel.is_some(), egui::Button::new(format!("{}  Export…", icon::EXPORT))).clicked()
+                && let Some(p) = sel
+            {
+                actions.push(ConnectAction::Export(p.id));
             }
             if ui.add_enabled(sel.is_some(), egui::Button::new(RichText::new(format!("{}  Delete", icon::TRASH)).color(theme::ERROR))).clicked()
                 && let Some(p) = sel
@@ -303,9 +398,14 @@ impl ConnectDialog {
             }
         });
         ui.separator();
-        let list_h = ui.available_height() - 40.0;
+        // The list takes the height the footer leaves, as measured. Not from
+        // `available_height`: a modal's room is its own size last frame, so
+        // a footer taller than guessed grew the dialog every frame.
+        let used = ui.cursor().top() - ui.max_rect().top();
+        let list_h = (min_h - used - self.list_footer_h).max(80.0);
         // Both ways: a narrow window scrolls the columns instead of cutting them.
-        egui::ScrollArea::both().max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
+        let scroll = egui::ScrollArea::both().max_height(list_h).min_scrolled_height(list_h).auto_shrink([false, false]);
+        scroll.show(ui, |ui| {
             let mut rows = Vec::new();
             egui::Grid::new("profiles").num_columns(5).striped(true).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
                 let picked = profiles.iter().filter(|p| self.selected.contains(&p.id)).count();
@@ -352,6 +452,12 @@ impl ConnectDialog {
                     if r.double_clicked() {
                         actions.push(ConnectAction::Connect(p.id));
                     }
+                    r.context_menu(|ui| {
+                        if ui.button(format!("{}  Export Connection…", icon::EXPORT)).clicked() {
+                            actions.push(ConnectAction::Export(p.id));
+                            ui.close();
+                        }
+                    });
                     ui.label(p.summary());
                     let mut opts = Vec::new();
                     if let Auth::Password { user, .. } = &p.auth {
@@ -371,32 +477,30 @@ impl ConnectDialog {
                 actions.push(ConnectAction::Move { id: id.0, before: before.map(|b| b.0) });
             }
         });
+        let footer_top = ui.cursor().top();
         ui.separator();
-        ui.horizontal(|ui| {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                // In list order, whatever order they were picked in.
-                let ids: Vec<Uuid> = profiles.iter().filter(|p| self.selected.contains(&p.id)).map(|p| p.id).collect();
-                let text = match ids.len() {
-                    0 | 1 => format!("{}  Connect", icon::PLUG),
-                    n => format!("{}  Connect {n}", icon::PLUG),
-                };
-                if ui.add_enabled(!ids.is_empty(), theme::primary_button(text, false)).clicked() {
-                    actions.extend(ids.into_iter().map(ConnectAction::Connect));
-                }
-                if ui.button("Close").clicked() {
-                    actions.push(ConnectAction::Close);
-                }
-                // The hint gets what the buttons leave, cut short if need be.
-                if profiles.len() > 1 {
-                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        ui.add(egui::Label::new(RichText::new("Tick several to connect them together · drag a name to reorder").weak()).truncate());
-                    });
-                }
-            });
+        theme::dialog_buttons(ui, |ui| {
+            // In list order, whatever order they were picked in.
+            let ids: Vec<Uuid> = profiles.iter().filter(|p| self.selected.contains(&p.id)).map(|p| p.id).collect();
+            let text = match ids.len() {
+                0 | 1 => format!("{}  Connect", icon::PLUG),
+                n => format!("{}  Connect {n}", icon::PLUG),
+            };
+            if ui.add_enabled(!ids.is_empty(), theme::primary_button(text, false)).clicked() {
+                actions.extend(ids.into_iter().map(ConnectAction::Connect));
+            }
+            if ui.button("Close").clicked() {
+                actions.push(ConnectAction::Close);
+            }
+            // The hint gets what the buttons leave, cut short if need be.
+            if profiles.len() > 1 {
+                theme::footer_note(ui, RichText::new("Tick several to connect them together · drag a name to reorder").weak());
+            }
         });
+        self.list_footer_h = ui.cursor().top() - footer_top;
     }
 
-    fn edit(&mut self, ui: &mut Ui, actions: &mut Vec<ConnectAction>) {
+    fn edit(&mut self, ui: &mut Ui, min_h: f32, vault: &Vault, actions: &mut Vec<ConnectAction>) {
         let Some(f) = &mut self.form else { return };
         ui.heading(if f.is_new { "New connection" } else { "Edit connection" });
         ui.add_space(4.0);
@@ -409,6 +513,8 @@ impl ConnectDialog {
             if let Some(c) = theme::color_swatches(ui, f.color.as_deref()) {
                 f.color = c;
             }
+            ui.add_space(16.0);
+            ui.checkbox(&mut f.read_only, "Read-only (refuse every write)");
         });
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -418,9 +524,11 @@ impl ConnectDialog {
         });
         ui.separator();
         // The body takes the height the footer leaves, so the buttons sit at
-        // the bottom of the dialog rather than above an empty strip.
-        let notes = usize::from(f.error.is_some()) + usize::from(!matches!(self.test, TestState::Idle));
-        let body_h = (ui.available_height() - 46.0 - 24.0 * notes as f32).max(250.0);
+        // the bottom of the dialog rather than above an empty strip. Not from
+        // `available_height`: a modal's room is its own size last frame, so
+        // any shortfall in the footer's height grew the dialog every frame
+        // until it filled the window.
+        let body_h = (min_h - ui.min_rect().height() - self.footer_h).max(250.0);
         ui.allocate_ui(vec2(ui.available_width(), body_h), |ui| {
             ui.set_min_height(body_h);
             match f.tab {
@@ -430,37 +538,54 @@ impl ConnectDialog {
                 FormTab::Ssh => ssh_tab(ui, f),
             }
         });
+        let footer_top = ui.min_rect().bottom();
         ui.separator();
-        if let Some(e) = &f.error {
-            ui.colored_label(theme::ERROR, e);
-        }
-        match &self.test {
-            TestState::Idle => {}
-            TestState::Running(..) => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Testing connection…");
-                });
+        // A failed test can be a paragraph (every server of a replica set),
+        // so messages scroll after a few lines instead of pushing the
+        // buttons off the window.
+        egui::ScrollArea::vertical().id_salt("form-notes").max_height(90.0).auto_shrink([false, true]).show(ui, |ui| {
+            if let Some(e) = &f.error {
+                ui.colored_label(theme::ERROR, e);
             }
-            TestState::Ok(m) => {
-                ui.colored_label(theme::OK, format!("{} {m}", icon::CHECK_CIRCLE));
+            match &self.test {
+                TestState::Idle => {}
+                TestState::Running(..) => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Testing connection…");
+                    });
+                }
+                TestState::Ok(m) => {
+                    ui.colored_label(theme::OK, format!("{} {m}", icon::CHECK_CIRCLE));
+                }
+                TestState::Failed(m) => {
+                    ui.colored_label(theme::ERROR, format!("{} {m}", icon::X_CIRCLE));
+                }
             }
-            TestState::Failed(m) => {
-                ui.colored_label(theme::ERROR, format!("{} {m}", icon::X_CIRCLE));
-            }
-        }
+        });
         let form_id = f.id;
         let mut close = false;
+        let mut saving = false;
         ui.horizontal(|ui| {
             let testing = matches!(self.test, TestState::Running(..));
             if ui.add_enabled(!testing, egui::Button::new(format!("{}  Test connection", icon::PULSE))).clicked() {
                 match f.to_profile() {
                     Ok(mut p) => {
                         f.error = None;
-                        let (password, ssh_secret) = f.secrets();
-                        // A throwaway id so testing never disturbs an open connection.
-                        p.id = Uuid::new_v4();
-                        actions.push(ConnectAction::Test(Box::new(ConnectRequest { profile: p, password, ssh_secret })));
+                        // Another rongo window may have saved its passwords since: caught up first.
+                        match vault_ui::catch_up(vault) {
+                            CatchUp::Changed => actions.push(ConnectAction::VaultChanged),
+                            fresh => {
+                                // Busy or unreadable just now: this window's copy still serves, and a toast says why.
+                                if let CatchUp::Failed(e) = fresh {
+                                    actions.push(ConnectAction::Notice(vault_ui::unreadable(&e)));
+                                }
+                                let (password, ssh_secret) = f.secrets(vault);
+                                // A throwaway id so testing never disturbs an open connection.
+                                p.id = Uuid::new_v4();
+                                actions.push(ConnectAction::Test(Box::new(ConnectRequest { profile: p, password, ssh_secret })));
+                            }
+                        }
                     }
                     Err(e) => f.error = Some(e),
                 }
@@ -468,11 +593,12 @@ impl ConnectDialog {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let mut save = |then_connect: bool, f: &mut Form| match f.to_profile() {
                     Ok(profile) => {
-                        let typed = |s: &String| (!s.is_empty()).then(|| s.clone());
+                        // A secret typed while its method is off is not kept.
+                        let typed = |s: &String, on: bool| (on && !s.is_empty()).then(|| s.clone());
                         actions.push(ConnectAction::Save {
                             profile,
-                            password: typed(&f.password),
-                            ssh_secret: typed(&f.ssh_secret),
+                            password: typed(&f.password, f.auth_on),
+                            ssh_secret: typed(&f.ssh_secret, f.ssh_on),
                             then_connect,
                         });
                         true
@@ -484,19 +610,24 @@ impl ConnectDialog {
                 };
                 if ui.add(theme::primary_button(format!("{}  Save & Connect", icon::PLUG), false)).clicked() {
                     close = save(true, f);
+                    saving = close;
                 }
                 if ui.button("Save").clicked() {
                     close = save(false, f);
+                    saving = close;
                 }
                 if ui.button("Cancel").clicked() {
                     close = true;
                 }
             });
         });
+        self.footer_h = ui.min_rect().bottom() - footer_top;
         if close {
             self.selected = vec![form_id];
             self.anchor = Some(form_id);
-            self.form = None;
+            let form = self.form.take();
+            // Kept until the app has answered the Save (see `restore_form`).
+            self.saved = form.filter(|_| saving);
             self.test = TestState::Idle;
         }
     }
@@ -532,7 +663,7 @@ fn server_tab(ui: &mut Ui, f: &mut Form) {
             TargetMode::Uri => {
                 field(ui, "URI", &mut f.uri, "mongodb+srv://user@cluster.example.net/?retryWrites=true", false);
                 ui.label("");
-                ui.weak("A password in the URI is moved to the Keychain when you save.");
+                ui.weak("A password in the URI is moved to the vault when you save.");
                 ui.end_row();
             }
             TargetMode::Manual => {
@@ -544,6 +675,22 @@ fn server_tab(ui: &mut Ui, f: &mut Form) {
             }
         }
         field(ui, "Default database", &mut f.default_db, "used for new IntelliShell tabs", false);
+        ui.label("Collection History");
+        let name = |v: Option<bool>| match v {
+            None => "Use Settings",
+            Some(true) => "On",
+            Some(false) => "Off",
+        };
+        egui::ComboBox::from_id_salt("conn-history")
+            .selected_text(name(f.history))
+            .show_ui(ui, |ui| {
+                for v in [None, Some(true), Some(false)] {
+                    ui.selectable_value(&mut f.history, v, name(v));
+                }
+            })
+            .response
+            .on_hover_text("Keep the documents rongo deletes or changes on this connection, on this computer, so they can be restored");
+        ui.end_row();
     });
 }
 
@@ -553,7 +700,7 @@ fn auth_tab(ui: &mut Ui, f: &mut Form) {
     ui.add_enabled_ui(f.auth_on, |ui| {
         egui::Grid::new("auth").num_columns(2).spacing(vec2(12.0, 8.0)).show(ui, |ui| {
             field(ui, "Username", &mut f.user, "", false);
-            let hint = if f.has_saved_password { "saved in Keychain — type to replace" } else { "" };
+            let hint = if f.has_saved_password { "saved — type to replace" } else { "" };
             field(ui, "Password", &mut f.password, hint, true);
             field(ui, "Auth database", &mut f.auth_db, "admin", false);
             ui.label("Mechanism");
@@ -601,7 +748,7 @@ fn ssh_tab(ui: &mut Ui, f: &mut Form) {
                 file_field(ui, "Private key", &mut f.ssh_key_path);
             }
             let label = if f.ssh_key_mode { "Passphrase" } else { "Password" };
-            let hint = if f.has_saved_ssh_secret { "saved in Keychain — type to replace" } else { "" };
+            let hint = if f.has_saved_ssh_secret { "saved — type to replace" } else { "" };
             field(ui, label, &mut f.ssh_secret, hint, true);
         });
         ui.add_space(4.0);
@@ -622,6 +769,9 @@ pub struct DocDialog {
     pub mode: DocMode,
     pub view: Option<u64>,
     text: String,
+    layout: theme::CodeLayout,
+    /// Something was typed: a click outside or Esc no longer closes it.
+    typed: bool,
     pub error: Option<String>,
     pub saving: Option<RequestId>,
 }
@@ -635,7 +785,7 @@ impl DocDialog {
     pub fn edit(conn: ConnId, ns: Namespace, doc: &Document, view: Option<u64>) -> Self {
         let id = doc.get("_id").cloned().unwrap_or(Bson::Null);
         let text = format::doc_to_shell(doc, Style::Editable);
-        Self { conn, ns, mode: DocMode::Edit { id }, view, text, error: None, saving: None }
+        Self { conn, ns, mode: DocMode::Edit { id }, view, text, layout: Default::default(), typed: false, error: None, saving: None }
     }
 
     #[cfg(test)]
@@ -648,7 +798,7 @@ impl DocDialog {
             Some(d) => format::doc_to_shell(d, Style::Editable),
             None => "{\n    \n}".to_string(),
         };
-        Self { conn, ns, mode: DocMode::Insert, view, text, error: None, saving: None }
+        Self { conn, ns, mode: DocMode::Insert, view, text, layout: Default::default(), typed: false, error: None, saving: None }
     }
 
     pub fn show(&mut self, ctx: &Context) -> Option<DocAction> {
@@ -657,18 +807,20 @@ impl DocDialog {
             DocMode::Edit { .. } => format!("{}  Edit document — {}", icon::PENCIL_SIMPLE, self.ns),
             DocMode::Insert => format!("{}  Add document — {}", icon::FILE_PLUS, self.ns),
         };
+        // The editor gives up height on a short window so the buttons and a
+        // few lines of error still fit. From the window, not the dialog's
+        // own last size, which would feed back into itself.
+        let edit_h = (ctx.content_rect().height() - 300.0).clamp(160.0, 440.0);
         let modal = Modal::new(Id::new("doc-dialog")).show(ctx, |ui| {
             ui.set_width(720.0);
             ui.heading(title);
             ui.weak("Shell syntax: ObjectId(\"…\"), ISODate(\"…\"), NumberLong(\"…\"), NumberDecimal(\"…\"), Double(5).");
             ui.add_space(4.0);
-            let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
-                let job = highlight::layout_job(buf.as_str(), theme::mono(13.0), wrap);
-                ui.fonts_mut(|f| f.layout_job(job))
-            };
+            let layout = &mut self.layout;
+            let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| layout.galley(ui, buf.as_str(), theme::mono(13.0), wrap);
             egui::Frame::new().fill(theme::BG).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
-                egui::ScrollArea::vertical().max_height(440.0).min_scrolled_height(300.0).show(ui, |ui| {
-                    ui.add(
+                egui::ScrollArea::vertical().max_height(edit_h).min_scrolled_height(edit_h.min(300.0)).show(ui, |ui| {
+                    let edit = ui.add(
                         egui::TextEdit::multiline(&mut self.text)
                             .code_editor()
                             .frame(egui::Frame::NONE)
@@ -676,10 +828,14 @@ impl DocDialog {
                             .desired_rows(18)
                             .layouter(&mut layouter),
                     );
+                    self.typed |= edit.changed();
                 });
             });
             if let Some(e) = &self.error {
-                ui.colored_label(theme::ERROR, e);
+                // A failed validation can list every rule it broke.
+                egui::ScrollArea::vertical().id_salt("doc-error").max_height(72.0).show(ui, |ui| {
+                    ui.colored_label(theme::ERROR, e);
+                });
             }
             ui.horizontal(|ui| {
                 if self.saving.is_some() {
@@ -687,9 +843,13 @@ impl DocDialog {
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let save = ui.add_enabled(self.saving.is_none(), theme::primary_button("Save", false));
-                    let shortcut = ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::S));
+                    // ⌘⇧S is another shortcut: taken first, as ⌘S would match it too.
+                    let shortcut = ui.input_mut(|i| {
+                        i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::S);
+                        i.consume_key(egui::Modifiers::COMMAND, Key::S)
+                    });
                     if save.clicked() || (shortcut && self.saving.is_none()) {
-                        match rongo_shell::parse_document(&self.text) {
+                        match rongo_shell::parse_editor_document(&self.text) {
                             Ok(doc) => {
                                 self.error = None;
                                 action = Some(DocAction::Save(doc));
@@ -703,7 +863,7 @@ impl DocDialog {
                 });
             });
         });
-        if modal.should_close() && action.is_none() && self.saving.is_none() {
+        if theme::may_close(&modal, self.typed) && action.is_none() && self.saving.is_none() {
             action = Some(DocAction::Close);
         }
         action
@@ -713,11 +873,12 @@ impl DocDialog {
 /// Read-only JSON view of one document (View Document, F3).
 pub struct ViewDocDialog {
     text: String,
+    layout: theme::CodeLayout,
 }
 
 impl ViewDocDialog {
     pub fn new(doc: &Document) -> Self {
-        Self { text: format::doc_to_shell(doc, Style::Display) }
+        Self { text: format::doc_to_shell(doc, Style::Display), layout: Default::default() }
     }
 
     /// Returns true when the dialog should close.
@@ -727,28 +888,24 @@ impl ViewDocDialog {
             ui.set_width(720.0);
             ui.heading(format!("{}  View Document", icon::FILE_TEXT));
             ui.add_space(4.0);
-            let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
-                let job = highlight::layout_job(buf.as_str(), theme::mono(13.0), wrap);
-                ui.fonts_mut(|f| f.layout_job(job))
-            };
+            let layout = &mut self.layout;
+            let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| layout.galley(ui, buf.as_str(), theme::mono(13.0), wrap);
             egui::Frame::new().fill(theme::BG).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
                 egui::ScrollArea::vertical().max_height(480.0).show(ui, |ui| {
                     let mut view = self.text.as_str();
                     ui.add(egui::TextEdit::multiline(&mut view).code_editor().frame(egui::Frame::NONE).desired_width(f32::INFINITY).layouter(&mut layouter));
                 });
             });
-            ui.horizontal(|ui| {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Close").clicked() {
-                        close = true;
-                    }
-                    if ui.button(format!("{}  Copy", icon::CLIPBOARD_TEXT)).clicked() {
-                        ui.ctx().copy_text(self.text.clone());
-                    }
-                });
+            theme::dialog_buttons(ui, |ui| {
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+                if ui.button(format!("{}  Copy", icon::CLIPBOARD_TEXT)).clicked() {
+                    ui.ctx().copy_text(self.text.clone());
+                }
             });
         });
-        close || modal.should_close()
+        close || theme::may_close(&modal, false)
     }
 }
 
@@ -763,8 +920,35 @@ pub enum Pending {
     DuplicateCollection { conn: ConnId, ns: Namespace },
     ClearCollection { conn: ConnId, ns: Namespace },
     DropIndex { conn: ConnId, ns: Namespace, name: String },
+    /// Lift a connection's read-only lock.
+    AllowWrites { conn: ConnId },
     /// Insert documents from the clipboard; the checkbox strips their `_id`s.
     Paste { conn: ConnId, ns: Namespace, docs: Vec<Document>, view: Option<u64> },
+    /// The name for a new database to paste collections into.
+    PasteAsDatabase { conn: ConnId },
+    /// A write whose Collection History can't be kept (too large, or its
+    /// key unavailable): sent as `cmd`, without history, once `name` is typed.
+    WithoutHistory { origin: crate::net::Origin, conn: ConnId, cmd: Box<rongo_core::Command>, name: String },
+    /// Remove one Collection History entry; the History tab `tab` lists again.
+    RemoveHistory { tab: u64, entry: rongo_core::history::EntryId },
+    /// Remove every Collection History entry of a collection recorded by
+    /// `before` (ms, when it was asked), off the UI thread; the History
+    /// tabs list again when it is done.
+    EmptyHistory { profile: uuid::Uuid, ns: Namespace, before: i64 },
+    /// Settings → Delete…: remove one collection's Collection History, as
+    /// recorded by `before` (ms, when it was asked).
+    DeleteHistory { profile: uuid::Uuid, ns: Namespace, before: i64 },
+    /// Settings → Clear All History…: remove every profile's.
+    ClearHistory,
+    /// Settings → Save with lower Collection History limits, which remove
+    /// history at once.
+    SaveSettings(Box<crate::settings::Settings>),
+    /// Delete a saved connection. The checkbox, there when the profile has
+    /// Collection History, deletes that too.
+    DeleteProfile { id: uuid::Uuid },
+    /// Reset the master password (Settings → Reset…, or Forgot? at launch).
+    /// The checkbox, there when there is Collection History, deletes it too.
+    ResetVault,
 }
 
 pub struct Confirm {
@@ -782,17 +966,53 @@ pub struct Confirm {
     pub must_type: Option<String>,
 }
 
+/// Whether `typed` confirms `want`, a name typed to go ahead with something
+/// that can't be undone: spaces around either don't count.
+pub fn confirms(typed: &str, want: &str) -> bool {
+    typed.trim() == want.trim()
+}
+
 pub enum ConfirmResult {
     Yes,
     No,
 }
 
 impl Confirm {
+    /// A question titled `title`, saying `message`; its OK button (labelled
+    /// `ok_label`) does `pending`.
+    pub fn new(title: &str, message: String, ok_label: &str, pending: Pending) -> Self {
+        Confirm { title: title.into(), message, ok_label: ok_label.into(), danger: false, pending, input: None, checkbox: None, must_type: None }
+    }
+
+    /// OK in the danger colour.
+    pub fn danger(mut self) -> Self {
+        self.danger = true;
+        self
+    }
+
+    /// A prompt, with `text` typed in it to begin with.
+    pub fn input(mut self, text: String) -> Self {
+        self.input = Some(text);
+        self
+    }
+
+    /// A checkbox labelled `label`, ticked or not.
+    pub fn checkbox(mut self, label: impl Into<String>, ticked: bool) -> Self {
+        self.checkbox = Some((label.into(), ticked));
+        self
+    }
+
+    /// OK waits until exactly `name` is typed in the prompt.
+    pub fn must_type(mut self, name: String) -> Self {
+        self.must_type = Some(name);
+        self
+    }
+
     /// OK waits for typed text, and for exactly the right text when a
-    /// name must be typed.
+    /// name must be typed (spaces around either don't count).
     pub fn ok_enabled(&self) -> bool {
         match (&self.input, &self.must_type) {
-            (Some(s), Some(want)) => s.trim() == want,
+            (Some(s), Some(want)) => confirms(s, want),
             (Some(s), None) => !s.trim().is_empty(),
             (None, _) => true,
         }
@@ -807,8 +1027,13 @@ impl Confirm {
             ui.label(&self.message);
             if let Some(input) = &mut self.input {
                 let r = ui.add(egui::TextEdit::singleline(input).desired_width(f32::INFINITY));
+                // ↩ (which takes the field's focus) goes ahead on the rule OK
+                // follows. Read before the focus is asked back: `lost_focus`
+                // looks at the focus as it is now, so after `request_focus`
+                // it was never true and ↩ did nothing.
+                let entered = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                 r.request_focus();
-                if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && !input.trim().is_empty() && self.must_type.as_ref().is_none_or(|want| input.trim() == want) {
+                if entered && self.ok_enabled() {
                     result = Some(ConfirmResult::Yes);
                 }
             }
@@ -817,16 +1042,14 @@ impl Confirm {
                 ui.checkbox(ticked, label.as_str());
             }
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let ok_enabled = self.ok_enabled();
-                    if ui.add_enabled(ok_enabled, theme::primary_button(self.ok_label.clone(), self.danger)).clicked() {
-                        result = Some(ConfirmResult::Yes);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        result = Some(ConfirmResult::No);
-                    }
-                });
+            theme::dialog_buttons(ui, |ui| {
+                let ok_enabled = self.ok_enabled();
+                if ui.add_enabled(ok_enabled, theme::primary_button(self.ok_label.clone(), self.danger)).clicked() {
+                    result = Some(ConfirmResult::Yes);
+                }
+                if ui.button("Cancel").clicked() {
+                    result = Some(ConfirmResult::No);
+                }
             });
         });
         if modal.should_close() && result.is_none() {
@@ -841,12 +1064,350 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::test_support::temp_vault;
+
+    /// Editing a connection keeps its lock: the form carries `read_only`
+    /// through (it used to build every profile unlocked), and its checkbox
+    /// is what changes it.
+    #[test]
+    fn form_keeps_the_read_only_flag() {
+        let mut p = ConnectionProfile::new("locked");
+        p.read_only = true;
+        let (_dir, vault) = temp_vault();
+        let form = Form::from_profile(&p, &vault);
+        assert!(form.to_profile().unwrap().read_only, "saving a locked profile keeps it locked");
+        p.read_only = false;
+        assert!(!Form::from_profile(&p, &vault).to_profile().unwrap().read_only);
+    }
+
+    /// The form says in one line what the driver or the tunnel would only
+    /// refuse later, less plainly: SSH port 0, a private key with no file,
+    /// a default database name MongoDB doesn't allow.
+    #[test]
+    fn form_refuses_what_the_driver_would() {
+        let (_dir, vault) = temp_vault();
+        let p = ConnectionProfile::new("p");
+        let form = || Form::from_profile(&p, &vault);
+        let ssh = || {
+            let mut f = form();
+            (f.ssh_on, f.ssh_host, f.ssh_user) = (true, "bastion".into(), "me".into());
+            f
+        };
+        assert!(ssh().to_profile().is_ok(), "a whole SSH setup passes");
+        let mut f = ssh();
+        f.ssh_port = "0".into();
+        assert!(f.to_profile().unwrap_err().contains("SSH port"), "port 0");
+        let mut f = ssh();
+        f.ssh_key_mode = true;
+        f.ssh_key_path = "  ".into();
+        assert!(f.to_profile().unwrap_err().contains("private key"), "no key file");
+        f.ssh_key_path = "~/.ssh/id_ed25519".into();
+        assert!(f.to_profile().is_ok());
+        for bad in ["a.b", "with space", "a/b", "x".repeat(64).as_str()] {
+            let mut f = form();
+            f.default_db = bad.into();
+            let e = f.to_profile().unwrap_err();
+            assert!(e.contains("Default database"), "{bad:?}: {e}");
+        }
+        let mut f = form();
+        f.default_db = " shop ".into();
+        assert_eq!(f.to_profile().unwrap().default_db.as_deref(), Some("shop"));
+    }
+
+    /// The connection form offers the lock, ticked for a locked profile.
+    #[test]
+    fn form_shows_the_read_only_checkbox() {
+        let (_dir, vault) = temp_vault();
+        let ctx = Context::default();
+        theme::install(&ctx);
+        let mut dialog = ConnectDialog::new_connection();
+        let mut seen = false;
+        for _ in 0..3 {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1000.0, 800.0))), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| _ = dialog.show(ui.ctx(), &[], &vault));
+            out.textures_delta.clear();
+            seen |= out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == "Read-only (refuse every write)"));
+        }
+        assert!(seen, "the checkbox is drawn");
+    }
+
+    /// The form carries a connection's Collection History choice through
+    /// (use Settings / on / off) and shows it on the Server tab.
+    #[test]
+    fn form_keeps_the_history_override() {
+        let (_dir, vault) = temp_vault();
+        let mut p = ConnectionProfile::new("h");
+        for v in [None, Some(true), Some(false)] {
+            p.history = v;
+            assert_eq!(Form::from_profile(&p, &vault).to_profile().unwrap().history, v);
+        }
+        let ctx = Context::default();
+        theme::install(&ctx);
+        let mut dialog = ConnectDialog::new_connection();
+        let mut texts = Vec::new();
+        for _ in 0..3 {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1000.0, 800.0))), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| _ = dialog.show(ui.ctx(), &[], &vault));
+            out.textures_delta.clear();
+            texts = out.shapes.iter().filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            }).collect::<Vec<_>>();
+        }
+        assert!(texts.iter().any(|t| t == "Collection History"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "Use Settings"), "a new connection follows Settings: {texts:?}");
+    }
+
+    /// The form notes which secrets the vault holds for a saved connection
+    /// (none for a new one or a clone), and Test connection uses them
+    /// unless others are typed.
+    #[test]
+    fn form_reads_saved_secrets_from_the_vault() {
+        let (_dir, vault) = temp_vault();
+        let mut p = ConnectionProfile::new("saved");
+        p.auth = Auth::Password { user: "u".into(), auth_db: "admin".into(), mechanism: None };
+        p.ssh = Some(SshConfig { host: "h".into(), port: 22, user: "u".into(), auth: SshAuth::Password });
+        vault.set(p.id, SecretKind::Password, "pw").unwrap();
+        let mut f = Form::from_profile(&p, &vault);
+        assert!(f.has_saved_password && !f.has_saved_ssh_secret);
+        assert_eq!(f.secrets(&vault), (Some("pw".to_string()), None));
+        f.password = "typed".into();
+        f.ssh_secret = "ssh typed".into();
+        assert_eq!(f.secrets(&vault), (Some("typed".to_string()), Some("ssh typed".to_string())));
+        let new = Form::new(&p);
+        assert!(!new.has_saved_password && !new.has_saved_ssh_secret);
+        assert_eq!(new.secrets(&vault), (None, None));
+    }
+
+    /// Edit catches up with passwords another rongo window saved since this
+    /// one unlocked; a vault whose password was changed there asks to unlock
+    /// again instead of opening the form.
+    #[test]
+    fn edit_sees_secrets_saved_in_another_window() {
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+        struct State {
+            dialog: ConnectDialog,
+            profiles: Vec<ConnectionProfile>,
+            vault: std::sync::Arc<Vault>,
+            actions: Vec<ConnectAction>,
+        }
+        let (_dir, vault) = temp_vault();
+        let mut p = ConnectionProfile::new("p");
+        p.auth = Auth::Password { user: "u".into(), auth_db: "admin".into(), mechanism: None };
+        let other = Vault::unlock(vault.path().to_path_buf(), crate::test_support::TEST_PASSWORD).unwrap();
+        other.set(p.id, SecretKind::Password, "from the other window").unwrap();
+        assert_eq!(vault.get(p.id, SecretKind::Password), None, "not seen yet");
+        let mut dialog = ConnectDialog::new();
+        dialog.selected = vec![p.id];
+        let state = State { dialog, profiles: vec![p.clone()], vault: vault.clone(), actions: Vec::new() };
+        let mut h = Harness::builder().with_size(vec2(1000.0, 800.0)).build_ui_state(
+            |ui, s: &mut State| {
+                theme::install(ui.ctx());
+                let actions = s.dialog.show(ui.ctx(), &s.profiles, &s.vault);
+                s.actions.extend(actions);
+            },
+            state,
+        );
+        h.run_steps(3);
+        h.get_by_label_contains("Edit").click();
+        h.run_steps(3);
+        let f = h.state().dialog.form.as_ref().expect("the form opens");
+        assert!(f.has_saved_password);
+        assert_eq!(f.secrets(&vault).0.as_deref(), Some("from the other window"));
+
+        h.state_mut().dialog.form = None;
+        h.run_steps(2);
+        other.change_password(crate::test_support::TEST_PASSWORD, "another password").unwrap();
+        h.get_by_label_contains("Edit").click();
+        h.run_steps(3);
+        assert!(h.state().dialog.form.is_none());
+        assert!(matches!(h.state().actions.last(), Some(ConnectAction::VaultChanged)));
+    }
+
+    /// Test connection catches up with a password another rongo window saved
+    /// after the form opened, and uses it; a vault whose password was changed
+    /// there asks to unlock again and tests nothing.
+    #[test]
+    fn test_connection_uses_secrets_saved_in_another_window() {
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+        struct State {
+            dialog: ConnectDialog,
+            vault: std::sync::Arc<Vault>,
+            actions: Vec<ConnectAction>,
+        }
+        let (_dir, vault) = temp_vault();
+        let mut p = ConnectionProfile::new("p");
+        p.auth = Auth::Password { user: "u".into(), auth_db: "admin".into(), mechanism: None };
+        vault.set(p.id, SecretKind::Password, "old").unwrap();
+        let mut dialog = ConnectDialog::new();
+        dialog.form = Some(Form::from_profile(&p, &vault));
+        let state = State { dialog, vault: vault.clone(), actions: Vec::new() };
+        let mut h = Harness::builder().with_size(vec2(1000.0, 800.0)).build_ui_state(
+            |ui, s: &mut State| {
+                theme::install(ui.ctx());
+                let actions = s.dialog.show(ui.ctx(), &[], &s.vault);
+                s.actions.extend(actions);
+            },
+            state,
+        );
+        h.run_steps(3);
+        let other = Vault::unlock(vault.path().to_path_buf(), crate::test_support::TEST_PASSWORD).unwrap();
+        other.set(p.id, SecretKind::Password, "new").unwrap();
+        h.get_by_label_contains("Test connection").click();
+        h.run_steps(2);
+        assert!(matches!(h.state().actions.last(), Some(ConnectAction::Test(req)) if req.password.as_deref() == Some("new")), "the password saved since");
+
+        h.state_mut().actions.clear();
+        other.change_password(crate::test_support::TEST_PASSWORD, "another password").unwrap();
+        h.get_by_label_contains("Test connection").click();
+        h.run_steps(2);
+        assert!(matches!(h.state().actions.as_slice(), [ConnectAction::VaultChanged]), "asks to unlock again, tests nothing");
+    }
+
+    /// Edit while another window holds the vault's lock: the form still
+    /// opens from this window's copy, and an error toast says why.
+    #[test]
+    fn edit_with_a_busy_vault_says_so() {
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+        struct State {
+            dialog: ConnectDialog,
+            profiles: Vec<ConnectionProfile>,
+            vault: std::sync::Arc<Vault>,
+            actions: Vec<ConnectAction>,
+        }
+        let (_dir, vault) = temp_vault();
+        let p = ConnectionProfile::new("p");
+        let mut dialog = ConnectDialog::new();
+        dialog.selected = vec![p.id];
+        let state = State { dialog, profiles: vec![p], vault: vault.clone(), actions: Vec::new() };
+        let mut h = Harness::builder().with_size(vec2(1000.0, 800.0)).build_ui_state(
+            |ui, s: &mut State| {
+                theme::install(ui.ctx());
+                let actions = s.dialog.show(ui.ctx(), &s.profiles, &s.vault);
+                s.actions.extend(actions);
+            },
+            state,
+        );
+        h.run_steps(3);
+        let held = std::fs::File::options().read(true).write(true).create(true).truncate(false).open(vault.path().with_extension("lock")).unwrap();
+        held.lock().unwrap();
+        h.get_by_label_contains("Edit").click();
+        h.run_steps(3);
+        drop(held);
+        assert!(h.state().dialog.has_form(), "opens from this window's copy");
+        let notices: Vec<&str> = h.state().actions.iter().filter_map(|a| if let ConnectAction::Notice(t) = a { Some(t.as_str()) } else { None }).collect();
+        assert_eq!(notices.len(), 1, "one toast");
+        assert!(notices[0].contains("busy"), "{notices:?}");
+        assert!(!h.state().actions.iter().any(|a| matches!(a, ConnectAction::VaultChanged)));
+    }
+
+    /// Save closes the form, but a Save that failed because the vault was
+    /// changed elsewhere brings it back as typed, secrets included, with
+    /// the message on it. A Save that went through lets it go.
+    #[test]
+    fn a_failed_save_brings_the_form_back_as_typed() {
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+        struct State {
+            dialog: ConnectDialog,
+            profiles: Vec<ConnectionProfile>,
+            vault: std::sync::Arc<Vault>,
+            actions: Vec<ConnectAction>,
+        }
+        let (_dir, vault) = temp_vault();
+        let mut dialog = ConnectDialog::new_connection();
+        {
+            let f = dialog.form.as_mut().unwrap();
+            (f.auth_on, f.user) = (true, "u".into());
+            f.password = "typed secret".into();
+            f.ssh_secret = "typed ssh secret".into();
+        }
+        let state = State { dialog, profiles: Vec::new(), vault, actions: Vec::new() };
+        let mut h = Harness::builder().with_size(vec2(1000.0, 800.0)).build_ui_state(
+            |ui, s: &mut State| {
+                theme::install(ui.ctx());
+                let actions = s.dialog.show(ui.ctx(), &s.profiles, &s.vault);
+                s.actions.extend(actions);
+            },
+            state,
+        );
+        h.run_steps(3);
+        h.get_by_label("Save").click();
+        h.step();
+        assert!(matches!(h.state().actions.last(), Some(ConnectAction::Save { password: Some(p), .. }) if p == "typed secret"));
+        assert!(!h.state().dialog.has_form(), "Save closes the form");
+
+        h.state_mut().dialog.restore_form("The vault was changed".into());
+        assert!(h.state().dialog.has_form());
+        assert_eq!(h.state().dialog.form_error(), Some("The vault was changed"));
+        let f = h.state().dialog.form.as_ref().unwrap();
+        assert_eq!((f.password.as_str(), f.ssh_secret.as_str()), ("typed secret", "typed ssh secret"));
+
+        // Saved for good: the form is gone, and a late restore finds nothing to bring back.
+        h.run_steps(3);
+        assert!(h.query_by_label_contains("The vault was changed").is_some(), "the message is on the form");
+        h.get_by_label("Save").click();
+        h.run_steps(3);
+        assert!(!h.state().dialog.has_form());
+        assert!(h.state().dialog.saved.is_none(), "not kept past the next frame");
+        h.state_mut().dialog.restore_form("late".into());
+        assert!(!h.state().dialog.has_form());
+    }
+
+    /// A secret typed while its method is off (password authentication, the
+    /// SSH tunnel) is not sent with Save; with the method on, it is. (Turned
+    /// off, the saved one is then deleted by the store, in the same write.)
+    #[test]
+    fn save_sends_no_secret_for_a_method_that_is_off() {
+        use egui_kittest::Harness;
+        use egui_kittest::kittest::Queryable;
+        struct State {
+            dialog: ConnectDialog,
+            vault: std::sync::Arc<Vault>,
+            actions: Vec<ConnectAction>,
+        }
+        let (_dir, vault) = temp_vault();
+        let mut p = ConnectionProfile::new("p");
+        p.auth = Auth::Password { user: "u".into(), auth_db: "admin".into(), mechanism: None };
+        p.ssh = Some(SshConfig { host: "h".into(), port: 22, user: "u".into(), auth: SshAuth::Password });
+        let mut dialog = ConnectDialog::new();
+        dialog.form = Some(Form::from_profile(&p, &vault));
+        let state = State { dialog, vault, actions: Vec::new() };
+        let mut h = Harness::builder().with_size(vec2(1000.0, 800.0)).build_ui_state(
+            |ui, s: &mut State| {
+                theme::install(ui.ctx());
+                let actions = s.dialog.show(ui.ctx(), &[], &s.vault);
+                s.actions.extend(actions);
+            },
+            state,
+        );
+        let save = |h: &mut Harness<'_, State>, auth_on: bool, ssh_on: bool| {
+            let mut f = Form::from_profile(&p, &h.state().vault);
+            (f.password, f.ssh_secret, f.auth_on, f.ssh_on) = ("typed pw".into(), "typed ssh".into(), auth_on, ssh_on);
+            h.state_mut().dialog.form = Some(f);
+            h.run_steps(3);
+            h.get_by_label("Save").click();
+            h.run_steps(2);
+            match h.state_mut().actions.pop() {
+                Some(ConnectAction::Save { profile, password, ssh_secret, .. }) => (profile.needs_password(), profile.ssh.is_some(), password, ssh_secret),
+                _ => panic!("no Save"),
+            }
+        };
+        assert_eq!(save(&mut h, true, true), (true, true, Some("typed pw".into()), Some("typed ssh".into())));
+        assert_eq!(save(&mut h, false, true), (false, true, None, Some("typed ssh".into())));
+        assert_eq!(save(&mut h, true, false), (true, false, Some("typed pw".into()), None));
+        assert_eq!(save(&mut h, false, false), (false, false, None, None));
+    }
 
     /// In a window narrower than the dialog, the dialog shrinks to fit:
     /// every row's checkbox and the Connect button stay on screen and work,
     /// and the columns scroll instead of being cut.
     #[test]
     fn manager_fits_a_narrow_window() {
+        let (_dir, vault) = temp_vault();
         let ctx = Context::default();
         theme::install(&ctx);
         let names = ["alpha-with-a-very-long-connection-name-1", "bravo-with-a-very-long-connection-name-2", "charlie-3"];
@@ -855,7 +1416,7 @@ mod tests {
         let width = 380.0;
         let frame = |dialog: &mut ConnectDialog, events: Vec<egui::Event>| {
             let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(width, 700.0))), events, ..Default::default() };
-            let mut out = ctx.run_ui(input, |ui| _ = dialog.show(ui.ctx(), &profiles));
+            let mut out = ctx.run_ui(input, |ui| _ = dialog.show(ui.ctx(), &profiles, &vault));
             out.textures_delta.clear();
             let boxes: Vec<egui::Rect> = out.shapes.iter().filter_map(|s| match &s.shape {
                 egui::Shape::Rect(r) if (13.5..=16.5).contains(&r.rect.width()) && (r.rect.width() - r.rect.height()).abs() < 0.5 => Some(r.rect),
@@ -890,6 +1451,7 @@ mod tests {
     /// in list order; Edit needs a single row.
     #[test]
     fn manager_connects_several() {
+        let (_dir, vault) = temp_vault();
         let ctx = Context::default();
         theme::install(&ctx);
         let names = ["alpha", "bravo", "charlie", "delta"];
@@ -904,7 +1466,7 @@ mod tests {
                 ..Default::default()
             };
             let mut actions = Vec::new();
-            let mut out = ctx.run_ui(input, |ui| actions = dialog.show(ui.ctx(), &profiles));
+            let mut out = ctx.run_ui(input, |ui| actions = dialog.show(ui.ctx(), &profiles, &vault));
             out.textures_delta.clear();
             let texts: HashMap<String, egui::Pos2> = out
                 .shapes
@@ -992,11 +1554,57 @@ mod tests {
         assert!(dialog.form.as_ref().is_some_and(|f| f.id == id("bravo")), "edit opens the one picked row");
     }
 
+    /// Export… (with one connection picked) and a row's right-click menu
+    /// both ask to export that connection.
+    #[test]
+    fn manager_exports_a_connection() {
+        let (_dir, vault) = temp_vault();
+        let ctx = Context::default();
+        theme::install(&ctx);
+        let profiles = ["alpha", "bravo"].map(ConnectionProfile::new);
+        let mut dialog = ConnectDialog::new();
+        let frame = |dialog: &mut ConnectDialog, events: Vec<egui::Event>| {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1200.0, 800.0))), events, ..Default::default() };
+            let mut actions = Vec::new();
+            let mut out = ctx.run_ui(input, |ui| actions = dialog.show(ui.ctx(), &profiles, &vault));
+            out.textures_delta.clear();
+            let texts: HashMap<String, egui::Pos2> = out
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) => Some((t.galley.text().trim_start_matches(|c: char| !c.is_ascii()).trim().to_string(), t.galley.rect.translate(t.pos.to_vec2()).center())),
+                    _ => None,
+                })
+                .collect();
+            (actions, texts)
+        };
+        let click = |dialog: &mut ConnectDialog, label: &str, button: egui::PointerButton| {
+            let mut texts = HashMap::new();
+            for _ in 0..3 {
+                texts = frame(dialog, vec![]).1;
+            }
+            let at = *texts.get(label).unwrap_or_else(|| panic!("{label:?} in {:?}", texts.keys()));
+            let press = |pressed| egui::Event::PointerButton { pos: at, button, pressed, modifiers: egui::Modifiers::NONE };
+            let mut actions = frame(dialog, vec![egui::Event::PointerMoved(at)]).0;
+            actions.extend(frame(dialog, vec![press(true)]).0);
+            actions.extend(frame(dialog, vec![press(false)]).0);
+            actions
+        };
+        let exports = |actions: Vec<ConnectAction>| actions.into_iter().filter_map(|a| if let ConnectAction::Export(id) = a { Some(id) } else { None }).collect::<Vec<_>>();
+        use egui::PointerButton::{Primary, Secondary};
+        assert!(exports(click(&mut dialog, "Export…", Primary)).is_empty(), "nothing picked");
+        click(&mut dialog, "bravo", Primary);
+        assert_eq!(exports(click(&mut dialog, "Export…", Primary)), [profiles[1].id]);
+        assert!(exports(click(&mut dialog, "alpha", Secondary)).is_empty());
+        assert_eq!(exports(click(&mut dialog, "Export Connection…", Primary)), [profiles[0].id]);
+    }
+
     /// In the Connection Manager a row looks like the connection in the tree
     /// (tint and bar in its colour), dragging a row asks to move it, and the
     /// colour button opens the colours.
     #[test]
     fn manager_reorders_and_colours() {
+        let (_dir, vault) = temp_vault();
         let ctx = Context::default();
         theme::install(&ctx);
         let [alpha, bravo, charlie] = ["alpha", "bravo", "charlie"].map(ConnectionProfile::new);
@@ -1018,7 +1626,7 @@ mod tests {
                 ..Default::default()
             };
             let mut actions = Vec::new();
-            let mut out = ctx.run_ui(input, |ui| actions = dialog.show(ui.ctx(), &profiles));
+            let mut out = ctx.run_ui(input, |ui| actions = dialog.show(ui.ctx(), &profiles, &vault));
             out.textures_delta.clear();
             let mut seen = Seen { actions, names: HashMap::new(), circles: Vec::new(), rects: Vec::new(), carets: Vec::new() };
             for s in &out.shapes {
@@ -1079,5 +1687,286 @@ mod tests {
         let swatch = frame(vec![]).circles.into_iter().find(|c| c.fill == red).expect("the colours opened").center;
         let actions = click(&mut frame, swatch);
         assert!(actions.iter().any(|a| matches!(a, ConnectAction::SetColor(id, Some(c)) if *id == bravo.id && c == "red")));
+    }
+
+    /// A failed test against a replica set reports every server, a message
+    /// many lines long. The form keeps a steady height through repaints and
+    /// its buttons stay on screen, instead of growing a little every frame
+    /// until it fills the window.
+    #[test]
+    fn form_keeps_its_height_after_a_long_error() {
+        let (_dir, vault) = temp_vault();
+        let ctx = Context::default();
+        theme::install(&ctx);
+        let mut dialog = ConnectDialog::new_connection();
+        dialog.test = TestState::Failed(crate::test_support::long_driver_error());
+        let screen = vec2(1200.0, 1000.0);
+        let mut bottom = || {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| _ = dialog.show(ui.ctx(), &[], &vault));
+            out.textures_delta.clear();
+            out.shapes.iter().find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text().ends_with("Save & Connect") => Some(t.pos.y + t.galley.rect.bottom()),
+                _ => None,
+            })
+        };
+        // The first frame only measures the dialog.
+        let settled = (0..5).filter_map(|_| bottom()).last().expect("Save & Connect");
+        let later = (0..60).filter_map(|_| bottom()).last().expect("Save & Connect");
+        assert!((later - settled).abs() < 1.0, "the footer moved from {settled} to {later}");
+        assert!(later < screen.y - 150.0, "the dialog reached the bottom of the window: footer at {later}");
+    }
+
+    /// The Connection Manager keeps a steady height through repaints, also
+    /// when its footer is taller than usual (bigger buttons): the list is
+    /// sized from the window and the footer as measured, not from the room
+    /// the dialog had last frame, which grew it every frame.
+    #[test]
+    fn manager_keeps_its_height_with_a_tall_footer() {
+        let (_dir, vault) = temp_vault();
+        let profiles: Vec<ConnectionProfile> = (0..30).map(|i| ConnectionProfile::new(format!("connection {i}"))).collect();
+        for button_h in [None, Some(44.0)] {
+            let ctx = Context::default();
+            theme::install(&ctx);
+            if let Some(h) = button_h {
+                ctx.all_styles_mut(|s| s.spacing.interact_size.y = h);
+            }
+            let mut dialog = ConnectDialog::new();
+            let screen = vec2(1200.0, 900.0);
+            let mut bottom = || {
+                let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)), ..Default::default() };
+                let mut out = ctx.run_ui(input, |ui| _ = dialog.show(ui.ctx(), &profiles, &vault));
+                out.textures_delta.clear();
+                out.shapes.iter().find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.text().ends_with("Connect") => Some(t.pos.y + t.galley.rect.bottom()),
+                    _ => None,
+                })
+            };
+            let settled = (0..5).filter_map(|_| bottom()).last().expect("Connect");
+            let later = (0..60).filter_map(|_| bottom()).last().expect("Connect");
+            assert!((later - settled).abs() < 1.0, "{button_h:?}: the footer moved from {settled} to {later}");
+            assert!(later < screen.y - 100.0, "{button_h:?}: the dialog reached the bottom of the window: footer at {later}");
+        }
+    }
+
+    /// On the smallest window the app allows, a big document with a long
+    /// validation error still leaves Save and Cancel on screen.
+    #[test]
+    fn doc_dialog_fits_a_short_window() {
+        let ctx = Context::default();
+        theme::install(&ctx);
+        let mut big = Document::new();
+        for i in 0..80 {
+            big.insert(format!("field_{i}"), format!("value {i}"));
+        }
+        let conn = ConnectionProfile::mock().conn_id();
+        let mut dialog = DocDialog::insert(conn, Namespace::new("db", "c"), Some(&big), None);
+        dialog.error = Some(format!("Saving the document failed: server error 121: Document failed validation {}", crate::test_support::long_driver_error().repeat(3)));
+        let screen = vec2(960.0, 600.0);
+        let mut buttons = || {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| _ = dialog.show(ui.ctx()));
+            out.textures_delta.clear();
+            let find = |label: &str| out.shapes.iter().find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text() == label => Some(t.galley.rect.translate(t.pos.to_vec2())),
+                _ => None,
+            });
+            find("Save").zip(find("Cancel"))
+        };
+        let (save, cancel) = (0..30).filter_map(|_| buttons()).last().expect("Save and Cancel drawn");
+        for (name, r) in [("Save", save), ("Cancel", cancel)] {
+            assert!(r.bottom() <= screen.y - 4.0 && r.top() >= 0.0, "{name} off screen: {r:?}");
+        }
+    }
+
+    /// Milliseconds per frame of the document editor and of View Document
+    /// showing a document of `fields` fields, with no input.
+    fn doc_frame_ms(fields: usize) -> (f64, f64) {
+        let ctx = Context::default();
+        theme::install(&ctx);
+        let mut doc = Document::new();
+        for i in 0..fields {
+            doc.insert(format!("field_{i}"), format!("value number {i} of the document"));
+        }
+        let conn = ConnectionProfile::mock().conn_id();
+        let mut edit = DocDialog::edit(conn, Namespace::new("db", "c"), &doc, None);
+        let mut view = ViewDocDialog::new(&doc);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1200.0, 900.0));
+        let time = |draw: &mut dyn FnMut(&Context)| {
+            let mut frame = || {
+                let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| draw(ui.ctx()));
+                out.textures_delta.clear();
+            };
+            frame();
+            frame();
+            // The fastest of several rounds: on a loaded machine another
+            // process can slow any one round, but not every one.
+            (0..5)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    for _ in 0..4 {
+                        frame();
+                    }
+                    t.elapsed().as_secs_f64() * 1000.0 / 4.0
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        (time(&mut |ctx| _ = edit.show(ctx)), time(&mut |ctx| _ = view.show(ctx)))
+    }
+
+    /// Edit Document and View Document with a 90 KB document cost about
+    /// what they do with a small one per frame: the text isn't tokenized
+    /// and laid out again while it is unchanged.
+    #[test]
+    fn doc_dialogs_frame_cost_does_not_grow_with_the_document() {
+        let (small_edit, small_view) = doc_frame_ms(20);
+        let (big_edit, big_view) = doc_frame_ms(2_000);
+        assert!(big_edit < small_edit * 3.0 + 5.0, "Edit Document: {big_edit:.1} ms per frame for 2,000 fields vs {small_edit:.1} ms for 20");
+        assert!(big_view < small_view * 3.0 + 5.0, "View Document: {big_view:.1} ms per frame for 2,000 fields vs {small_view:.1} ms for 20");
+    }
+
+    /// Prints the document dialogs' frame times (run with --release --ignored --nocapture).
+    #[test]
+    #[ignore = "prints timings"]
+    fn report_doc_dialog_frame_times() {
+        for fields in [20, 2_000, 4_000, 40_000] {
+            let (edit, view) = doc_frame_ms(fields);
+            println!("{fields} fields: Edit Document {edit:.2} ms, View Document {view:.2} ms per frame");
+        }
+    }
+
+    /// The document editor in a harness, noting when it asks to close and
+    /// what it saves.
+    struct DocProbe {
+        dialog: DocDialog,
+        closed: bool,
+        saved: Vec<Document>,
+    }
+
+    fn doc_harness(doc: &Document) -> egui_kittest::Harness<'static, DocProbe> {
+        let conn = ConnectionProfile::mock().conn_id();
+        let dialog = DocDialog::edit(conn, Namespace::new("db", "c"), doc, None);
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 800.0)).build_ui_state(
+            |ui, p: &mut DocProbe| {
+                theme::install(ui.ctx());
+                match p.dialog.show(ui.ctx()) {
+                    Some(DocAction::Close) => p.closed = true,
+                    Some(DocAction::Save(d)) => p.saved.push(d),
+                    None => {}
+                }
+            },
+            DocProbe { dialog, closed: false, saved: Vec::new() },
+        );
+        h.run_steps(3);
+        h
+    }
+
+    /// ↩ in a question's field goes ahead on the rule its OK button follows:
+    /// text typed, and exactly the name when one must be typed. (It did
+    /// nothing: the field asked for its focus back before ↩ was looked at.)
+    #[test]
+    fn enter_in_a_question_follows_its_ok_button() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let enter = |c: Confirm, typed: &str| {
+            let mut h = crate::test_support::harness(egui::vec2(800.0, 600.0), 2, (c, None), |ctx, (c, yes): &mut (Confirm, Option<bool>)| {
+                if let Some(r) = c.show(ctx) {
+                    yes.get_or_insert(matches!(r, ConfirmResult::Yes));
+                }
+            });
+            if !typed.is_empty() {
+                h.get_by_role(Role::TextInput).type_text(typed);
+                h.run_steps(2);
+            }
+            let ok = h.state().0.ok_enabled();
+            h.key_press(Key::Enter);
+            h.run_steps(2);
+            assert_eq!(h.state().1 == Some(true), ok, "typed {typed:?}");
+            ok
+        };
+        let name = || Confirm::new("Drop Database", "Type shop".into(), "Drop", Pending::DropDatabase { conn: ConnId(uuid::Uuid::nil()), db: "shop".into() }).input(String::new()).must_type("shop".into());
+        assert!(!enter(name(), ""));
+        assert!(!enter(name(), "sh"));
+        assert!(enter(name(), "shop"));
+        let named = || Confirm::new("Add Collection", "Name:".into(), "Create", Pending::CreateCollection { conn: ConnId(uuid::Uuid::nil()), db: "d".into() }).input(String::new());
+        assert!(!enter(named(), "   "));
+        assert!(enter(named(), "c"));
+    }
+
+    /// A click outside the document editor, or Esc, closes it only while
+    /// nothing was typed into it; after typing only Cancel closes it, so
+    /// minutes of editing aren't lost to a stray click.
+    #[test]
+    fn doc_dialog_keeps_typed_work_on_an_outside_click_or_esc() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let doc = rongo_core::bson::doc! { "_id": 1, "name": "a" };
+        let mut h = doc_harness(&doc);
+        crate::test_support::click_outside(&mut h);
+        assert!(h.state().closed, "nothing typed: a click outside closes it");
+        let mut h = doc_harness(&doc);
+        h.key_press(Key::Escape);
+        h.run_steps(2);
+        assert!(h.state().closed, "nothing typed: Esc closes it");
+
+        let mut h = doc_harness(&doc);
+        h.get_by_role(Role::MultilineTextInput).focus();
+        h.run_steps(2);
+        h.get_by_role(Role::MultilineTextInput).type_text("x");
+        h.run_steps(2);
+        assert!(h.state().dialog.text().contains('x'), "typed: {}", h.state().dialog.text());
+        crate::test_support::click_outside(&mut h);
+        assert!(!h.state().closed, "a click outside keeps typed work");
+        h.key_press(Key::Escape);
+        h.run_steps(2);
+        assert!(!h.state().closed, "Esc keeps typed work");
+        h.get_by_label("Cancel").click();
+        h.run_steps(2);
+        assert!(h.state().closed, "Cancel closes it");
+    }
+
+    /// ⌘S saves the document; ⌘⇧S is another shortcut and saves nothing.
+    #[test]
+    fn doc_dialog_saves_on_cmd_s_but_not_cmd_shift_s() {
+        let doc = rongo_core::bson::doc! { "_id": 1, "name": "a" };
+        let mut h = doc_harness(&doc);
+        h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::S);
+        h.run_steps(2);
+        assert!(h.state().saved.is_empty(), "⌘⇧S saved the document");
+        h.key_press_modifiers(egui::Modifiers::COMMAND, Key::S);
+        h.run_steps(2);
+        assert_eq!(h.state().saved, [doc]);
+    }
+
+    /// The connection manager closes on a click outside; its form, open,
+    /// never does (Cancel goes back to the list).
+    #[test]
+    fn connection_form_keeps_its_work_on_an_outside_click() {
+        struct Probe {
+            dialog: ConnectDialog,
+            vault: std::sync::Arc<Vault>,
+            closed: bool,
+        }
+        let (_dir, vault) = temp_vault();
+        let open = |dialog: ConnectDialog| {
+            let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 800.0)).build_ui_state(
+                |ui, p: &mut Probe| {
+                    theme::install(ui.ctx());
+                    let acts = p.dialog.show(ui.ctx(), &[], &p.vault);
+                    p.closed |= acts.iter().any(|a| matches!(a, ConnectAction::Close));
+                },
+                Probe { dialog, vault: vault.clone(), closed: false },
+            );
+            h.run_steps(3);
+            h
+        };
+        let mut h = open(ConnectDialog::new());
+        crate::test_support::click_outside(&mut h);
+        assert!(h.state().closed, "the list closes");
+        let mut h = open(ConnectDialog::new_connection());
+        crate::test_support::click_outside(&mut h);
+        h.key_press(Key::Escape);
+        h.run_steps(2);
+        assert!(!h.state().closed && h.state().dialog.has_form(), "the form stays");
     }
 }

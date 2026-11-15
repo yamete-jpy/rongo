@@ -3,7 +3,7 @@
 
 pub mod query;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use bson::oid::ObjectId;
 use bson::{Bson, Document, doc};
@@ -12,18 +12,76 @@ use rand::{Rng, SeedableRng};
 
 use crate::api::{CollInfo, CollKind, DbInfo, Namespace, WriteOutcome};
 use crate::error::{CoreError, CoreResult};
+use crate::paths;
 
 #[derive(Default)]
 pub struct MockColl {
     pub docs: Vec<Document>,
     pub indexes: Vec<Document>,
-    /// Stored for Add/Edit Validator; the demo server does not enforce it.
-    pub validator: Option<(Document, String, String)>,
+    /// What `create` was given and `listCollections` reports: validator,
+    /// capped, `viewOn`/`pipeline` for a view, `timeseries`, … Mostly stored
+    /// only; inserts do check the validator (see `accepts`).
+    pub options: Document,
+    /// Which collection this is, as `listCollections` reports it in
+    /// `info.uuid`: new on create, kept by a rename. None stands for a
+    /// server that reports none (an older one, or a time series whose
+    /// buckets entry the user can't see).
+    pub uuid: Option<bson::Uuid>,
+    /// Positions in `docs` by `query::eq_hash` of the `_id`, so an insert
+    /// finds a duplicate without a scan. Kept by `insert`, rebuilt when
+    /// documents go or an `_id` changes (`reindex`).
+    ids: HashMap<u64, Vec<usize>>,
 }
 
 impl MockColl {
     fn new(docs: Vec<Document>) -> Self {
-        Self { docs, indexes: vec![doc! { "v": 2, "key": { "_id": 1 }, "name": "_id_" }], validator: None }
+        let mut c = Self { docs, indexes: vec![doc! { "v": 2, "key": { "_id": 1 }, "name": "_id_" }], options: Document::new(), uuid: Some(bson::Uuid::new()), ids: HashMap::new() };
+        c.reindex();
+        c
+    }
+
+    fn reindex(&mut self) {
+        self.ids.clear();
+        for (i, d) in self.docs.iter().enumerate() {
+            if let Some(id) = d.get("_id") {
+                self.ids.entry(query::eq_hash(id)).or_default().push(i);
+            }
+        }
+    }
+
+    /// Whether a document with this `_id` (by `bson_eq`) is here.
+    fn has_id(&self, id: &Bson) -> bool {
+        self.ids.get(&query::eq_hash(id)).is_some_and(|at| at.iter().any(|&i| self.docs[i].get("_id").is_some_and(|x| query::bson_eq(x, id))))
+    }
+
+    /// Whether the validator lets `doc` in. The demo server checks
+    /// `$jsonSchema.required` and the query conditions it can evaluate; what
+    /// it can't evaluate lets everything through. `validationAction: "warn"`
+    /// and `validationLevel: "off"` let everything through, as on a server.
+    fn accepts(&self, doc: &Document) -> bool {
+        let o = &self.options;
+        let Ok(validator) = o.get_document("validator") else { return true };
+        if o.get_str("validationLevel").ok() == Some("off") || o.get_str("validationAction").ok() == Some("warn") {
+            return true;
+        }
+        let mut conditions = validator.clone();
+        if let Some(Bson::Document(schema)) = conditions.remove("$jsonSchema") {
+            let required = schema.get_array("required").map(|r| r.iter().filter_map(Bson::as_str).collect::<Vec<_>>()).unwrap_or_default();
+            if !required.iter().all(|field| doc.contains_key(field)) {
+                return false;
+            }
+        }
+        query::matches(doc, &conditions).unwrap_or(true)
+    }
+
+    fn kind(&self) -> CollKind {
+        if self.options.contains_key("viewOn") {
+            CollKind::View
+        } else if self.options.contains_key("timeseries") {
+            CollKind::Timeseries
+        } else {
+            CollKind::Collection
+        }
     }
 }
 
@@ -50,36 +108,74 @@ impl MockStore {
     pub fn list_collections(&self, db: &str) -> Vec<CollInfo> {
         self.dbs
             .get(db)
-            .map(|colls| colls.keys().map(|name| CollInfo { name: name.clone(), kind: CollKind::Collection }).collect())
+            .map(|colls| colls.iter().map(|(name, c)| CollInfo { name: name.clone(), kind: c.kind() }).collect())
             .unwrap_or_default()
+    }
+
+    /// `{ name, type, options, info }` per collection, as `listCollections` returns them.
+    pub fn collection_specs(&self, db: &str) -> Vec<Document> {
+        let Some(colls) = self.dbs.get(db) else { return Vec::new() };
+        colls
+            .iter()
+            .map(|(name, c)| {
+                let kind = match c.kind() {
+                    CollKind::View => "view",
+                    CollKind::Timeseries => "timeseries",
+                    CollKind::Collection => "collection",
+                };
+                // Like a server, a view has no uuid. (A real time series has
+                // none either, only its buckets do; here it has its own.)
+                let mut info = doc! { "readOnly": c.kind() == CollKind::View };
+                if let Some(uuid) = c.uuid.filter(|_| c.kind() != CollKind::View) {
+                    info.insert("uuid", uuid);
+                }
+                doc! { "name": name, "type": kind, "options": c.options.clone(), "info": info }
+            })
+            .collect()
     }
 
     fn coll(&self, ns: &Namespace) -> Option<&MockColl> {
         self.dbs.get(&ns.db)?.get(&ns.coll)
     }
 
+    /// The collection, created if missing: only for the writes that create
+    /// one on a server (inserts, upserts, `createIndexes`).
     fn coll_mut(&mut self, ns: &Namespace) -> &mut MockColl {
         // Like the server, a collection created by a write has an _id index.
         self.dbs.entry(ns.db.clone()).or_default().entry(ns.coll.clone()).or_insert_with(|| MockColl::new(Vec::new()))
+    }
+
+    /// The collection if it exists, for the writes that create none.
+    fn existing_mut(&mut self, ns: &Namespace) -> Option<&mut MockColl> {
+        self.dbs.get_mut(&ns.db)?.get_mut(&ns.coll)
     }
 
     pub fn list_indexes(&self, ns: &Namespace) -> Vec<Document> {
         self.coll(ns).map(|c| c.indexes.clone()).unwrap_or_default()
     }
 
-    pub fn create_index(&mut self, ns: &Namespace, keys: Document, name: Option<String>) -> String {
-        let name = name.unwrap_or_else(|| {
-            keys.iter().map(|(k, v)| format!("{k}_{}", crate::format::cell_text(v))).collect::<Vec<_>>().join("_")
-        });
+    /// `createIndexes`: each spec has `key` and the index options, `name`
+    /// included (MongoDB's usual name when missing). Existing names are kept.
+    /// A missing collection is created, as on a server.
+    pub fn create_indexes(&mut self, ns: &Namespace, specs: Vec<Document>) {
         let c = self.coll_mut(ns);
-        if !c.indexes.iter().any(|i| i.get_str("name").ok() == Some(name.as_str())) {
-            c.indexes.push(doc! { "v": 2, "key": keys, "name": name.clone() });
+        for spec in specs {
+            let name = match spec.get_str("name") {
+                Ok(n) => n.to_string(),
+                Err(_) => crate::conn::default_index_name(&spec.get_document("key").cloned().unwrap_or_default()),
+            };
+            if c.indexes.iter().any(|i| i.get_str("name").ok() == Some(name.as_str())) {
+                continue;
+            }
+            let mut index = doc! { "v": 2 };
+            index.extend(spec);
+            index.insert("name", name);
+            c.indexes.push(index);
         }
-        name
     }
 
     pub fn drop_index(&mut self, ns: &Namespace, name: &str) -> CoreResult<()> {
-        let c = self.coll_mut(ns);
+        let c = self.existing_mut(ns).ok_or_else(|| ns_not_found(ns))?;
         let before = c.indexes.len();
         c.indexes.retain(|i| i.get_str("name").ok() != Some(name) || name == "_id_");
         if c.indexes.len() == before {
@@ -99,23 +195,30 @@ impl MockStore {
         limit: Option<u64>,
     ) -> CoreResult<Vec<Document>> {
         let Some(c) = self.coll(ns) else { return Ok(Vec::new()) };
-        let mut hits = Vec::new();
+        let sort = sort.filter(|s| !s.is_empty());
+        let limit = limit.filter(|n| *n > 0).map(|n| n as usize);
+        // Without a sort, the page is the first matches: stop at its end.
+        let enough = match (sort, limit) {
+            (None, Some(n)) => (skip as usize).saturating_add(n),
+            _ => usize::MAX,
+        };
+        // Matches by reference; only the page is copied.
+        let mut hits: Vec<&Document> = Vec::new();
         for d in &c.docs {
+            if hits.len() == enough {
+                break;
+            }
             if query::matches(d, filter)? {
-                hits.push(d.clone());
+                hits.push(d);
             }
         }
-        if let Some(s) = sort.filter(|s| !s.is_empty()) {
-            query::sort_docs(&mut hits, s);
+        if let Some(s) = sort {
+            hits = query::sort_docs(hits, s);
         }
-        let iter = hits.into_iter().skip(skip as usize);
-        let page: Vec<Document> = match limit {
-            Some(n) if n > 0 => iter.take(n as usize).collect(),
-            _ => iter.collect(),
-        };
+        let page = hits.into_iter().skip(skip as usize).take(limit.unwrap_or(usize::MAX));
         match projection.filter(|p| !p.is_empty()) {
-            Some(p) => page.iter().map(|d| query::project(d, p)).collect(),
-            None => Ok(page),
+            Some(p) => page.map(|d| query::project(d, p)).collect(),
+            None => Ok(page.cloned().collect()),
         }
     }
 
@@ -146,43 +249,83 @@ impl MockStore {
             }
         };
         let c = self.coll_mut(ns);
-        if c.docs.iter().any(|d| d.get("_id").is_some_and(|x| query::bson_eq(x, &id))) {
+        if c.kind() == CollKind::View {
+            return Err(view_refuses(ns));
+        }
+        if !c.accepts(&doc) {
+            return Err(CoreError::Server { code: 121, msg: "Document failed validation".into() });
+        }
+        if c.has_id(&id) {
             return Err(CoreError::Server {
                 code: 11000,
                 msg: format!("E11000 duplicate key error collection: {ns} index: _id_ dup key: {{ _id: {} }}", crate::format::to_shell(&id, crate::format::Style::Display)),
             });
         }
+        c.ids.entry(query::eq_hash(&id)).or_default().push(c.docs.len());
         c.docs.push(doc);
         Ok(id)
     }
 
-    pub fn update(&mut self, ns: &Namespace, filter: &Document, update: &Document, many: bool, upsert: bool) -> CoreResult<WriteOutcome> {
-        let mut out = WriteOutcome::default();
-        let c = self.coll_mut(ns);
-        for d in c.docs.iter_mut() {
-            if query::matches(d, filter)? {
-                out.matched += 1;
-                let before = d.clone();
-                query::apply_update(d, update)?;
-                if *d != before {
-                    out.modified += 1;
-                }
-                if !many {
-                    break;
+    /// An unordered insert: every document is tried. Those refused for an
+    /// existing `_id` are reported by position; the first other refusal
+    /// (a validator's) is kept in `error` and the rest are still tried.
+    pub fn insert_unordered(&mut self, ns: &Namespace, docs: Vec<Document>) -> CoreResult<crate::conn::Inserted> {
+        if self.coll(ns).is_some_and(|c| c.kind() == CollKind::View) {
+            return Err(view_refuses(ns));
+        }
+        let mut out = crate::conn::Inserted::default();
+        for (i, d) in docs.into_iter().enumerate() {
+            match self.insert(ns, d) {
+                Ok(_) => out.inserted += 1,
+                Err(CoreError::Server { code: 11000, .. }) => out.duplicates.push(i),
+                Err(e) => {
+                    out.error.get_or_insert(e);
                 }
             }
+        }
+        Ok(out)
+    }
+
+    pub fn update(&mut self, ns: &Namespace, filter: &Document, update: &Document, many: bool, upsert: bool) -> CoreResult<WriteOutcome> {
+        let mut out = WriteOutcome::default();
+        // A missing collection matches nothing, and only an upsert creates it.
+        if let Some(c) = self.existing_mut(ns) {
+            let mut moved_id = false;
+            let result: CoreResult<()> = (|| {
+                for d in c.docs.iter_mut() {
+                    if query::matches(d, filter)? {
+                        out.matched += 1;
+                        let before = d.clone();
+                        query::apply_update(d, update)?;
+                        if *d != before {
+                            out.modified += 1;
+                            moved_id |= d.get("_id") != before.get("_id");
+                        }
+                        if !many {
+                            break;
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            // ($set on a field of _id, say; a failed update may have
+            // changed part of a document before it stopped.)
+            if moved_id || result.is_err() {
+                c.reindex();
+            }
+            result?;
         }
         if out.matched == 0 && upsert {
             let mut fresh = Document::new();
             for (k, v) in filter.iter().filter(|(k, _)| !k.starts_with('$')) {
                 if !matches!(v, Bson::Document(d) if d.keys().any(|k| k.starts_with('$'))) {
-                    query::set_path(&mut fresh, k, v.clone())?;
+                    paths::set_path(&mut fresh, k, v.clone())?;
                 }
             }
             query::apply_update(&mut fresh, update)?;
             if let Ok(set) = update.get_document("$setOnInsert") {
                 for (k, v) in set {
-                    query::set_path(&mut fresh, k, v.clone())?;
+                    paths::set_path(&mut fresh, k, v.clone())?;
                 }
             }
             out.inserted_id = Some(self.insert(ns, fresh)?);
@@ -195,8 +338,8 @@ impl MockStore {
             return Err(CoreError::InvalidInput("replacement document must not contain update operators".into()));
         }
         let mut out = WriteOutcome::default();
-        let c = self.coll_mut(ns);
-        for d in c.docs.iter_mut() {
+        let docs = self.existing_mut(ns).map_or(&mut [][..], |c| &mut c.docs[..]);
+        for d in docs.iter_mut() {
             if query::matches(d, filter)? {
                 out.matched = 1;
                 let id = d.get("_id").cloned();
@@ -224,29 +367,63 @@ impl MockStore {
     }
 
     pub fn delete(&mut self, ns: &Namespace, filter: &Document, many: bool) -> CoreResult<u64> {
-        let c = self.coll_mut(ns);
+        let Some(c) = self.existing_mut(ns) else { return Ok(0) };
+        // Every match is found before anything goes, so a filter that fails
+        // deletes nothing.
         let mut deleted = 0;
-        let mut kept = Vec::with_capacity(c.docs.len());
-        for d in std::mem::take(&mut c.docs) {
-            if (many || deleted == 0) && query::matches(&d, filter)? {
-                deleted += 1;
-            } else {
-                kept.push(d);
-            }
+        let mut hit = Vec::with_capacity(c.docs.len());
+        for d in &c.docs {
+            let h = (many || deleted == 0) && query::matches(d, filter)?;
+            deleted += u64::from(h);
+            hit.push(h);
         }
-        c.docs = kept;
+        if deleted > 0 {
+            let mut i = 0;
+            c.docs.retain(|_| {
+                i += 1;
+                !hit[i - 1]
+            });
+            c.reindex();
+        }
         Ok(deleted)
     }
 
     pub fn aggregate(&self, ns: &Namespace, pipeline: &[Document]) -> CoreResult<Vec<Document>> {
-        let docs = self.coll(ns).map(|c| c.docs.clone()).unwrap_or_default();
-        query::aggregate(docs, pipeline)
+        // Leading $match stages (and a $limit after them) run on the
+        // collection in place: only what they let through is copied.
+        let stage = |s: &Document, name: &str| s.len() == 1 && s.contains_key(name);
+        let matches: Vec<&Document> = pipeline.iter().take_while(|s| stage(s, "$match")).map(|s| s.get_document("$match")).collect::<Result<_, _>>().unwrap_or_default();
+        let mut rest = &pipeline[matches.len()..];
+        let limit = match rest.first() {
+            Some(s) if stage(s, "$limit") => s.get("$limit").and_then(query::as_f64).filter(|n| *n >= 0.0).map(|n| {
+                rest = &rest[1..];
+                n as usize
+            }),
+            _ => None,
+        };
+        let mut docs = Vec::new();
+        for d in self.coll(ns).map_or(&[][..], |c| &c.docs[..]) {
+            if docs.len() == limit.unwrap_or(usize::MAX) {
+                break;
+            }
+            let mut keep = true;
+            for f in &matches {
+                if !query::matches(d, f)? {
+                    keep = false;
+                    break;
+                }
+            }
+            if keep {
+                docs.push(d.clone());
+            }
+        }
+        query::aggregate(docs, rest)
     }
 
     pub fn distinct(&self, ns: &Namespace, field: &str, filter: &Document) -> CoreResult<Vec<Bson>> {
         let mut out: Vec<Bson> = Vec::new();
         for d in self.find(ns, filter, None, None, 0, None)? {
-            for v in query::lookup(&d, field) {
+            for v in paths::lookup(&d, field) {
                 let items: Vec<&Bson> = match v {
                     Bson::Array(a) => a.iter().collect(),
                     other => vec![other],
@@ -263,11 +440,27 @@ impl MockStore {
     }
 
     pub fn create_collection(&mut self, ns: &Namespace) -> CoreResult<()> {
+        self.create_collection_with(ns, Document::new())
+    }
+
+    /// The `create` command with these options; `viewOn` makes a view.
+    pub fn create_collection_with(&mut self, ns: &Namespace, options: Document) -> CoreResult<()> {
         if self.coll(ns).is_some() {
             return Err(CoreError::Server { code: 48, msg: format!("Collection {ns} already exists.") });
         }
-        self.dbs.entry(ns.db.clone()).or_default().insert(ns.coll.clone(), MockColl::new(Vec::new()));
+        let mut coll = MockColl::new(Vec::new());
+        coll.options = options;
+        if coll.kind() == CollKind::View {
+            coll.indexes.clear();
+        }
+        self.dbs.entry(ns.db.clone()).or_default().insert(ns.coll.clone(), coll);
         Ok(())
+    }
+
+    /// Report no uuid for this collection, as some servers do.
+    #[cfg(test)]
+    pub(crate) fn forget_uuid(&mut self, ns: &Namespace) {
+        self.coll_mut(ns).uuid = None;
     }
 
     pub fn drop_collection(&mut self, ns: &Namespace) -> bool {
@@ -288,19 +481,8 @@ impl MockStore {
         Ok(())
     }
 
-    pub fn duplicate_collection(&mut self, ns: &Namespace, to: &str) -> CoreResult<()> {
-        let target = Namespace::new(&ns.db, to);
-        if self.coll(&target).is_some() {
-            return Err(CoreError::Server { code: 48, msg: format!("Collection {target} already exists.") });
-        }
-        let src = self.coll(ns).ok_or_else(|| CoreError::Server { code: 26, msg: format!("ns not found: {ns}") })?;
-        let copy = MockColl { docs: src.docs.clone(), indexes: src.indexes.clone(), validator: src.validator.clone() };
-        self.dbs.entry(ns.db.clone()).or_default().insert(to.to_string(), copy);
-        Ok(())
-    }
-
     pub fn modify_index(&mut self, ns: &Namespace, name: &str, hidden: Option<bool>, ttl: Option<i64>) -> CoreResult<()> {
-        let c = self.coll_mut(ns);
+        let c = self.existing_mut(ns).ok_or_else(|| ns_not_found(ns))?;
         let idx = c
             .indexes
             .iter_mut()
@@ -335,23 +517,25 @@ impl MockStore {
             "totalIndexSize": c.indexes.len() as i64 * 4096,
             "indexSizes": c.indexes.iter().filter_map(|i| i.get_str("name").ok()).map(|n| (n.to_string(), Bson::Int64(4096))).collect::<Document>(),
             "indexNames": c.indexes.iter().filter_map(|i| i.get_str("name").ok().map(str::to_string)).collect::<Vec<_>>(),
-            "capped": false,
+            "capped": c.options.get_bool("capped").unwrap_or(false),
         })
     }
 
     pub fn validator(&self, ns: &Namespace) -> CoreResult<Document> {
         let c = self.coll(ns).ok_or_else(|| CoreError::Server { code: 26, msg: format!("ns not found: {ns}") })?;
-        Ok(match &c.validator {
-            Some((v, level, action)) => doc! { "validator": v.clone(), "validationLevel": level.clone(), "validationAction": action.clone() },
-            None => doc! { "validator": {}, "validationLevel": "strict", "validationAction": "error" },
+        let o = &c.options;
+        Ok(doc! {
+            "validator": o.get_document("validator").cloned().unwrap_or_default(),
+            "validationLevel": o.get_str("validationLevel").unwrap_or("strict"),
+            "validationAction": o.get_str("validationAction").unwrap_or("error"),
         })
     }
 
     pub fn set_validator(&mut self, ns: &Namespace, validator: Document, level: &str, action: &str) -> CoreResult<()> {
-        if self.coll(ns).is_none() {
-            return Err(CoreError::Server { code: 26, msg: format!("ns not found: {ns}") });
-        }
-        self.coll_mut(ns).validator = Some((validator, level.to_string(), action.to_string()));
+        let o = &mut self.existing_mut(ns).ok_or_else(|| ns_not_found(ns))?.options;
+        o.insert("validator", validator);
+        o.insert("validationLevel", level);
+        o.insert("validationAction", action);
         Ok(())
     }
 
@@ -504,6 +688,16 @@ impl MockStore {
     }
 }
 
+/// A server's answer to a write into a view.
+fn view_refuses(ns: &Namespace) -> CoreError {
+    CoreError::Server { code: 166, msg: format!("Namespace {ns} is a view, not a collection") }
+}
+
+/// A server's answer (NamespaceNotFound) to changing what a missing collection has.
+fn ns_not_found(ns: &Namespace) -> CoreError {
+    CoreError::Server { code: 26, msg: format!("ns not found: {ns}") }
+}
+
 fn pick<'a>(rng: &mut StdRng, items: &[&'a str]) -> &'a str {
     items[rng.random_range(0..items.len())]
 }
@@ -550,15 +744,15 @@ mod tests {
     }
 
     #[test]
-    fn rename_duplicate_and_validators() {
+    fn rename_and_validators() {
         let mut s = MockStore::empty();
         let ns = Namespace::new("t", "a");
         s.insert(&ns, doc! { "x": 1 }).unwrap();
-        s.create_index(&ns, doc! { "x": 1 }, None);
-        s.duplicate_collection(&ns, "b").unwrap();
-        assert!(s.duplicate_collection(&ns, "b").is_err());
-        assert_eq!(s.list_indexes(&Namespace::new("t", "b")).len(), 2);
+        s.create_indexes(&ns, vec![doc! { "key": { "x": 1 } }]);
+        s.insert(&Namespace::new("t", "b"), doc! { "x": 1 }).unwrap();
+        assert!(matches!(s.rename_collection(&ns, "b"), Err(CoreError::Server { code: 48, .. })));
         s.rename_collection(&ns, "c").unwrap();
+        assert_eq!(s.list_indexes(&Namespace::new("t", "c")).len(), 2, "indexes go along");
         assert!(s.coll(&ns).is_none());
         let c = Namespace::new("t", "c");
         assert_eq!(s.coll_stats(&c).unwrap().get_i64("count").unwrap(), 1);
@@ -571,8 +765,7 @@ mod tests {
         let mut s = MockStore::empty();
         let ns = Namespace::new("t", "a");
         s.insert(&ns, doc! { "at": 1 }).unwrap();
-        s.create_index(&ns, doc! { "at": 1 }, Some("ttl".into()));
-        s.coll_mut(&ns).indexes[1].insert("expireAfterSeconds", 60);
+        s.create_indexes(&ns, vec![doc! { "key": { "at": 1 }, "name": "ttl", "expireAfterSeconds": 60 }]);
         let sum = crate::api::CollSummary::from_stats(&s.coll_stats(&ns).unwrap());
         assert_eq!((sum.count, sum.indexes, sum.total_index_size), (1, 2, 8192));
         s.modify_index(&ns, "ttl", Some(true), Some(120)).unwrap();
@@ -596,5 +789,211 @@ mod tests {
         assert!(r.inserted_id.is_some());
         assert_eq!(s.count(&ns, &doc! { "k": "x", "n": 1 }).unwrap(), 1);
         assert_eq!(s.delete(&ns, &doc! {}, true).unwrap(), 2);
+    }
+
+    #[test]
+    fn collection_options_kinds_and_views() {
+        let mut s = MockStore::empty();
+        let orders = Namespace::new("t", "orders");
+        let view = Namespace::new("t", "v");
+        let definition = doc! { "viewOn": "orders", "pipeline": [{ "$match": { "a": 1 } }] };
+        s.create_collection_with(&orders, doc! { "validator": { "a": { "$exists": true } }, "capped": true, "size": 4096 }).unwrap();
+        s.create_collection_with(&view, definition.clone()).unwrap();
+        s.create_collection_with(&Namespace::new("t", "ts"), doc! { "timeseries": { "timeField": "at" } }).unwrap();
+        assert!(s.create_collection_with(&orders, doc! {}).is_err(), "already exists");
+
+        let specs = s.collection_specs("t");
+        let kinds: Vec<(&str, &str)> = specs.iter().map(|d| (d.get_str("name").unwrap(), d.get_str("type").unwrap())).collect();
+        assert_eq!(kinds, [("orders", "collection"), ("ts", "timeseries"), ("v", "view")]);
+        assert_eq!(specs[2].get_document("options").unwrap(), &definition);
+        let kinds: Vec<CollKind> = s.list_collections("t").into_iter().map(|c| c.kind).collect();
+        assert_eq!(kinds, [CollKind::Collection, CollKind::Timeseries, CollKind::View]);
+        assert!(s.collection_specs("nothing").is_empty());
+
+        // The validator is one of the options, both ways.
+        assert_eq!(s.validator(&orders).unwrap().get_document("validator").unwrap(), &doc! { "a": { "$exists": true } });
+        s.set_validator(&orders, doc! { "b": 1 }, "moderate", "warn").unwrap();
+        let options = s.collection_specs("t")[0].get_document("options").unwrap().clone();
+        assert_eq!(options, doc! { "validator": { "b": 1 }, "capped": true, "size": 4096, "validationLevel": "moderate", "validationAction": "warn" });
+        assert!(s.coll_stats(&orders).unwrap().get_bool("capped").unwrap());
+
+        // A view has no indexes and takes no documents.
+        assert!(s.list_indexes(&view).is_empty());
+        assert!(matches!(s.insert(&view, doc! { "a": 1 }), Err(CoreError::Server { code: 166, .. })));
+        assert!(matches!(s.insert_unordered(&view, vec![doc! { "a": 1 }]), Err(CoreError::Server { code: 166, .. })));
+    }
+
+    #[test]
+    fn unordered_inserts_report_duplicate_ids() {
+        let mut s = MockStore::empty();
+        let ns = Namespace::new("t", "c");
+        s.insert(&ns, doc! { "_id": 2, "old": true }).unwrap();
+        let r = s.insert_unordered(&ns, vec![doc! { "_id": 1 }, doc! { "_id": 2 }, doc! { "_id": 3 }, doc! { "_id": 1 }]).unwrap();
+        assert_eq!(r, crate::conn::Inserted { inserted: 2, duplicates: vec![1, 3], error: None, unconfirmed: false });
+        assert_eq!(s.count(&ns, &doc! {}).unwrap(), 3);
+        assert_eq!(s.count(&ns, &doc! { "old": true }).unwrap(), 1, "the existing document is untouched");
+
+        s.create_indexes(&ns, vec![doc! { "key": { "a": 1 }, "name": "a_1", "unique": true }, doc! { "key": { "b": -1 } }, doc! { "key": { "a": 1 }, "name": "a_1" }]);
+        let indexes = s.list_indexes(&ns);
+        let names: Vec<&str> = indexes.iter().map(|i| i.get_str("name").unwrap()).collect();
+        assert_eq!(names, ["_id_", "a_1", "b_-1"]);
+        assert_eq!(indexes[1], doc! { "v": 2, "key": { "a": 1 }, "name": "a_1", "unique": true });
+    }
+
+    #[test]
+    fn unordered_inserts_go_on_past_validation_failures() {
+        let mut s = MockStore::empty();
+        let ns = Namespace::new("t", "c");
+        s.create_collection_with(&ns, doc! { "validator": { "$jsonSchema": { "required": ["a"] } } }).unwrap();
+        let r = s.insert_unordered(&ns, vec![doc! { "_id": 1, "a": 1 }, doc! { "_id": 2 }, doc! { "_id": 1, "a": 1 }, doc! { "_id": 3, "a": 3 }, doc! { "_id": 4 }]).unwrap();
+        assert_eq!((r.inserted, r.duplicates.clone()), (2, vec![2]));
+        assert!(matches!(r.error, Some(CoreError::Server { code: 121, .. })), "{r:?}");
+        assert_eq!(s.count(&ns, &doc! {}).unwrap(), 2);
+
+        // Query-style validators too; "warn" and "off" let documents through.
+        let q = Namespace::new("t", "q");
+        s.create_collection_with(&q, doc! { "validator": { "a": { "$gt": 0 } } }).unwrap();
+        assert!(matches!(s.insert(&q, doc! { "a": 0 }), Err(CoreError::Server { code: 121, .. })));
+        s.insert(&q, doc! { "a": 1 }).unwrap();
+        s.set_validator(&q, doc! { "a": { "$gt": 0 } }, "strict", "warn").unwrap();
+        s.insert(&q, doc! { "a": 0 }).unwrap();
+        s.set_validator(&q, doc! { "a": { "$gt": 0 } }, "off", "error").unwrap();
+        s.insert(&q, doc! { "a": -1 }).unwrap();
+        assert_eq!(s.count(&q, &doc! {}).unwrap(), 3);
+    }
+
+    /// A filter the demo server can't evaluate fails the delete before
+    /// anything is deleted, as a server's does (it once emptied the
+    /// collection).
+    #[test]
+    fn a_delete_whose_filter_fails_deletes_nothing() {
+        let mut s = MockStore::empty();
+        let ns = Namespace::new("t", "c");
+        for i in 0..3 {
+            s.insert(&ns, doc! { "_id": i }).unwrap();
+        }
+        assert!(s.delete(&ns, &doc! { "$where": "this.a" }, true).is_err());
+        assert_eq!(s.count(&ns, &doc! {}).unwrap(), 3);
+        assert!(s.delete(&ns, &doc! { "a": { "$near": [0, 0] } }, false).is_err());
+        assert_eq!(s.count(&ns, &doc! {}).unwrap(), 3);
+    }
+
+    /// Like a server, only inserts, upserts and index or collection
+    /// creation make a missing collection; other writes find nothing, and
+    /// dropping or changing an index of one is "ns not found" (code 26).
+    #[test]
+    fn writes_to_a_missing_collection_create_nothing() {
+        let mut s = MockStore::empty();
+        let ns = Namespace::new("t", "gone");
+        assert_eq!(s.delete(&ns, &doc! {}, true).unwrap(), 0);
+        let r = s.update(&ns, &doc! {}, &doc! { "$set": { "a": 1 } }, true, false).unwrap();
+        assert_eq!((r.matched, r.modified, r.inserted_id), (0, 0, None));
+        let r = s.replace(&ns, &doc! { "_id": 1 }, doc! { "a": 1 }, false).unwrap();
+        assert_eq!((r.matched, r.inserted_id), (0, None));
+        assert!(matches!(s.drop_index(&ns, "a_1"), Err(CoreError::Server { code: 26, .. })), "{:?}", s.drop_index(&ns, "a_1"));
+        assert!(matches!(s.modify_index(&ns, "a_1", Some(true), None), Err(CoreError::Server { code: 26, .. })));
+        assert!(s.list_databases().is_empty() && s.list_collections("t").is_empty(), "nothing was created");
+
+        let upserted = Namespace::new("t", "upserted");
+        s.update(&upserted, &doc! { "k": 1 }, &doc! { "$set": { "a": 1 } }, false, true).unwrap();
+        s.replace(&Namespace::new("t", "replaced"), &doc! { "_id": 1 }, doc! { "a": 1 }, true).unwrap();
+        s.create_indexes(&Namespace::new("t", "indexed"), vec![doc! { "key": { "a": 1 } }]);
+        let names: Vec<String> = s.list_collections("t").into_iter().map(|c| c.name).collect();
+        assert_eq!(names, ["indexed", "replaced", "upserted"]);
+    }
+
+    #[test]
+    fn collections_have_their_own_uuid() {
+        let mut s = MockStore::empty();
+        let a = Namespace::new("t", "a");
+        s.insert(&a, doc! { "x": 1 }).unwrap();
+        s.insert(&Namespace::new("t", "b"), doc! { "x": 1 }).unwrap();
+        s.create_collection_with(&Namespace::new("t", "v"), doc! { "viewOn": "a", "pipeline": [] }).unwrap();
+        let uuid = |s: &MockStore, name: &str| {
+            let spec = s.collection_specs("t").into_iter().find(|d| d.get_str("name").ok() == Some(name))?;
+            spec.get_document("info").ok()?.get("uuid").cloned()
+        };
+        let first = uuid(&s, "a").expect("a collection has a uuid");
+        assert!(matches!(first, Bson::Binary(ref b) if b.subtype == bson::spec::BinarySubtype::Uuid), "{first:?}");
+        assert!(uuid(&s, "b").is_some_and(|b| b != first), "each collection has its own");
+        assert_eq!(uuid(&s, "v"), None, "a view has none, as on a real server");
+        let c = Namespace::new("t", "c");
+        s.rename_collection(&a, "c").unwrap();
+        assert_eq!(uuid(&s, "c").as_ref(), Some(&first), "a rename keeps it");
+        s.drop_collection(&c);
+        s.insert(&c, doc! { "x": 1 }).unwrap();
+        assert!(uuid(&s, "c").is_some_and(|u| u != first), "dropped and created again: another collection");
+    }
+
+    /// The `_id` index finds a duplicate as `bson_eq` does (1, 1.0 and
+    /// NumberLong(1) are one `_id`), and follows deletes and an `_id` an
+    /// update changed.
+    #[test]
+    fn the_id_index_follows_writes() {
+        let mut s = MockStore::empty();
+        let ns = Namespace::new("t", "c");
+        s.insert(&ns, doc! { "_id": 1 }).unwrap();
+        assert!(s.insert(&ns, doc! { "_id": 1.0 }).is_err() && s.insert(&ns, doc! { "_id": 1_i64 }).is_err());
+        s.insert(&ns, doc! { "_id": { "a": 1, "b": "x" } }).unwrap();
+        assert!(s.insert(&ns, doc! { "_id": { "a": 1.0, "b": "x" } }).is_err());
+        s.insert(&ns, doc! { "_id": { "b": "x", "a": 1 } }).unwrap();
+        s.insert(&ns, doc! { "_id": "s" }).unwrap();
+        s.insert(&ns, doc! { "_id": Bson::Double(f64::NAN) }).unwrap();
+        s.insert(&ns, doc! { "_id": Bson::Double(f64::NAN) }).unwrap();
+        assert_eq!(s.delete(&ns, &doc! { "_id": 1 }, false).unwrap(), 1);
+        s.insert(&ns, doc! { "_id": 1 }).unwrap();
+        assert!(s.insert(&ns, doc! { "_id": "s" }).is_err(), "found where the delete moved it");
+        s.insert(&ns, doc! { "_id": { "a": 2 } }).unwrap();
+        s.update(&ns, &doc! { "_id": { "a": 2 } }, &doc! { "$set": { "_id.b": 3 } }, false, false).unwrap();
+        s.insert(&ns, doc! { "_id": { "a": 2 } }).unwrap();
+        assert!(s.insert(&ns, doc! { "_id": { "a": 2, "b": 3 } }).is_err());
+    }
+
+    /// A page without a sort stops at its last match, and an aggregate's
+    /// leading $match and $limit run in place: both give what the general
+    /// way gives.
+    #[test]
+    fn short_cuts_give_what_the_general_way_gives() {
+        let s = MockStore::demo();
+        let ns = Namespace::new("demo-games", "bet_logs");
+        let all = s.find(&ns, &doc! {}, None, None, 0, None).unwrap();
+        let pending: Vec<Document> = all.iter().filter(|d| d.get_str("status").ok() == Some("pending")).cloned().collect();
+        assert_eq!(s.find(&ns, &doc! { "status": "pending" }, None, None, 30, Some(20)).unwrap(), pending[30..50]);
+        assert_eq!(s.find(&ns, &doc! { "status": "pending" }, None, Some(&doc! { "ref": 1 }), 5, Some(2)).unwrap(), s.find(&ns, &doc! { "status": "pending" }, None, None, 5, Some(2)).unwrap().iter().map(|d| query::project(d, &doc! { "ref": 1 }).unwrap()).collect::<Vec<_>>());
+        for pipeline in [
+            vec![doc! { "$match": { "status": "pending" } }],
+            vec![doc! { "$match": { "status": "pending" } }, doc! { "$limit": 10 }],
+            vec![doc! { "$match": { "status": "pending" } }, doc! { "$match": { "provider": "ALPHA" } }, doc! { "$limit": 5 }, doc! { "$sort": { "amount": -1 } }],
+            vec![doc! { "$limit": 3 }],
+            vec![doc! { "$limit": -3 }],
+            vec![doc! { "$group": { "_id": { "u": "$username", "p": "$provider" }, "n": { "$sum": 1 } } }],
+            vec![doc! { "$sortByCount": "$status" }],
+        ] {
+            assert_eq!(s.aggregate(&ns, &pipeline).map_err(|e| e.to_string()), query::aggregate(all.clone(), &pipeline).map_err(|e| e.to_string()), "{pipeline:?}");
+        }
+    }
+
+    /// Times the demo server's hot spots on its 25,000 bet_logs: an
+    /// unordered insert of all of them (as a copy does), finds with and
+    /// without a sort, and a $group.
+    /// `cargo test -p rongo-core --release --lib -- --ignored --nocapture report_mock_time`
+    #[test]
+    #[ignore = "timing; run explicitly in release mode"]
+    fn report_mock_time() {
+        let mut s = MockStore::demo();
+        let ns = Namespace::new("demo-games", "bet_logs");
+        let docs = s.find(&ns, &doc! {}, None, None, 0, None).unwrap();
+        let time = |what: &str, f: &mut dyn FnMut() -> usize| {
+            let t = std::time::Instant::now();
+            let n = f();
+            println!("{what}: {:?} ({n})", t.elapsed());
+        };
+        time("insert_unordered 25k into an empty collection", &mut || s.insert_unordered(&Namespace::new("copy", "bets"), docs.clone()).unwrap().inserted as usize);
+        time("insert_unordered 25k again (all duplicates)", &mut || s.insert_unordered(&Namespace::new("copy", "bets"), docs.clone()).unwrap().duplicates.len());
+        time("find page of 50, no sort", &mut || s.find(&ns, &doc! {}, None, None, 100, Some(50)).unwrap().len());
+        time("find page of 50, sorted by status, amount", &mut || s.find(&ns, &doc! {}, Some(&doc! { "status": 1, "amount": -1 }), None, 100, Some(50)).unwrap().len());
+        time("find page of 50 with a filter", &mut || s.find(&ns, &doc! { "status": "pending" }, None, None, 0, Some(50)).unwrap().len());
+        time("$group by username", &mut || s.aggregate(&ns, &[doc! { "$group": { "_id": "$username", "n": { "$sum": 1 } } }]).unwrap().len());
+        time("$match + $limit 10", &mut || s.aggregate(&ns, &[doc! { "$match": { "status": "pending" } }, doc! { "$limit": 10 }]).unwrap().len());
     }
 }

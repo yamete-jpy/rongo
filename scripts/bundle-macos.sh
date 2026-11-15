@@ -2,6 +2,7 @@
 # Build a release binary and wrap it in target/rongo.app.
 set -eu
 cd "$(dirname "$0")/.."
+. ./scripts/trim-paths.sh
 cargo build --release -p rongo
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 app=target/rongo.app

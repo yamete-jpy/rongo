@@ -43,7 +43,7 @@ db.dropDatabase()
     let deadline = Instant::now() + Duration::from_secs(30);
     while done.is_none() {
         match shell.try_recv() {
-            Some(ShellEvent::Print { text, .. }) => prints.push(text),
+            Some(ShellEvent::Print { texts, .. }) => prints.extend(texts),
             Some(ShellEvent::Result { item, .. }) => results.push(item),
             Some(ShellEvent::Done { run: r, error, db, .. }) if r == run => done = Some((error, db)),
             Some(_) => {}

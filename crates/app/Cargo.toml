@@ -7,10 +7,16 @@ license.workspace = true
 [lints]
 workspace = true
 
+[build-dependencies]
+# The Windows icon and version info (build.rs; nothing happens on macOS).
+embed-resource = "3"
+
 [dependencies]
 rongo-core.workspace = true
 rongo-shell.workspace = true
-eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "persistence"] }
+# wgpu draws through Metal. macOS runs OpenGL (glow) on top of Metal, and
+# its window buffers took about 90 MB more on a wide screen.
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11", "persistence"] }
 egui_extras = "0.36"
 egui = "0.36"
 egui-phosphor = "0.14"
@@ -22,7 +28,16 @@ rfd = "0.15"
 uuid = "1"
 directories = "6"
 memmap2 = "0.9"
+# The JSON view's find: byte searches over the whole text.
+memchr = "2.7"
 tokio.workspace = true
+# The update check: one HTTPS GET to GitHub's API on a thread of its own.
+# rustls with ring and webpki-roots, as the MongoDB driver already uses; no
+# gzip, so no header beyond the two the request sets.
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
+# Opens the release page in the default browser: /usr/bin/open on macOS,
+# ShellExecuteExW on Windows (no shell in between).
+open = { version = "5.4", features = ["shellexecute-on-windows"] }
 
 [dev-dependencies]
 # Renders the UI to images for the screenshot tour (an ignored test).

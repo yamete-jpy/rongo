@@ -2,8 +2,10 @@
 //! a line-number gutter, the current line highlighted, an error marker, and an
 //! autocomplete popup.
 
+use std::sync::Arc;
+
 use egui::text::{CCursor, CCursorRange};
-use egui::{Align2, Area, Frame, Id, Key, Modifiers, Order, Rect, Sense, Shape, TextEdit, Ui, pos2, vec2};
+use egui::{Align2, Area, Frame, Galley, Id, Key, Modifiers, Order, Rect, Sense, Shape, TextEdit, Ui, pos2, vec2};
 use rongo_shell::complete::{self, Completion, Kind};
 
 use crate::{highlight, theme};
@@ -19,6 +21,22 @@ pub struct CodeEditor {
     pub error_line: Option<u32>,
     /// Collection whose field names the open popup is waiting for.
     awaiting_fields: Option<String>,
+    /// The text as last laid out, reused while it stays the same.
+    laid: Option<Laid>,
+}
+
+/// The editor's text as laid out (coloured, wrapped at `wrap`), kept while
+/// the text and the wrap width stay the same: colouring and laying out a
+/// long script every frame took milliseconds.
+struct Laid {
+    text: String,
+    wrap: f32,
+    galley: Arc<Galley>,
+    /// A one-character text laid out next to it each frame. egui hands back
+    /// this same galley for it for as long as its galley cache keeps what it
+    /// laid out; another one means the cache was emptied (a new font atlas,
+    /// another scale), and `galley` may point at glyphs that have moved.
+    probe: Arc<Galley>,
 }
 
 struct Popup {
@@ -40,7 +58,7 @@ pub struct EditorOutput {
 
 impl CodeEditor {
     pub fn new(id: Id, text: impl Into<String>) -> Self {
-        Self { text: text.into(), id, completion: None, cursor: 0, selection: None, error_line: None, awaiting_fields: None }
+        Self { text: text.into(), id, completion: None, cursor: 0, selection: None, error_line: None, awaiting_fields: None, laid: None }
     }
 
     /// Replace the whole text (Load file, New). The old cursor and
@@ -53,12 +71,9 @@ impl CodeEditor {
         self.error_line = None;
     }
 
-    /// 1-based line and column of the cursor.
+    /// 1-based line and column of the cursor, counted without copying.
     pub fn line_col(&self) -> (usize, usize) {
-        let before: String = self.text.chars().take(self.cursor).collect();
-        let line = before.matches('\n').count() + 1;
-        let col = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
-        (line, col)
+        self.text.chars().take(self.cursor).fold((1, 1), |(line, col), c| if c == '\n' { (line + 1, 1) } else { (line, col + 1) })
     }
 
     /// The selection, or everything when nothing is selected.
@@ -94,8 +109,10 @@ impl CodeEditor {
         RunRequest { code: lines[first..=last].join("\n"), line_offset: first as u32 }
     }
 
-    /// `fields` returns a collection's field names when they are known.
-    pub fn ui(&mut self, ui: &mut Ui, collections: &[String], fields: &dyn Fn(&str) -> Option<Vec<String>>) -> EditorOutput {
+    /// `collections` gives the database's collection names and `fields` a
+    /// collection's field names when they are known; both are asked only
+    /// when completing (a database can hold thousands of collections).
+    pub fn ui(&mut self, ui: &mut Ui, collections: &dyn Fn() -> Vec<String>, fields: &dyn Fn(&str) -> Option<Vec<String>>) -> EditorOutput {
         let mut out = EditorOutput::default();
         let has_focus = ui.memory(|m| m.has_focus(self.id));
         // Field names arrived while the popup was open: refresh it.
@@ -139,12 +156,24 @@ impl CodeEditor {
         let font = theme::mono(13.5);
         let row_height = ui.fonts_mut(|f| f.row_height(&font));
         let char_w = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
-        let line_count = self.text.split('\n').count().max(1);
+        let line_count = memchr::memchr_iter(b'\n', self.text.as_bytes()).count() + 1;
         let gutter_w = (line_count.to_string().len().max(2) as f32) * char_w + 18.0;
 
+        // Taken out for the frame, so the closures below can borrow the rest.
+        let mut laid = self.laid.take();
         let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+            let probe = ui.fonts_mut(|f| f.layout_no_wrap("0".into(), theme::mono(13.5), theme::TEXT));
+            if let Some(l) = laid.as_ref()
+                && l.wrap == wrap
+                && Arc::ptr_eq(&l.probe, &probe)
+                && l.text == buf.as_str()
+            {
+                return l.galley.clone();
+            }
             let job = highlight::layout_job(buf.as_str(), theme::mono(13.5), wrap);
-            ui.fonts_mut(|f| f.layout_job(job))
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
+            laid = Some(Laid { text: buf.as_str().to_owned(), wrap, galley: galley.clone(), probe });
+            galley
         };
 
         let scroll = egui::ScrollArea::both().id_salt(self.id.with("scroll")).auto_shrink([false, false]).show(ui, |ui| {
@@ -169,15 +198,22 @@ impl CodeEditor {
                     self.selection = Some((a.min(b), a.max(b)));
                 }
 
-                // Gutter numbers, current line and error line.
+                // Gutter numbers, current line and error line, for the rows
+                // in view: the rows above are only counted.
                 let painter = ui.painter();
                 let full_width = ui.clip_rect().right() - gutter.left();
                 let (cur_line, _) = self.line_col();
-                let mut line = 1usize;
-                let mut starts_line = true;
+                let rows = &output.galley.rows;
+                let clip = ui.clip_rect().y_range();
+                let first = rows.partition_point(|r| output.galley_pos.y + r.max_y() < clip.min);
+                let mut line = 1 + rows[..first].iter().filter(|r| r.ends_with_newline).count();
+                let mut starts_line = first == 0 || rows[first - 1].ends_with_newline;
                 let mut highlight = Vec::new();
-                for row in &output.galley.rows {
+                for row in &rows[first..] {
                     let y = output.galley_pos.y + row.min_y();
+                    if y > clip.max {
+                        break;
+                    }
                     if starts_line {
                         let color = if line == cur_line { theme::TEXT } else { theme::MUTED };
                         painter.text(
@@ -212,6 +248,7 @@ impl CodeEditor {
             })
             .inner
         });
+        self.laid = laid;
 
         if let Some(p) = &self.completion
             && has_focus
@@ -254,7 +291,7 @@ impl CodeEditor {
         out
     }
 
-    fn refresh_completion(&mut self, collections: &[String], fields: &dyn Fn(&str) -> Option<Vec<String>>, forced: bool) {
+    fn refresh_completion(&mut self, collections: &dyn Fn() -> Vec<String>, fields: &dyn Fn(&str) -> Option<Vec<String>>, forced: bool) {
         let cursor_byte = char_to_byte(&self.text, self.cursor);
         let before = &self.text[..cursor_byte];
         let last = before.chars().last();
@@ -263,7 +300,7 @@ impl CodeEditor {
             self.completion = None;
             return;
         }
-        let c = complete::complete(before, collections, fields);
+        let c = complete::complete(before, &collections(), fields);
         self.awaiting_fields = c.needs_fields;
         self.completion = (!c.items.is_empty()).then_some(Popup { start_byte: c.start, items: c.items, selected: 0 });
     }
@@ -346,7 +383,7 @@ mod tests {
             };
             let mut out = ctx.run_ui(input, |ui| {
                 ui.memory_mut(|m| m.request_focus(e.id));
-                e.ui(ui, &[], &fields);
+                e.ui(ui, &Vec::new, &fields);
             });
             out.textures_delta.clear();
             out.shapes
@@ -408,7 +445,7 @@ mod tests {
                 ..Default::default()
             };
             let mut out = ctx.run_ui(input, |ui| {
-                e.ui(ui, &[], &fields);
+                e.ui(ui, &Vec::new, &fields);
             });
             out.textures_delta.clear();
         };
@@ -429,6 +466,37 @@ mod tests {
         assert!(e.completion.is_none());
     }
 
+    /// The collection names are asked for only when completing: a repaint
+    /// with nothing typed doesn't copy a database's thousands of names.
+    #[test]
+    fn collection_names_are_read_only_when_completing() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut e = CodeEditor::new(Id::new("ed"), "");
+        let asked = std::cell::Cell::new(0);
+        let collections = || {
+            asked.set(asked.get() + 1);
+            vec!["users".to_string(), "orders".to_string()]
+        };
+        let fields = |_: &str| None;
+        let frame = |e: &mut CodeEditor, events: Vec<egui::Event>| {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 500.0))), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                ui.memory_mut(|m| m.request_focus(e.id));
+                e.ui(ui, &collections, &fields);
+            });
+            out.textures_delta.clear();
+        };
+        for _ in 0..5 {
+            frame(&mut e, vec![]);
+        }
+        assert_eq!(asked.get(), 0, "not asked while nothing is typed");
+        frame(&mut e, vec![egui::Event::Text("db.u".into())]);
+        let popup = e.completion.as_ref().expect("suggestions opened");
+        assert!(popup.items.iter().any(|i| i.label == "users"), "the collections are offered");
+        assert!(asked.get() > 0);
+    }
+
     #[test]
     fn selection_runs_with_offset() {
         let mut e = editor("x\ny\nz", 0);
@@ -436,5 +504,131 @@ mod tests {
         let r = e.run_all();
         assert_eq!((r.code.as_str(), r.line_offset), ("y", 1));
         assert_eq!(editor("ab\ncd", 4).line_col(), (2, 2));
+    }
+
+    /// A 5,000-line script lays out line numbers only for the lines in
+    /// view, the right ones, also scrolled far down.
+    #[test]
+    fn gutter_numbers_only_for_lines_in_view() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let script: String = (0..5_000).map(|i| format!("print({i})\n")).collect();
+        let mut e = CodeEditor::new(Id::new("ed"), script);
+        let fields = |_: &str| None;
+        let frame = |e: &mut CodeEditor, events: Vec<egui::Event>| -> Vec<usize> {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 500.0))), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                e.ui(ui, &Vec::new, &fields);
+            });
+            out.textures_delta.clear();
+            // Line numbers are the texts that are only digits.
+            out.shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) => t.galley.text().parse::<usize>().ok(),
+                    _ => None,
+                })
+                .collect()
+        };
+        frame(&mut e, vec![]);
+        let numbers = frame(&mut e, vec![]);
+        assert!(!numbers.is_empty() && numbers.len() < 100, "{} line numbers laid out", numbers.len());
+        assert_eq!(numbers[0], 1);
+        assert!(numbers.windows(2).all(|w| w[1] == w[0] + 1), "{numbers:?}");
+        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Page, delta: egui::vec2(0.0, -200.0), modifiers: Modifiers::NONE, phase: egui::TouchPhase::Move };
+        frame(&mut e, vec![egui::Event::PointerMoved(egui::pos2(400.0, 250.0))]);
+        frame(&mut e, vec![wheel]);
+        let numbers = frame(&mut e, vec![]);
+        assert!(!numbers.is_empty() && numbers.len() < 100, "{} line numbers laid out", numbers.len());
+        assert!(numbers[0] > 1_000 && numbers.windows(2).all(|w| w[1] == w[0] + 1), "scrolled down: {numbers:?}");
+    }
+
+    /// The laid-out text is kept while it stays the same, and laid out
+    /// again when it changes or egui's fonts start over (another scale):
+    /// the old galley's glyphs would be in the wrong places.
+    #[test]
+    fn the_layout_is_kept_until_the_text_or_the_fonts_change() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut e = CodeEditor::new(Id::new("ed"), "db.users.find({ name: \"สมชาย\" })\nprint(1)");
+        let fields = |_: &str| None;
+        let frame = |e: &mut CodeEditor, events: Vec<egui::Event>| {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 500.0))), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                ui.memory_mut(|m| m.request_focus(e.id));
+                e.ui(ui, &Vec::new, &fields);
+            });
+            out.textures_delta.clear();
+        };
+        let galley = |e: &CodeEditor| e.laid.as_ref().expect("laid out").galley.clone();
+        frame(&mut e, vec![]);
+        let first = galley(&e);
+        for _ in 0..3 {
+            frame(&mut e, vec![]);
+        }
+        assert!(Arc::ptr_eq(&first, &galley(&e)), "kept while nothing changed");
+        frame(&mut e, vec![egui::Event::Text("x".into())]);
+        let typed = galley(&e);
+        assert!(!Arc::ptr_eq(&first, &typed) && typed.text().contains('x'), "laid out again after typing");
+        ctx.set_pixels_per_point(2.0);
+        frame(&mut e, vec![]);
+        frame(&mut e, vec![]);
+        let scaled = galley(&e);
+        assert!(!Arc::ptr_eq(&typed, &scaled), "laid out again for the new scale");
+        assert_eq!(scaled.pixels_per_point, 2.0);
+    }
+
+    /// Line and column count characters (Thai is one column a character),
+    /// from 1.
+    #[test]
+    fn line_and_column_of_the_cursor() {
+        assert_eq!(editor("", 0).line_col(), (1, 1));
+        assert_eq!(editor("ab\n", 3).line_col(), (2, 1));
+        assert_eq!(editor("ไทย\nสวัสดี x", 9).line_col(), (2, 6));
+        assert_eq!(editor("a\n\nb", 3).line_col(), (3, 1));
+    }
+
+    /// What a frame of the editor costs with a 5,000-line script: idle (the
+    /// cursor blinking, the pointer moving), and typing a character a frame.
+    /// Run with `cargo test -p rongo --release -- --ignored --nocapture report_editor_frame_time`.
+    #[test]
+    #[ignore = "timing; run explicitly in release mode"]
+    fn report_editor_frame_time() {
+        use std::time::Instant;
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let script: String = (0..5_000).map(|i| format!("db.getCollection(\"games\").updateOne({{ _id: {i} }}, {{ $set: {{ name: \"สล็อต {i}\", rtp: {}.5 }} }}) // line {i}\n", i % 97)).collect();
+        let lines = script.lines().count();
+        let mut e = CodeEditor::new(Id::new("ed"), script);
+        let fields = |_: &str| None;
+        let mut frame = |e: &mut CodeEditor, events: Vec<egui::Event>| {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))), events, ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                ui.memory_mut(|m| m.request_focus(e.id));
+                e.ui(ui, &Vec::new, &fields);
+                std::hint::black_box(e.line_col());
+            });
+            out.textures_delta.clear();
+        };
+        for _ in 0..3 {
+            frame(&mut e, vec![]);
+        }
+        e.set_cursor(&ctx, e.text.chars().count() / 2);
+        frame(&mut e, vec![]);
+        let best = |e: &mut CodeEditor, frame: &mut dyn FnMut(&mut CodeEditor, Vec<egui::Event>), typing: bool| {
+            (0..5)
+                .map(|_| {
+                    let t = Instant::now();
+                    for k in 0..10 {
+                        let events = if typing { vec![egui::Event::Text(if k % 2 == 0 { "x".into() } else { "y".into() })] } else { vec![egui::Event::PointerMoved(egui::pos2(300.0 + k as f32, 300.0))] };
+                        frame(e, events);
+                    }
+                    t.elapsed().as_secs_f64() * 100.0
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        let idle = best(&mut e, &mut frame, false);
+        let typing = best(&mut e, &mut frame, true);
+        eprintln!("editor, {lines} lines: {idle:.2} ms/frame idle, {typing:.2} ms/frame typing");
     }
 }

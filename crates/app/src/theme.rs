@@ -124,33 +124,77 @@ pub fn mono(size: f32) -> FontId {
     FontId::new(size, FontFamily::Monospace)
 }
 
-/// macOS fonts for scripts egui's own fonts lack, tried in this order after
-/// them. Missing files are skipped.
-const FALLBACK_FONTS: &[&str] = &[
-    "/System/Library/Fonts/Supplemental/Thonburi.ttc",
-    "/System/Library/Fonts/Hiragino Sans GB.ttc",
-    "/System/Library/Fonts/AppleSDGothicNeo.ttc",
-    "/System/Library/Fonts/Supplemental/Lao Sangam MN.ttf",
-    "/System/Library/Fonts/Supplemental/Khmer Sangam MN.ttf",
-    "/System/Library/Fonts/Supplemental/Myanmar Sangam MN.ttc",
-    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+/// A system font file: a full path (macOS), or a file in Windows' Fonts
+/// folder (`%WINDIR%\Fonts`; Windows needn't be on C:).
+enum FontFile {
+    Path(&'static str),
+    WindowsFonts(&'static str),
+}
+
+/// Fonts for scripts egui's own fonts lack, tried in this order after them.
+/// One list for both systems; missing files are skipped. The Windows names
+/// are the ones Microsoft's Windows 10 and 11 font lists give; Nirmala UI is
+/// also tried as a .ttc, as some Windows 11 builds ship it.
+const FALLBACK_FONTS: &[FontFile] = &[
+    FontFile::Path("/System/Library/Fonts/Supplemental/Thonburi.ttc"),
+    FontFile::Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
+    FontFile::Path("/System/Library/Fonts/AppleSDGothicNeo.ttc"),
+    FontFile::Path("/System/Library/Fonts/Supplemental/Lao Sangam MN.ttf"),
+    FontFile::Path("/System/Library/Fonts/Supplemental/Khmer Sangam MN.ttf"),
+    FontFile::Path("/System/Library/Fonts/Supplemental/Myanmar Sangam MN.ttc"),
+    FontFile::Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+    // Leelawadee UI: Thai, Lao, Khmer.
+    FontFile::WindowsFonts("LeelawUI.ttf"),
+    // Microsoft YaHei: Chinese (and kana).
+    FontFile::WindowsFonts("msyh.ttc"),
+    // Malgun Gothic: Korean.
+    FontFile::WindowsFonts("malgun.ttf"),
+    // Yu Gothic: Japanese.
+    FontFile::WindowsFonts("YuGothR.ttc"),
+    // Myanmar Text.
+    FontFile::WindowsFonts("mmrtext.ttf"),
+    // Nirmala UI: the Indic scripts.
+    FontFile::WindowsFonts("Nirmala.ttc"),
+    FontFile::WindowsFonts("Nirmala.ttf"),
+    // Segoe UI Symbol: symbols.
+    FontFile::WindowsFonts("seguisym.ttf"),
 ];
+
+/// The fallback font files to try, in order: the Windows ones only when
+/// there is a Windows folder (`windir`, from `%WINDIR%`).
+fn fallback_font_paths(windir: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
+    FALLBACK_FONTS
+        .iter()
+        .filter_map(|f| match f {
+            FontFile::Path(path) => Some(std::path::PathBuf::from(path)),
+            FontFile::WindowsFonts(name) => windir.map(|w| w.join("Fonts").join(name)),
+        })
+        .collect()
+}
+
+/// The Windows folder: `%WINDIR%`, else `%SystemRoot%`; an empty value is
+/// no value.
+fn windows_dir(windir: Option<std::ffi::OsString>, system_root: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    [windir, system_root].into_iter().flatten().find(|v| !v.is_empty()).map(std::path::PathBuf::from)
+}
 
 /// The fallback font files, memory-mapped once. The CJK files are 20-55 MB
 /// each; mapping them means only the glyphs actually drawn are read into
 /// memory, and egui borrows the bytes without copying them.
-fn fallback_fonts() -> &'static [(&'static str, &'static [u8])] {
-    static FONTS: std::sync::OnceLock<Vec<(&'static str, &'static [u8])>> = std::sync::OnceLock::new();
+fn fallback_fonts() -> &'static [(String, &'static [u8])] {
+    static FONTS: std::sync::OnceLock<Vec<(String, &'static [u8])>> = std::sync::OnceLock::new();
     FONTS.get_or_init(|| {
-        FALLBACK_FONTS
-            .iter()
+        let windir = windows_dir(std::env::var_os("WINDIR"), std::env::var_os("SystemRoot"));
+        fallback_font_paths(windir.as_deref())
+            .into_iter()
             .filter_map(|path| {
-                let file = std::fs::File::open(path).ok()?;
-                // SAFETY: system font files are read-only (SIP-protected) and
-                // are not modified while the app runs.
+                let file = std::fs::File::open(&path).ok()?;
+                // SAFETY: system font files are read-only (SIP-protected on
+                // macOS, owned by TrustedInstaller on Windows) and are not
+                // modified while the app runs.
                 let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
                 let bytes: &'static [u8] = Box::leak(Box::new(map));
-                Some((*path, bytes))
+                Some((path.display().to_string(), bytes))
             })
             .collect()
     })
@@ -159,10 +203,10 @@ fn fallback_fonts() -> &'static [(&'static str, &'static [u8])] {
 pub fn install(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-    for (path, bytes) in fallback_fonts() {
-        fonts.font_data.insert(path.to_string(), std::sync::Arc::new(egui::FontData::from_static(bytes)));
+    for (name, bytes) in fallback_fonts() {
+        fonts.font_data.insert(name.clone(), std::sync::Arc::new(egui::FontData::from_static(bytes)));
         for family in [FontFamily::Proportional, FontFamily::Monospace] {
-            fonts.families.entry(family).or_default().push(path.to_string());
+            fonts.families.entry(family).or_default().push(name.clone());
         }
     }
     ctx.set_fonts(fonts);
@@ -237,11 +281,100 @@ pub fn discard_button(ui: &mut egui::Ui) -> bool {
         .clicked()
 }
 
+/// A dialog's row of buttons, laid out from the right: the main action
+/// first, then Cancel or Close, then the rest.
+pub fn dialog_buttons<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.horizontal(|ui| ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add).inner).inner
+}
+
+/// In `dialog_buttons`, after the buttons: a line in the room they leave on
+/// the left, cut short with "…" rather than widening the dialog.
+pub fn footer_note(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
+    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.add(egui::Label::new(text).truncate());
+    });
+}
+
 /// The button for a dialog's main action: filled with the accent colour,
 /// or red when it destroys something, so the eye finds it first.
 pub fn primary_button(text: impl Into<String>, danger: bool) -> egui::Button<'static> {
     let fill = if danger { Color32::from_rgb(0xc4, 0x3c, 0x3c) } else { Color32::from_rgb(0x2f, 0x6f, 0xd6) };
     egui::Button::new(egui::RichText::new(text).strong().color(Color32::WHITE)).fill(fill)
+}
+
+/// A message wrapped at `width` and cut to `rows` lines ending in "…",
+/// with all of it on hover. A driver error can be a paragraph (one entry
+/// per replica-set member); unwrapped in a row it ran off the window.
+pub fn clipped_text(ui: &mut egui::Ui, text: &str, color: Color32, rows: usize, width: f32) -> egui::Response {
+    let font = TextStyle::Body.resolve(ui.style());
+    let mut job = egui::text::LayoutJob::simple(text.to_owned(), font, color, width.max(40.0));
+    job.wrap.max_rows = rows;
+    job.wrap.overflow_character = Some('…');
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let cut = galley.elided;
+    let r = ui.add(egui::Label::new(galley));
+    if cut { r.on_hover_text(text) } else { r }
+}
+
+/// Text past this size is shown without colours: tokenizing it (a query
+/// listing 50,000 ids, a document of megabytes) costs more than the
+/// colours are worth.
+pub const MAX_HIGHLIGHT: usize = 100_000;
+
+/// A code field's laid-out text, kept so that a repaint with the same text
+/// and width (a caret blink, a spinner, the pointer moving) reuses it
+/// instead of tokenizing and laying out all of it again.
+#[derive(Clone, Default)]
+pub struct CodeLayout {
+    last: Option<((u64, u32, u32), std::sync::Arc<egui::Galley>)>,
+}
+
+impl CodeLayout {
+    /// `text` laid out in `font` and wrapped at `wrap`: coloured up to
+    /// `MAX_HIGHLIGHT` bytes, plain beyond. For a `TextEdit` layouter.
+    pub fn galley(&mut self, ui: &egui::Ui, text: &str, font: FontId, wrap: f32) -> std::sync::Arc<egui::Galley> {
+        // A hash of the text costs far less than tokenizing it. The scale
+        // counts too: a galley is laid out for one.
+        let key = (egui::Id::new((text, font.size.to_bits())).value(), wrap.to_bits(), ui.ctx().pixels_per_point().to_bits());
+        if let Some((k, g)) = &self.last
+            && *k == key
+        {
+            return g.clone();
+        }
+        let job = if text.len() > MAX_HIGHLIGHT {
+            egui::text::LayoutJob::simple(text.to_string(), font, TEXT, wrap)
+        } else {
+            crate::highlight::layout_job(text, font, wrap)
+        };
+        let galley = ui.fonts_mut(|f| f.layout_job(job));
+        self.last = Some((key, galley.clone()));
+        galley
+    }
+}
+
+/// A dialog's error: a few lines across the dialog, cut with "…" and whole
+/// on hover, so a paragraph (a validator listing every rule a document
+/// broke) can't push the buttons off a short window.
+pub fn error_note(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let width = ui.available_width();
+    clipped_text(ui, text, ERROR, 4, width)
+}
+
+/// Whether a dialog closes on a click outside it or Esc: only while it
+/// holds nothing typed or changed (`dirty`) that closing would throw away.
+/// Otherwise only its Cancel / Close buttons close it. Esc is taken either
+/// way, so nothing under the dialog acts on it.
+pub fn may_close<T>(modal: &egui::ModalResponse<T>, dirty: bool) -> bool {
+    modal.should_close() && !dirty
+}
+
+/// How many edits text fields have reported so far this frame. Compared
+/// before and after a dialog's contents, it tells whether something was
+/// typed into the dialog: every text field reports each edit as a
+/// `ValueChanged` output event (made for screen readers).
+pub fn text_edits(ctx: &egui::Context) -> usize {
+    use egui::output::OutputEvent;
+    ctx.output(|o| o.events.iter().filter(|e| matches!(e, OutputEvent::ValueChanged(i) if i.typ == egui::WidgetType::TextEdit)).count())
 }
 
 #[cfg(test)]
@@ -263,5 +396,64 @@ mod tests {
                 assert!(missing.is_empty(), "{family:?} has no glyphs for {missing:?} in {text}");
             }
         }
+    }
+
+    /// Where `%WINDIR%` isn't set (macOS) the list is the macOS files, as
+    /// before; on Windows the Windows files follow, from its Fonts folder.
+    #[test]
+    fn the_fallback_fonts_resolve_per_os() {
+        let mac = [
+            "/System/Library/Fonts/Supplemental/Thonburi.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+            "/System/Library/Fonts/Supplemental/Lao Sangam MN.ttf",
+            "/System/Library/Fonts/Supplemental/Khmer Sangam MN.ttf",
+            "/System/Library/Fonts/Supplemental/Myanmar Sangam MN.ttc",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        ]
+        .map(std::path::PathBuf::from);
+        assert_eq!(fallback_font_paths(None), mac);
+        let windir = std::path::Path::new(r"D:\Win 11");
+        let windows = ["LeelawUI.ttf", "msyh.ttc", "malgun.ttf", "YuGothR.ttc", "mmrtext.ttf", "Nirmala.ttc", "Nirmala.ttf", "seguisym.ttf"].map(|f| windir.join("Fonts").join(f));
+        assert_eq!(fallback_font_paths(Some(windir)), [&mac[..], &windows[..]].concat());
+    }
+
+    /// The Windows folder is `%WINDIR%`, or `%SystemRoot%` where that is
+    /// unset; empty values count as unset.
+    #[test]
+    fn the_windows_folder_falls_back_to_systemroot() {
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        assert_eq!(windows_dir(os(r"C:\Windows"), os(r"D:\Other")), Some(std::path::PathBuf::from(r"C:\Windows")));
+        assert_eq!(windows_dir(None, os(r"D:\Other")), Some(std::path::PathBuf::from(r"D:\Other")));
+        assert_eq!(windows_dir(os(""), os(r"D:\Other")), Some(std::path::PathBuf::from(r"D:\Other")));
+        assert_eq!(windows_dir(None, None), None);
+        assert_eq!(windows_dir(os(""), os("")), None);
+    }
+
+    /// A long message stops at its row limit with "…" and stays inside its
+    /// width; a short one is left whole.
+    #[test]
+    fn clipped_text_keeps_to_its_rows() {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let long = "timed out: Server selection timeout: No available servers. ".repeat(20);
+        let mut shapes = Vec::new();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            clipped_text(ui, &long, ERROR, 3, 300.0);
+            clipped_text(ui, "Connection saved", TEXT, 3, 300.0);
+        });
+        out.textures_delta.clear();
+        for s in out.shapes {
+            if let egui::epaint::Shape::Text(t) = s.shape {
+                shapes.push(t.galley);
+            }
+        }
+        let [long_g, short_g] = &shapes[..] else { panic!("two texts, got {}", shapes.len()) };
+        assert_eq!(long_g.rows.len(), 3);
+        let last = long_g.rows.last().and_then(|r| r.glyphs.last()).map(|g| g.chr);
+        assert!(long_g.elided && last == Some('…'), "ends with {last:?}");
+        assert!(long_g.rect.width() <= 300.0, "{}", long_g.rect.width());
+        assert!(!short_g.elided);
+        assert_eq!(short_g.text(), "Connection saved");
     }
 }

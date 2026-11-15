@@ -8,9 +8,9 @@ use rongo_core::bson::{Bson, Document, doc};
 use rongo_core::format::{self, Style};
 use rongo_core::{Command, Namespace};
 
-use crate::{highlight, theme};
+use crate::theme;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum KeyType {
     Asc,
     Desc,
@@ -84,6 +84,13 @@ pub struct IndexForm {
     pub numeric_ordering: bool,
     pub background: bool,
     show_json: bool,
+    /// The JSON preview's text, for the form as it was (`inputs`): made
+    /// again only when something changes, as it runs the shell's parser.
+    json: Option<(u64, String)>,
+    json_layout: theme::CodeLayout,
+    /// The partial filter's or the weights' editor, laid out (one shows at
+    /// a time, on its own tab).
+    code_layout: theme::CodeLayout,
 }
 
 impl IndexForm {
@@ -116,7 +123,20 @@ impl IndexForm {
             numeric_ordering: false,
             background: false,
             show_json: false,
+            json: None,
+            json_layout: theme::CodeLayout::default(),
+            code_layout: theme::CodeLayout::default(),
         }
+    }
+
+    /// A hash of everything typed or picked in the form.
+    fn inputs(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        (&self.name, &self.fields, self.unique, self.sparse, self.hidden, self.ttl_on, &self.ttl, self.partial_on, &self.partial).hash(&mut h);
+        (&self.default_language, &self.language_override, &self.weights, self.sphere_version, &self.bits, &self.min, &self.max).hash(&mut h);
+        (self.collation_on, &self.locale, self.strength, self.case_level, &self.case_first, self.numeric_ordering, self.background).hash(&mut h);
+        h.finish()
     }
 
     pub fn set_known_fields(&mut self, fields: Vec<String>) {
@@ -264,20 +284,23 @@ impl IndexForm {
             ui.toggle_value(&mut self.show_json, format!("{}  JSON", icon::BRACKETS_CURLY)).on_hover_text("Show the index definition that will be sent");
         });
         if self.show_json {
-            let text = match self.definition() {
-                Ok((keys, options)) => {
-                    let mut d = doc! { "key": keys };
-                    d.extend(options);
-                    format::doc_to_shell(&d, Style::Display)
-                }
-                Err(e) => format!("// {e}"),
-            };
-            let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
-                let job = highlight::layout_job(buf.as_str(), theme::mono(12.5), wrap);
-                ui.fonts_mut(|f| f.layout_job(job))
-            };
+            let inputs = self.inputs();
+            if self.json.as_ref().is_none_or(|(k, _)| *k != inputs) {
+                let text = match self.definition() {
+                    Ok((keys, options)) => {
+                        let mut d = doc! { "key": keys };
+                        d.extend(options);
+                        format::doc_to_shell(&d, Style::Display)
+                    }
+                    Err(e) => format!("// {e}"),
+                };
+                self.json = Some((inputs, text));
+            }
+            let text = self.json.as_ref().map_or("", |(_, t)| t.as_str());
+            let layout = &mut self.json_layout;
+            let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| layout.galley(ui, buf.as_str(), theme::mono(12.5), wrap);
             egui::Frame::new().fill(theme::BG).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
-                let mut view = text.as_str();
+                let mut view = text;
                 ui.add(egui::TextEdit::multiline(&mut view).code_editor().frame(egui::Frame::NONE).desired_width(f32::INFINITY).layouter(&mut layouter));
             });
         }
@@ -362,7 +385,7 @@ impl IndexForm {
         ui.add_space(8.0);
         ui.checkbox(&mut self.partial_on, RichText::new("Partial").size(14.0));
         ui.label(RichText::new("Only index the documents in a collection that meet the filter expression entered below:").color(theme::MUTED));
-        ui.add_enabled_ui(self.partial_on, |ui| code(ui, &mut self.partial, 5));
+        ui.add_enabled_ui(self.partial_on, |ui| code(ui, &mut self.partial, 5, &mut self.code_layout));
     }
 
     fn text_tab(&mut self, ui: &mut Ui) {
@@ -380,7 +403,7 @@ impl IndexForm {
                 ui.end_row();
             });
             ui.label("Weights (how much each field counts in the text score)");
-            code(ui, &mut self.weights, 4);
+            code(ui, &mut self.weights, 4, &mut self.code_layout);
             ui.weak("e.g. { title: 10, body: 1 }. Fields not listed weigh 1.");
         });
     }
@@ -462,11 +485,9 @@ fn strength_label(s: i32) -> String {
     }
 }
 
-fn code(ui: &mut Ui, text: &mut String, rows: usize) {
-    let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
-        let job = highlight::layout_job(buf.as_str(), theme::mono(13.0), wrap);
-        ui.fonts_mut(|f| f.layout_job(job))
-    };
+/// A code editor, laid out again only when its text changes (`layout`).
+fn code(ui: &mut Ui, text: &mut String, rows: usize, layout: &mut theme::CodeLayout) {
+    let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| layout.galley(ui, buf.as_str(), theme::mono(13.0), wrap);
     egui::Frame::new().fill(theme::BG).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
         ui.add(egui::TextEdit::multiline(text).code_editor().frame(egui::Frame::NONE).desired_width(f32::INFINITY).desired_rows(rows).layouter(&mut layouter));
     });
@@ -478,6 +499,66 @@ mod tests {
 
     fn form() -> IndexForm {
         IndexForm::new(Namespace::new("db", "c"), vec![])
+    }
+
+    /// Milliseconds per frame of the form with a partial filter and text
+    /// weights (each read by the shell's parser), its JSON preview on or off.
+    fn form_frame_ms(json: bool) -> f64 {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut f = form();
+        f.fields = vec![("title".into(), KeyType::Text)];
+        (f.partial_on, f.partial) = (true, "{ kind: \"temp\", n: { $gt: 5 } }".into());
+        f.weights = "{ title: 10 }".into();
+        f.show_json = json;
+        let mut frame = || {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| f.ui(ui));
+            out.textures_delta.clear();
+        };
+        frame();
+        frame();
+        (0..5)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                for _ in 0..5 {
+                    frame();
+                }
+                t.elapsed().as_secs_f64() * 1000.0 / 5.0
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// The JSON preview is made again only when the form changes: with it
+    /// on, a frame costs about what it does with it off (it used to run the
+    /// shell's parser on the partial filter and the weights every frame).
+    #[test]
+    fn json_preview_is_made_only_when_the_form_changes() {
+        let off = form_frame_ms(false);
+        let on = form_frame_ms(true);
+        assert!(on < off * 1.5 + 0.5, "{on:.2} ms per frame with the preview vs {off:.2} ms without");
+    }
+
+    /// The preview follows what is typed.
+    #[test]
+    fn json_preview_follows_the_form() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut f = form();
+        f.show_json = true;
+        let preview = |f: &mut IndexForm| {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| f.ui(ui));
+            out.textures_delta.clear();
+            out.shapes.iter().filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text().contains("key") || t.galley.text().starts_with("//") => Some(t.galley.text().to_string()),
+                _ => None,
+            }).collect::<Vec<_>>().join("\n")
+        };
+        assert!(preview(&mut f).contains("add at least one field"));
+        f.fields[0].0 = "chatID".into();
+        let text = preview(&mut f);
+        assert!(text.contains("chatID") && !text.contains("unique"), "{text}");
+        f.unique = true;
+        assert!(preview(&mut f).contains("unique"));
     }
 
     /// Every tab draws (headless) with fields of each kind present.

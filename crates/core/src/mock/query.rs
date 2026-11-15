@@ -7,6 +7,7 @@ use std::cmp::Ordering;
 use bson::{Bson, Document};
 
 use crate::error::{CoreError, CoreResult};
+use crate::paths::{get_path, lookup, set_path, unset_path};
 
 fn unsupported(what: &str) -> CoreError {
     CoreError::InvalidInput(format!("the demo server does not support {what}"))
@@ -14,7 +15,7 @@ fn unsupported(what: &str) -> CoreError {
 
 // ---------------------------------------------------------------- values
 
-fn as_f64(v: &Bson) -> Option<f64> {
+pub(crate) fn as_f64(v: &Bson) -> Option<f64> {
     match v {
         Bson::Int32(i) => Some(f64::from(*i)),
         Bson::Int64(i) => Some(*i as f64),
@@ -95,51 +96,40 @@ pub fn bson_eq(a: &Bson, b: &Bson) -> bool {
     }
 }
 
-/// Values at a dotted path. Arrays along the way fan out, as in MongoDB.
-pub fn lookup<'a>(doc: &'a Document, path: &str) -> Vec<&'a Bson> {
-    let mut out = Vec::new();
-    let mut parts = path.split('.');
-    let Some(first) = parts.next() else { return out };
-    let rest: Vec<&str> = parts.collect();
-    if let Some(v) = doc.get(first) {
-        descend(v, &rest, &mut out);
-    }
-    out
-}
-
-fn descend<'a>(v: &'a Bson, rest: &[&str], out: &mut Vec<&'a Bson>) {
-    let Some((head, tail)) = rest.split_first() else {
-        out.push(v);
-        return;
-    };
-    match v {
-        Bson::Document(d) => {
-            if let Some(next) = d.get(*head) {
-                descend(next, tail, out);
+/// A hash for looking values up by `bson_eq`: values it calls equal hash
+/// alike (numbers by their f64 value; inside documents and arrays, where it
+/// compares more loosely, by type only), so equal candidates are found by
+/// hash and then confirmed with `bson_eq`.
+pub(crate) fn eq_hash(v: &Bson) -> u64 {
+    use std::hash::{Hash, Hasher};
+    fn feed(v: &Bson, nested: bool, h: &mut std::collections::hash_map::DefaultHasher) {
+        type_rank(v).hash(h);
+        match v {
+            _ if !nested && as_f64(v).is_some() => {
+                let f = as_f64(v).unwrap_or_default();
+                (if f == 0.0 { 0 } else { f.to_bits() }).hash(h);
             }
-        }
-        Bson::Array(items) => {
-            if let Ok(i) = head.parse::<usize>() {
-                if let Some(next) = items.get(i) {
-                    descend(next, tail, out);
-                }
-            } else {
-                for item in items {
-                    if let Bson::Document(d) = item
-                        && let Some(next) = d.get(*head)
-                    {
-                        descend(next, tail, out);
-                    }
+            Bson::String(s) | Bson::Symbol(s) => s.hash(h),
+            Bson::ObjectId(o) => o.bytes().hash(h),
+            Bson::Boolean(b) => b.hash(h),
+            Bson::Document(d) => {
+                for (k, x) in d {
+                    k.hash(h);
+                    feed(x, true, h);
                 }
             }
+            Bson::Array(a) => {
+                a.len().hash(h);
+                for x in a {
+                    feed(x, true, h);
+                }
+            }
+            _ => {}
         }
-        _ => {}
     }
-}
-
-/// First value at a dotted path, without array fan-out beyond indices.
-pub fn get_path<'a>(doc: &'a Document, path: &str) -> Option<&'a Bson> {
-    lookup(doc, path).into_iter().next()
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    feed(v, false, &mut h);
+    h.finish()
 }
 
 // ---------------------------------------------------------------- filters
@@ -151,6 +141,7 @@ pub fn matches(doc: &Document, filter: &Document) -> CoreResult<bool> {
             "$or" => logical(doc, cond)?.iter().any(|b| *b),
             "$nor" => !logical(doc, cond)?.iter().any(|b| *b),
             "$comment" => true,
+            "$expr" => truthy(&eval_expr(doc, cond)?),
             k if k.starts_with('$') => return Err(unsupported(k)),
             path => field_matches(&lookup(doc, path), cond)?,
         };
@@ -198,7 +189,7 @@ fn field_matches(values: &[&Bson], cond: &Bson) -> CoreResult<bool> {
     if values.is_empty() {
         return Ok(matches!(cond, Bson::Null));
     }
-    Ok(any_scalar(values, |v| bson_eq(v, cond)) || values.iter().any(|v| bson_eq(v, cond)))
+    Ok(any_scalar(values, |v| bson_eq(v, cond)))
 }
 
 /// Apply `pred` to each value, and to each element of array values.
@@ -329,22 +320,25 @@ fn type_alias(v: &Bson) -> &'static [&'static str] {
 
 // ---------------------------------------------------------------- sort & projection
 
-pub fn sort_docs(docs: &mut [Document], sort: &Document) {
-    let keys: Vec<(String, bool)> = sort
-        .iter()
-        .map(|(k, v)| (k.clone(), as_f64(v).is_none_or(|n| n >= 0.0)))
+/// `docs` in `sort` order (stable). Each document's sort values are looked
+/// up once, not on every comparison.
+pub fn sort_docs<D: std::borrow::Borrow<Document>>(docs: Vec<D>, sort: &Document) -> Vec<D> {
+    static NULL: Bson = Bson::Null;
+    let fields: Vec<(&str, bool)> = sort.iter().map(|(k, v)| (k.as_str(), as_f64(v).is_none_or(|n| n >= 0.0))).collect();
+    let mut keyed: Vec<(Vec<Bson>, D)> = docs
+        .into_iter()
+        .map(|d| (fields.iter().map(|(k, _)| get_path(d.borrow(), k).unwrap_or(&NULL).clone()).collect(), d))
         .collect();
-    docs.sort_by(|a, b| {
-        for (k, asc) in &keys {
-            let va = get_path(a, k).cloned().unwrap_or(Bson::Null);
-            let vb = get_path(b, k).cloned().unwrap_or(Bson::Null);
-            let o = total_cmp(&va, &vb);
+    keyed.sort_by(|(a, _), (b, _)| {
+        for ((va, vb), (_, asc)) in a.iter().zip(b).zip(&fields) {
+            let o = total_cmp(va, vb);
             if o != Ordering::Equal {
                 return if *asc { o } else { o.reverse() };
             }
         }
         Ordering::Equal
     });
+    keyed.into_iter().map(|(_, d)| d).collect()
 }
 
 fn truthy(v: &Bson) -> bool {
@@ -390,65 +384,17 @@ pub fn project(doc: &Document, projection: &Document) -> CoreResult<Document> {
     Ok(out)
 }
 
-// ---------------------------------------------------------------- paths
-
-pub fn set_path(doc: &mut Document, path: &str, value: Bson) -> CoreResult<()> {
-    match path.split_once('.') {
-        None => {
-            doc.insert(path, value);
-            Ok(())
-        }
-        Some((head, tail)) => {
-            let entry = doc.entry(head.to_string()).or_insert_with(|| Bson::Document(Document::new()));
-            match entry {
-                Bson::Document(sub) => set_path(sub, tail, value),
-                Bson::Array(items) => {
-                    let (idx, rest) = tail.split_once('.').map_or((tail, None), |(a, b)| (a, Some(b)));
-                    let i: usize = idx
-                        .parse()
-                        .map_err(|_| CoreError::InvalidInput(format!("cannot create field '{idx}' in an array")))?;
-                    while items.len() <= i {
-                        items.push(Bson::Null);
-                    }
-                    match rest {
-                        None => {
-                            items[i] = value;
-                            Ok(())
-                        }
-                        Some(rest) => {
-                            if !matches!(items[i], Bson::Document(_)) {
-                                items[i] = Bson::Document(Document::new());
-                            }
-                            let Bson::Document(sub) = &mut items[i] else { unreachable!() };
-                            set_path(sub, rest, value)
-                        }
-                    }
-                }
-                _ => Err(CoreError::InvalidInput(format!("cannot create field '{tail}' in a non-object"))),
-            }
-        }
-    }
-}
-
-pub fn unset_path(doc: &mut Document, path: &str) {
-    match path.split_once('.') {
-        None => {
-            doc.remove(path);
-        }
-        Some((head, tail)) => {
-            if let Some(Bson::Document(sub)) = doc.get_mut(head) {
-                unset_path(sub, tail);
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------- updates
 
 /// Apply an update document (`$set`, `$inc`, …) or treat it as a replacement.
 pub fn apply_update(doc: &mut Document, update: &Document) -> CoreResult<()> {
     if !update.keys().all(|k| k.starts_with('$')) {
         return Err(CoreError::InvalidInput("update document must contain only update operators".into()));
+    }
+    // A name MongoDB doesn't know is refused whole before anything changes, as the server does.
+    const OPERATORS: &[&str] = &["$currentDate", "$inc", "$min", "$max", "$mul", "$rename", "$set", "$setOnInsert", "$unset", "$addToSet", "$pop", "$pull", "$push", "$pullAll", "$bit"];
+    if let Some(op) = update.keys().find(|k| !OPERATORS.contains(&k.as_str())) {
+        return Err(CoreError::Server { code: 9, msg: format!("Unknown modifier: {op}. Expected a valid update modifier or pipeline-style update specified as an array") });
     }
     for (op, arg) in update {
         let Bson::Document(fields) = arg else {
@@ -583,6 +529,10 @@ pub fn eval_expr(doc: &Document, e: &Bson) -> CoreResult<Bson> {
         }
         Bson::Document(d) if d.len() == 1 && d.keys().next().is_some_and(|k| k.starts_with('$')) => {
             let (op, arg) = d.iter().next().expect("one key");
+            // Its argument is taken as it is, not evaluated.
+            if op == "$literal" {
+                return Ok(arg.clone());
+            }
             let args: Vec<Bson> = match arg {
                 Bson::Array(a) => a.iter().map(|x| eval_expr(doc, x)).collect::<CoreResult<_>>()?,
                 other => vec![eval_expr(doc, other)?],
@@ -645,6 +595,11 @@ fn eval_operator(op: &str, args: &[Bson]) -> CoreResult<Bson> {
         },
         "$ifNull" => args.iter().find(|a| !matches!(a, Bson::Null)).cloned().unwrap_or(Bson::Null),
         "$eq" => Bson::Boolean(args.len() == 2 && bson_eq(&args[0], &args[1])),
+        "$cmp" if args.len() == 2 => Bson::Int32(match total_cmp(&args[0], &args[1]) {
+            Ordering::Less => -1,
+            Ordering::Equal => 0,
+            Ordering::Greater => 1,
+        }),
         "$ne" => Bson::Boolean(!(args.len() == 2 && bson_eq(&args[0], &args[1]))),
         "$gt" | "$gte" | "$lt" | "$lte" if args.len() == 2 => {
             let o = total_cmp(&args[0], &args[1]);
@@ -677,10 +632,7 @@ pub fn aggregate(mut docs: Vec<Document>, pipeline: &[Document]) -> CoreResult<V
                 }
                 kept
             }
-            ("$sort", Bson::Document(s)) => {
-                sort_docs(&mut docs, s);
-                docs
-            }
+            ("$sort", Bson::Document(s)) => sort_docs(docs, s),
             ("$skip", n) => {
                 let n = as_f64(n).unwrap_or(0.0) as usize;
                 docs.into_iter().skip(n).collect()
@@ -740,12 +692,11 @@ pub fn aggregate(mut docs: Vec<Document>, pipeline: &[Document]) -> CoreResult<V
             }
             ("$group", Bson::Document(spec)) => group(docs, spec)?,
             ("$sortByCount", e) => {
-                let mut grouped = group(
+                let grouped = group(
                     docs,
                     &bson::doc! { "_id": e.clone(), "count": { "$sum": 1 } },
                 )?;
-                sort_docs(&mut grouped, &bson::doc! { "count": -1 });
-                grouped
+                sort_docs(grouped, &bson::doc! { "count": -1 })
             }
             (other, _) => return Err(unsupported(&format!("the {other} stage"))),
         };
@@ -756,11 +707,17 @@ pub fn aggregate(mut docs: Vec<Document>, pipeline: &[Document]) -> CoreResult<V
 fn group(docs: Vec<Document>, spec: &Document) -> CoreResult<Vec<Document>> {
     let id_expr = spec.get("_id").cloned().unwrap_or(Bson::Null);
     let mut groups: Vec<(Bson, Vec<Document>)> = Vec::new();
+    // Groups by key hash, so a document's group is found without a scan.
+    let mut by_hash: std::collections::HashMap<u64, Vec<usize>> = Default::default();
     for d in docs {
         let key = eval_expr(&d, &id_expr)?;
-        match groups.iter_mut().find(|(k, _)| bson_eq(k, &key)) {
-            Some((_, members)) => members.push(d),
-            None => groups.push((key, vec![d])),
+        let bucket = by_hash.entry(eq_hash(&key)).or_default();
+        match bucket.iter().find(|&&g| bson_eq(&groups[g].0, &key)) {
+            Some(&g) => groups[g].1.push(d),
+            None => {
+                bucket.push(groups.len());
+                groups.push((key, vec![d]));
+            }
         }
     }
     let mut out = Vec::with_capacity(groups.len());
@@ -823,6 +780,20 @@ mod tests {
     }
 
     #[test]
+    fn expr_compares_the_whole_document_with_a_literal() {
+        let d = doc! { "_id": 1, "a": "$b", "n": { "x": [1, 2] } };
+        let same = doc! { "_id": 1, "$expr": { "$eq": ["$$ROOT", { "$literal": d.clone() }] } };
+        assert!(m(d.clone(), same.clone()), "a literal is taken as it is, `$b` included");
+        assert!(!m(doc! { "_id": 1, "a": "$b", "n": { "x": [1, 3] } }, same));
+        // The restore guard's form.
+        let guard = doc! { "_id": 1, "$expr": { "$eq": [{ "$cmp": ["$$ROOT", { "$literal": d.clone() }] }, 0] } };
+        assert!(m(d.clone(), guard.clone()));
+        assert!(!m(doc! { "_id": 1, "a": "$b", "n": { "x": [1, 3] } }, guard.clone()));
+        assert!(!m(doc! { "_id": 1, "a": "$b", "n": { "x": [1, 2] }, "more": true }, guard));
+        assert!(m(doc! { "a": 2 }, doc! { "$expr": { "$gt": ["$a", 1] } }));
+    }
+
+    #[test]
     fn equality_and_comparison() {
         let d = doc! { "a": 5, "s": "Hello", "tags": ["x", "y"], "sub": { "n": 2.5 } };
         assert!(m(d.clone(), doc! { "a": 5.0 }));
@@ -840,8 +811,8 @@ mod tests {
 
     #[test]
     fn sort_mixes_types_in_bson_order() {
-        let mut docs = vec![doc! { "v": "b" }, doc! { "v": 2 }, doc! {}, doc! { "v": 1.5 }, doc! { "v": "a" }];
-        sort_docs(&mut docs, &doc! { "v": 1 });
+        let docs = vec![doc! { "v": "b" }, doc! { "v": 2 }, doc! {}, doc! { "v": 1.5 }, doc! { "v": "a" }];
+        let docs = sort_docs(docs, &doc! { "v": 1 });
         let vs: Vec<_> = docs.iter().map(|d| d.get("v").cloned()).collect();
         assert_eq!(vs, [None, Some(Bson::Double(1.5)), Some(Bson::Int32(2)), Some("a".into()), Some("b".into())]);
     }

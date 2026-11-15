@@ -7,7 +7,9 @@ pub fn preprocess(code: &str) -> String {
 }
 
 fn rewrite_line(line: &str) -> String {
-    let trimmed = line.trim().trim_end_matches(';').trim();
+    // `use shop // note`: neither a database name nor a show target holds `//`.
+    let code = line.split("//").next().unwrap_or_default();
+    let trimmed = code.trim().trim_end_matches(';').trim();
     let mut words = trimmed.split_whitespace();
     match (words.next(), words.next(), words.next()) {
         (Some("use"), Some(name), None) if is_db_name(name) => {
@@ -31,13 +33,16 @@ mod tests {
 
     #[test]
     fn rewrites_use_and_show_keeping_lines() {
-        let src = "use shop\n  show collections;\nconst use_x = 1\nuse a b";
+        let src = "use shop\n  show collections;\nconst use_x = 1\nuse a b\nuse shop // the shop\nshow dbs; // all\nconst url = 'http://x' // use shop";
         let out = preprocess(src);
         let lines: Vec<_> = out.lines().collect();
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.len(), 7);
         assert!(lines[0].starts_with("db = db.getSiblingDB(\"shop\")"));
         assert_eq!(lines[1], "__show(\"collections\");");
         assert_eq!(lines[2], "const use_x = 1");
         assert_eq!(lines[3], "use a b");
+        assert!(lines[4].starts_with("db = db.getSiblingDB(\"shop\")"));
+        assert_eq!(lines[5], "__show(\"dbs\");");
+        assert_eq!(lines[6], "const url = 'http://x' // use shop");
     }
 }

@@ -2,3 +2,5 @@ target/
 .remember/
 *.json.tmp
 .DS_Store
+.claude/worktrees/
+.superpowers/

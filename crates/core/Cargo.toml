@@ -22,8 +22,24 @@ regex = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 russh = { version = "0.64", default-features = false, features = ["ring", "rsa", "flate2"] }
 directories = "6"
-keyring = { version = "3", features = ["apple-native"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+chacha20poly1305 = "0.10"
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
+ring = "0.17"
+# Free space on a volume, on every OS (`fsx::free_space`).
+fs4 = "1.1"
+
+# Only to move secrets older versions kept in the Keychain into the vault.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+# fsx on Windows: the owner-only DACL of private files and folders.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+
+# Tests that check what the OS reports (statvfs) or make a named pipe.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2.191"

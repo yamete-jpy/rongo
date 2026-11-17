@@ -10,6 +10,7 @@ use rongo_core::vault::Vault;
 use rongo_core::{ConnId, ConnectRequest, Namespace, RequestId};
 use uuid::Uuid;
 
+use crate::doc_find::{self, DocFind};
 use crate::theme;
 use crate::vault_ui::{self, CatchUp};
 
@@ -769,7 +770,11 @@ pub struct DocDialog {
     pub mode: DocMode,
     pub view: Option<u64>,
     text: String,
+    /// Counts the edits of `text`: the find bar searches it again.
+    version: u64,
     layout: theme::CodeLayout,
+    /// The find bar (⌘F), while it is open.
+    find: Option<DocFind>,
     /// Something was typed: a click outside or Esc no longer closes it.
     typed: bool,
     pub error: Option<String>,
@@ -785,7 +790,7 @@ impl DocDialog {
     pub fn edit(conn: ConnId, ns: Namespace, doc: &Document, view: Option<u64>) -> Self {
         let id = doc.get("_id").cloned().unwrap_or(Bson::Null);
         let text = format::doc_to_shell(doc, Style::Editable);
-        Self { conn, ns, mode: DocMode::Edit { id }, view, text, layout: Default::default(), typed: false, error: None, saving: None }
+        Self { conn, ns, mode: DocMode::Edit { id }, view, text, version: 0, layout: Default::default(), find: None, typed: false, error: None, saving: None }
     }
 
     #[cfg(test)]
@@ -798,7 +803,7 @@ impl DocDialog {
             Some(d) => format::doc_to_shell(d, Style::Editable),
             None => "{\n    \n}".to_string(),
         };
-        Self { conn, ns, mode: DocMode::Insert, view, text, layout: Default::default(), typed: false, error: None, saving: None }
+        Self { conn, ns, mode: DocMode::Insert, view, text, version: 0, layout: Default::default(), find: None, typed: false, error: None, saving: None }
     }
 
     pub fn show(&mut self, ctx: &Context) -> Option<DocAction> {
@@ -810,25 +815,42 @@ impl DocDialog {
         // The editor gives up height on a short window so the buttons and a
         // few lines of error still fit. From the window, not the dialog's
         // own last size, which would feed back into itself.
-        let edit_h = (ctx.content_rect().height() - 300.0).clamp(160.0, 440.0);
+        let window_h = (ctx.content_rect().height() - 300.0).clamp(160.0, 440.0);
+        let editor = Id::new("doc-dialog").with("text");
         let modal = Modal::new(Id::new("doc-dialog")).show(ctx, |ui| {
             ui.set_width(720.0);
             ui.heading(title);
             ui.weak("Shell syntax: ObjectId(\"…\"), ISODate(\"…\"), NumberLong(\"…\"), NumberDecimal(\"…\"), Double(5).");
             ui.add_space(4.0);
+            doc_find::bar(&mut self.find, ui, editor, &self.text, self.version);
+            // The find bar's height comes off the editor's: the dialog keeps its size.
+            let edit_h = window_h - if self.find.is_some() { doc_find::BAR_H } else { 0.0 };
             let layout = &mut self.layout;
             let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| layout.galley(ui, buf.as_str(), theme::mono(13.0), wrap);
             egui::Frame::new().fill(theme::BG).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
                 egui::ScrollArea::vertical().max_height(edit_h).min_scrolled_height(edit_h.min(300.0)).show(ui, |ui| {
-                    let edit = ui.add(
-                        egui::TextEdit::multiline(&mut self.text)
-                            .code_editor()
-                            .frame(egui::Frame::NONE)
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(18)
-                            .layouter(&mut layouter),
-                    );
-                    self.typed |= edit.changed();
+                    let marks = ui.painter().add(egui::Shape::Noop);
+                    // Where the selection began before this frame's typing: the text before it stays.
+                    let selected_from = self.find.as_ref().and_then(|_| egui::TextEdit::load_state(ui.ctx(), editor)?.cursor.char_range()).map(|r| r.as_sorted_char_range().start.0);
+                    let edit = egui::TextEdit::multiline(&mut self.text)
+                        .id(editor)
+                        .code_editor()
+                        .frame(egui::Frame::NONE)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(18)
+                        .layouter(&mut layouter)
+                        .show(ui);
+                    if edit.response.changed() {
+                        self.typed = true;
+                        self.version += 1;
+                        // Found again at once: the marks below are for this text.
+                        if let Some(f) = &mut self.find {
+                            let caret = edit.cursor_range.map(|r| r.primary.index.0);
+                            let at = selected_from.zip(caret).map(|(from, caret)| doc_find::Edit { start: from.min(caret), caret });
+                            f.update(ui.ctx(), &self.text, self.version, at);
+                        }
+                    }
+                    doc_find::paint(&mut self.find, ui, marks, &edit);
                 });
             });
             if let Some(e) = &self.error {
@@ -874,26 +896,35 @@ impl DocDialog {
 pub struct ViewDocDialog {
     text: String,
     layout: theme::CodeLayout,
+    /// The find bar (⌘F), while it is open.
+    find: Option<DocFind>,
 }
 
 impl ViewDocDialog {
     pub fn new(doc: &Document) -> Self {
-        Self { text: format::doc_to_shell(doc, Style::Display), layout: Default::default() }
+        Self { text: format::doc_to_shell(doc, Style::Display), layout: Default::default(), find: None }
     }
 
     /// Returns true when the dialog should close.
     pub fn show(&mut self, ctx: &Context) -> bool {
         let mut close = false;
+        let viewer = Id::new("view-doc").with("text");
         let modal = Modal::new(Id::new("view-doc")).show(ctx, |ui| {
             ui.set_width(720.0);
             ui.heading(format!("{}  View Document", icon::FILE_TEXT));
             ui.add_space(4.0);
+            // The text never changes: one version.
+            doc_find::bar(&mut self.find, ui, viewer, &self.text, 0);
+            // The find bar's height comes off the text's: the dialog keeps its size.
+            let view_h = 480.0 - if self.find.is_some() { doc_find::BAR_H } else { 0.0 };
             let layout = &mut self.layout;
             let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| layout.galley(ui, buf.as_str(), theme::mono(13.0), wrap);
             egui::Frame::new().fill(theme::BG).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
-                egui::ScrollArea::vertical().max_height(480.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(view_h).show(ui, |ui| {
+                    let marks = ui.painter().add(egui::Shape::Noop);
                     let mut view = self.text.as_str();
-                    ui.add(egui::TextEdit::multiline(&mut view).code_editor().frame(egui::Frame::NONE).desired_width(f32::INFINITY).layouter(&mut layouter));
+                    let out = egui::TextEdit::multiline(&mut view).id(viewer).code_editor().frame(egui::Frame::NONE).desired_width(f32::INFINITY).layouter(&mut layouter).show(ui);
+                    doc_find::paint(&mut self.find, ui, marks, &out);
                 });
             });
             theme::dialog_buttons(ui, |ui| {
@@ -1750,38 +1781,59 @@ mod tests {
     }
 
     /// On the smallest window the app allows, a big document with a long
-    /// validation error still leaves Save and Cancel on screen.
+    /// validation error still leaves Save and Cancel on screen, with the
+    /// find bar open too; and View Document's Close stays on screen.
     #[test]
     fn doc_dialog_fits_a_short_window() {
-        let ctx = Context::default();
-        theme::install(&ctx);
         let mut big = Document::new();
         for i in 0..80 {
             big.insert(format!("field_{i}"), format!("value {i}"));
         }
-        let conn = ConnectionProfile::mock().conn_id();
-        let mut dialog = DocDialog::insert(conn, Namespace::new("db", "c"), Some(&big), None);
-        dialog.error = Some(format!("Saving the document failed: server error 121: Document failed validation {}", crate::test_support::long_driver_error().repeat(3)));
         let screen = vec2(960.0, 600.0);
-        let mut buttons = || {
+        let drawn = |ctx: &Context, draw: &mut dyn FnMut(&Context), labels: &[&str]| {
             let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)), ..Default::default() };
-            let mut out = ctx.run_ui(input, |ui| _ = dialog.show(ui.ctx()));
+            let mut out = ctx.run_ui(input, |ui| draw(ui.ctx()));
             out.textures_delta.clear();
             let find = |label: &str| out.shapes.iter().find_map(|s| match &s.shape {
                 egui::Shape::Text(t) if t.galley.text() == label => Some(t.galley.rect.translate(t.pos.to_vec2())),
                 _ => None,
             });
-            find("Save").zip(find("Cancel"))
+            labels.iter().map(|l| find(l)).collect::<Option<Vec<_>>>()
         };
-        let (save, cancel) = (0..30).filter_map(|_| buttons()).last().expect("Save and Cancel drawn");
-        for (name, r) in [("Save", save), ("Cancel", cancel)] {
-            assert!(r.bottom() <= screen.y - 4.0 && r.top() >= 0.0, "{name} off screen: {r:?}");
+        for find_open in [false, true] {
+            let ctx = Context::default();
+            theme::install(&ctx);
+            let conn = ConnectionProfile::mock().conn_id();
+            let mut dialog = DocDialog::insert(conn, Namespace::new("db", "c"), Some(&big), None);
+            dialog.error = Some(format!("Saving the document failed: server error 121: Document failed validation {}", crate::test_support::long_driver_error().repeat(3)));
+            dialog.find = find_open.then(DocFind::default);
+            let rects = (0..30).filter_map(|_| drawn(&ctx, &mut |ctx| _ = dialog.show(ctx), &["Save", "Cancel"])).last().expect("Save and Cancel drawn");
+            for (name, r) in ["Save", "Cancel"].iter().zip(rects) {
+                assert!(r.bottom() <= screen.y - 4.0 && r.top() >= 0.0, "find bar open: {find_open}: {name} off screen: {r:?}");
+            }
+
+            let ctx = Context::default();
+            theme::install(&ctx);
+            let mut view = ViewDocDialog::new(&big);
+            view.find = find_open.then(DocFind::default);
+            let rects = (0..30).filter_map(|_| drawn(&ctx, &mut |ctx| _ = view.show(ctx), &["Close"])).last().expect("Close drawn");
+            assert!(rects[0].bottom() <= screen.y - 4.0 && rects[0].top() >= 0.0, "View Document, find bar open: {find_open}: Close off screen: {:?}", rects[0]);
         }
     }
 
+    /// The find bar while `doc_frame_ms` times the dialogs: closed, open on
+    /// a needle, or typed into every frame (each frame another needle, so a
+    /// search of the whole text, as a keystroke in the field costs).
+    #[derive(Clone, Copy)]
+    enum BarIs {
+        Closed,
+        Open(&'static str),
+        Typing(&'static str),
+    }
+
     /// Milliseconds per frame of the document editor and of View Document
-    /// showing a document of `fields` fields, with no input.
-    fn doc_frame_ms(fields: usize) -> (f64, f64) {
+    /// showing a document of `fields` fields, with no input but `bar`'s.
+    fn doc_frame_ms(fields: usize, bar: BarIs) -> (f64, f64) {
         let ctx = Context::default();
         theme::install(&ctx);
         let mut doc = Document::new();
@@ -1791,10 +1843,24 @@ mod tests {
         let conn = ConnectionProfile::mock().conn_id();
         let mut edit = DocDialog::edit(conn, Namespace::new("db", "c"), &doc, None);
         let mut view = ViewDocDialog::new(&doc);
+        if let BarIs::Open(needle) | BarIs::Typing(needle) = bar {
+            edit.find = Some(DocFind::typed(needle));
+            view.find = Some(DocFind::typed(needle));
+        }
+        // Typing: the needle, then it without its last letter, by turns.
+        let typing = |find: &mut Option<DocFind>, frame: usize| {
+            if let (BarIs::Typing(needle), Some(f)) = (bar, find) {
+                let typed = f.needle_mut();
+                typed.clear();
+                typed.push_str(if frame.is_multiple_of(2) { needle } else { &needle[..needle.len() - 1] });
+            }
+        };
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1200.0, 900.0));
-        let time = |draw: &mut dyn FnMut(&Context)| {
+        let time = |draw: &mut dyn FnMut(&Context, usize)| {
+            let mut n = 0;
             let mut frame = || {
-                let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| draw(ui.ctx()));
+                n += 1;
+                let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| draw(ui.ctx(), n));
                 out.textures_delta.clear();
             };
             frame();
@@ -1811,27 +1877,61 @@ mod tests {
                 })
                 .fold(f64::INFINITY, f64::min)
         };
-        (time(&mut |ctx| _ = edit.show(ctx)), time(&mut |ctx| _ = view.show(ctx)))
+        let edit_ms = time(&mut |ctx, n| {
+            typing(&mut edit.find, n);
+            _ = edit.show(ctx);
+        });
+        let view_ms = time(&mut |ctx, n| {
+            typing(&mut view.find, n);
+            _ = view.show(ctx);
+        });
+        (edit_ms, view_ms)
     }
 
     /// Edit Document and View Document with a 90 KB document cost about
-    /// what they do with a small one per frame: the text isn't tokenized
-    /// and laid out again while it is unchanged.
+    /// what they do with a small one per frame, the find bar closed or
+    /// open: the text isn't tokenized and laid out again while it is
+    /// unchanged. (Too coarse to see a search of 90 KB a frame:
+    /// `find_follows_the_text_and_runs_only_on_a_change` counts searches,
+    /// and `find_marks_only_the_rows_in_view` counts the rows looked at.)
     #[test]
     fn doc_dialogs_frame_cost_does_not_grow_with_the_document() {
-        let (small_edit, small_view) = doc_frame_ms(20);
-        let (big_edit, big_view) = doc_frame_ms(2_000);
-        assert!(big_edit < small_edit * 3.0 + 5.0, "Edit Document: {big_edit:.1} ms per frame for 2,000 fields vs {small_edit:.1} ms for 20");
-        assert!(big_view < small_view * 3.0 + 5.0, "View Document: {big_view:.1} ms per frame for 2,000 fields vs {small_view:.1} ms for 20");
+        for bar in [BarIs::Closed, BarIs::Open("number 1")] {
+            let (small_edit, small_view) = doc_frame_ms(20, bar);
+            let (big_edit, big_view) = doc_frame_ms(2_000, bar);
+            let open = matches!(bar, BarIs::Open(_));
+            assert!(big_edit < small_edit * 3.0 + 5.0, "Edit Document, find bar open: {open}: {big_edit:.1} ms per frame for 2,000 fields vs {small_edit:.1} ms for 20");
+            assert!(big_view < small_view * 3.0 + 5.0, "View Document, find bar open: {open}: {big_view:.1} ms per frame for 2,000 fields vs {small_view:.1} ms for 20");
+        }
     }
 
-    /// Prints the document dialogs' frame times (run with --release --ignored --nocapture).
+    /// Prints the document dialogs' frame times, with the find bar closed,
+    /// open, and typed into each frame (each frame a search of the whole
+    /// text). Run with `cargo test -p rongo --release -- --ignored
+    /// --nocapture report_doc_dialog_frame_times`.
     #[test]
     #[ignore = "prints timings"]
     fn report_doc_dialog_frame_times() {
-        for fields in [20, 2_000, 4_000, 40_000] {
-            let (edit, view) = doc_frame_ms(fields);
-            println!("{fields} fields: Edit Document {edit:.2} ms, View Document {view:.2} ms per frame");
+        for fields in [20, 2_000, 4_000, 40_000, 200_000] {
+            let mut doc = Document::new();
+            for i in 0..fields {
+                doc.insert(format!("field_{i}"), format!("value number {i} of the document"));
+            }
+            let kb = format::doc_to_shell(&doc, Style::Editable).len() / 1024;
+            // Only the last field matches: the view scrolls to the end, and
+            // each frame walks every row above it to place the marks.
+            let last: &'static str = Box::leak(format!("number {} of", fields - 1).into_boxed_str());
+            let bars = [
+                (BarIs::Closed, "find bar closed"),
+                (BarIs::Open("number 12"), "find bar open"),
+                (BarIs::Open(last), "find bar open at the end"),
+                (BarIs::Typing("number 12"), "typing a needle"),
+                (BarIs::Typing("ümber 12"), "typing a non-ASCII needle"),
+            ];
+            for (bar, name) in bars {
+                let (edit, view) = doc_frame_ms(fields, bar);
+                println!("{fields} fields ({kb} KB), {name}: Edit Document {edit:.2} ms, View Document {view:.2} ms per frame");
+            }
         }
     }
 
@@ -1936,6 +2036,410 @@ mod tests {
         h.key_press_modifiers(egui::Modifiers::COMMAND, Key::S);
         h.run_steps(2);
         assert_eq!(h.state().saved, [doc]);
+    }
+
+    /// "apple" three times ignoring case, twice matching it.
+    fn apples() -> Document {
+        rongo_core::bson::doc! { "_id": 1, "a": "apple", "b": "Apple pie", "c": "pineapple" }
+    }
+
+    /// View Document in a harness, noting when it asks to close.
+    struct ViewProbe {
+        dialog: ViewDocDialog,
+        closed: bool,
+    }
+
+    fn view_harness(doc: &Document) -> egui_kittest::Harness<'static, ViewProbe> {
+        let probe = ViewProbe { dialog: ViewDocDialog::new(doc), closed: false };
+        crate::test_support::harness(vec2(1000.0, 800.0), 3, probe, |ctx, p: &mut ViewProbe| p.closed |= p.dialog.show(ctx))
+    }
+
+    /// Every shape the last frame drew, `Shape::Vec`s opened, with the
+    /// clip it was drawn in.
+    fn flat_shapes<S>(h: &egui_kittest::Harness<'_, S>) -> Vec<(egui::Rect, egui::Shape)> {
+        fn open(clip: egui::Rect, s: &egui::Shape, out: &mut Vec<(egui::Rect, egui::Shape)>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| open(clip, s, out)),
+                s => out.push((clip, s.clone())),
+            }
+        }
+        let mut out = Vec::new();
+        for c in &h.output().shapes {
+            open(c.clip_rect, &c.shape, &mut out);
+        }
+        out
+    }
+
+    /// What the find bar says: "n of m" or "No matches", if anything.
+    fn find_count<S>(h: &egui_kittest::Harness<'_, S>) -> Option<String> {
+        flat_shapes(h).into_iter().find_map(|(_, s)| match s {
+            egui::Shape::Text(t) if t.galley.text() == "No matches" || (t.galley.text().contains(" of ") && t.galley.text().starts_with(|c: char| c.is_ascii_digit())) => Some(t.galley.text().to_string()),
+            _ => None,
+        })
+    }
+
+    /// The find marks the last frame drew behind the text: the matches,
+    /// then the current one, each as (its rect, the clip it is drawn in).
+    type Marks = Vec<(egui::Rect, egui::Rect)>;
+    fn find_marks<S>(h: &egui_kittest::Harness<'_, S>) -> (Marks, Marks) {
+        let (mut others, mut current) = (Vec::new(), Vec::new());
+        for (clip, s) in flat_shapes(h) {
+            if let egui::Shape::Rect(r) = s {
+                if r.fill == theme::FIND_MATCH {
+                    others.push((r.rect, clip));
+                } else if r.fill == theme::FIND_CURRENT {
+                    current.push((r.rect, clip));
+                }
+            }
+        }
+        (others, current)
+    }
+
+    fn press<S>(h: &mut egui_kittest::Harness<'_, S>, modifiers: egui::Modifiers, key: Key) {
+        h.key_press_modifiers(modifiers, key);
+        h.run_steps(2);
+    }
+
+    /// Types `text` into the focused field.
+    fn type_in<S>(h: &mut egui_kittest::Harness<'_, S>, text: &str) {
+        h.event(egui::Event::Text(text.into()));
+        h.run_steps(2);
+    }
+
+    /// ⌘F in the document editor opens a find bar above the text with its
+    /// field focused. Typing finds: "1 of 3", every match marked behind
+    /// the text and the current one apart; ↩ and ⇧↩ step round while the
+    /// field keeps its focus, Aa matches case, and ⌘F again selects what
+    /// was typed, so typing replaces it.
+    #[test]
+    fn cmd_f_finds_in_the_document_editor() {
+        use egui::Modifiers as M;
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut h = doc_harness(&apples());
+        assert!(h.query_by_role(Role::TextInput).is_none(), "no find bar before ⌘F");
+        press(&mut h, M::COMMAND, Key::F);
+        assert!(h.get_by_role(Role::TextInput).is_focused(), "⌘F focused the find field");
+        assert_eq!(find_count(&h), None, "nothing typed, nothing said");
+        type_in(&mut h, "apple");
+        assert_eq!(find_count(&h).as_deref(), Some("1 of 3"));
+        let (others, current) = find_marks(&h);
+        assert_eq!((others.len(), current.len()), (2, 1), "every match marked, the current one apart");
+        assert!(others.iter().all(|(o, _)| o.top() > current[0].0.top()), "the first match is the current one");
+        for (modifiers, want) in [(M::NONE, "2 of 3"), (M::NONE, "3 of 3"), (M::NONE, "1 of 3"), (M::SHIFT, "3 of 3")] {
+            press(&mut h, modifiers, Key::Enter);
+            assert_eq!(find_count(&h).as_deref(), Some(want), "after {modifiers:?} ↩");
+            assert!(h.get_by_role(Role::TextInput).is_focused(), "the field kept its focus");
+        }
+        h.get_by_label("Aa").click();
+        h.run_steps(2);
+        assert_eq!(find_count(&h).as_deref(), Some("1 of 2"), "matching case leaves \"Apple\" out");
+        press(&mut h, M::COMMAND, Key::F);
+        assert!(h.get_by_role(Role::TextInput).is_focused());
+        type_in(&mut h, "pear");
+        assert_eq!(h.get_by_role(Role::TextInput).value().as_deref(), Some("pear"), "⌘F selected what was typed");
+        assert_eq!(find_count(&h).as_deref(), Some("No matches"));
+        assert_eq!(find_marks(&h), (vec![], vec![]));
+        press(&mut h, M::COMMAND, Key::A);
+        press(&mut h, M::NONE, Key::Backspace);
+        assert_eq!(find_count(&h), None, "an empty field says nothing");
+    }
+
+    /// Esc closes the find bar, never the dialog, also with nothing typed
+    /// into the document; with the bar closed, Esc closes the dialog by
+    /// the usual rule. Closing the bar (Esc or ✕) gives the editor its
+    /// focus with the current match selected, so typing goes on there.
+    #[test]
+    fn esc_closes_the_find_bar_not_the_dialog() {
+        use egui::Modifiers as M;
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut h = doc_harness(&apples());
+        press(&mut h, M::COMMAND, Key::F);
+        press(&mut h, M::NONE, Key::Escape);
+        assert!(h.query_by_role(Role::TextInput).is_none(), "Esc closed the find bar");
+        assert!(!h.state().closed, "and not the dialog");
+        press(&mut h, M::NONE, Key::Escape);
+        assert!(h.state().closed, "with the bar closed and nothing typed, Esc closes the dialog");
+
+        let mut h = doc_harness(&apples());
+        press(&mut h, M::COMMAND, Key::F);
+        type_in(&mut h, "pie");
+        assert_eq!(find_count(&h).as_deref(), Some("1 of 1"));
+        press(&mut h, M::NONE, Key::Escape);
+        assert!(h.query_by_role(Role::TextInput).is_none() && !h.state().closed);
+        assert!(h.get_by_role(Role::MultilineTextInput).is_focused(), "the editor has the focus");
+        type_in(&mut h, "tart");
+        assert!(h.state().dialog.text().contains("\"Apple tart\""), "typing replaced the match: {}", h.state().dialog.text());
+
+        press(&mut h, M::COMMAND, Key::F);
+        h.get_by_label(icon::X).click();
+        h.run_steps(2);
+        assert!(h.query_by_role(Role::TextInput).is_none() && !h.state().closed, "✕ closed the bar only");
+    }
+
+    /// Editing the text with the bar open finds again, so the count follows
+    /// the text and the current match stays the one it was; a search runs
+    /// only when the text, the needle or match case changes, not each frame.
+    #[test]
+    fn find_follows_the_text_and_runs_only_on_a_change() {
+        use egui::Modifiers as M;
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let searches = |h: &egui_kittest::Harness<'_, DocProbe>| h.state().dialog.find.as_ref().map_or(0, |f| f.searches);
+        let mut h = doc_harness(&apples());
+        press(&mut h, M::COMMAND, Key::F);
+        type_in(&mut h, "apple");
+        assert_eq!(find_count(&h).as_deref(), Some("1 of 3"));
+        let n = searches(&h);
+        assert!(n > 0);
+        h.run_steps(5);
+        assert_eq!(searches(&h), n, "nothing changed, nothing searched");
+        h.get_by_role(Role::MultilineTextInput).focus();
+        h.run_steps(2);
+        assert_eq!(searches(&h), n, "the editor's focus is no change");
+        // Typed at the start, before the current match.
+        caret_after(&mut h, "");
+        type_in(&mut h, "apple, ");
+        assert!(h.state().dialog.text().starts_with("apple, "), "{}", h.state().dialog.text());
+        assert_eq!(find_count(&h).as_deref(), Some("2 of 4"), "the count follows the text, the current match stays");
+        assert_eq!(searches(&h), n + 1, "one search for the edit");
+        let (others, current) = find_marks(&h);
+        assert_eq!((others.len(), current.len()), (3, 1));
+        h.get_by_label("Aa").click();
+        h.run_steps(2);
+        assert_eq!(searches(&h), n + 2, "one for match case");
+        assert!(find_count(&h).is_some_and(|c| c.ends_with(" of 3")), "{:?}", find_count(&h));
+    }
+
+    /// Focuses the document editor with its caret just after the first
+    /// `after` in its text ("" for the start).
+    fn caret_after(h: &mut egui_kittest::Harness<'_, DocProbe>, after: &str) {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        h.get_by_role(Role::MultilineTextInput).focus();
+        h.run_steps(2);
+        let text = h.state().dialog.text();
+        let at = text.find(after).unwrap_or_else(|| panic!("{after:?} in {text}")) + after.len();
+        let chars = text[..at].chars().count();
+        let editor = Id::new("doc-dialog").with("text");
+        let mut state = egui::TextEdit::load_state(&h.ctx, editor).expect("the editor's state");
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(chars))));
+        state.store(&h.ctx, editor);
+    }
+
+    /// Esc pressed while typing in the document closes the bar and leaves
+    /// the caret where it was, so the next keystroke goes there. (It put
+    /// the selection on the current match, and the "0" meant for `_id`
+    /// replaced "apple".)
+    #[test]
+    fn esc_from_the_text_keeps_its_caret() {
+        use egui::Modifiers as M;
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut h = doc_harness(&apples());
+        press(&mut h, M::COMMAND, Key::F);
+        type_in(&mut h, "apple");
+        assert_eq!(find_count(&h).as_deref(), Some("1 of 3"));
+        caret_after(&mut h, "\"_id\" : 1");
+        type_in(&mut h, "0");
+        press(&mut h, M::NONE, Key::Escape);
+        assert!(h.query_by_role(Role::TextInput).is_none() && !h.state().closed, "Esc closed the bar only");
+        assert!(h.get_by_role(Role::MultilineTextInput).is_focused(), "the text kept the focus");
+        type_in(&mut h, "0");
+        let text = h.state().dialog.text();
+        assert!(text.contains("\"_id\" : 100,") && text.contains("\"a\" : \"apple\""), "the keystroke went to the caret: {text}");
+    }
+
+    /// After an edit the current match stays the one it was: an edit before
+    /// it (a deletion too) moves it with the text, one after it leaves its
+    /// place in the count, and one inside it, which unmakes it, moves on to
+    /// the first match from the caret.
+    #[test]
+    fn the_current_match_stays_through_edits_around_it() {
+        use egui::Modifiers as M;
+        let mut h = doc_harness(&apples());
+        press(&mut h, M::COMMAND, Key::F);
+        type_in(&mut h, "apple");
+        press(&mut h, M::NONE, Key::Enter);
+        assert_eq!(find_count(&h).as_deref(), Some("2 of 3"), "on \"Apple pie\"");
+        let between = |h: &egui_kittest::Harness<'_, DocProbe>| {
+            let (others, current) = find_marks(h);
+            let y = current.first().expect("a current match").0.top();
+            others.iter().any(|(o, _)| o.top() < y) && others.iter().any(|(o, _)| o.top() > y)
+        };
+        assert!(between(&h));
+        // Before it: the `1` of `_id` deleted.
+        caret_after(&mut h, "\"_id\" : 1");
+        press(&mut h, M::NONE, Key::Backspace);
+        assert!(h.state().dialog.text().contains("\"_id\" : ,"), "{}", h.state().dialog.text());
+        assert_eq!(find_count(&h).as_deref(), Some("2 of 3"), "a deletion before the current match keeps it");
+        assert!(between(&h), "still \"Apple pie\"");
+        // After it: another match at the end.
+        caret_after(&mut h, "\"pineapple\"");
+        type_in(&mut h, " apple");
+        assert_eq!(find_count(&h).as_deref(), Some("2 of 4"), "an edit after the current match keeps its place");
+        // Inside it: "Ap|ple" typed into is no match any more.
+        caret_after(&mut h, "\"Ap");
+        type_in(&mut h, "x");
+        assert!(h.state().dialog.text().contains("\"Apxple pie\""), "{}", h.state().dialog.text());
+        assert_eq!(find_count(&h).as_deref(), Some("2 of 3"), "the first match from the caret: \"pineapple\"");
+    }
+
+    /// With the bar open, a frame looks only at the rows in view: where each
+    /// row starts is worked out once per layout of the text, not walked from
+    /// the top each frame (on 11.5 MB scrolled to the end that walk cost
+    /// about 2 ms a frame).
+    #[test]
+    fn find_marks_only_the_rows_in_view() {
+        use egui::Modifiers as M;
+        let mut doc = Document::new();
+        for i in 0..3_000 {
+            doc.insert(format!("field_{i}"), format!("value {i}"));
+        }
+        doc.insert("last", "zebra");
+        let mut h = doc_harness(&doc);
+        press(&mut h, M::COMMAND, Key::F);
+        type_in(&mut h, "zebra");
+        h.run_steps(3);
+        assert_eq!(find_count(&h).as_deref(), Some("1 of 1"));
+        assert_eq!(find_marks(&h).1.len(), 1, "scrolled to the match at the end");
+        let find = |h: &egui_kittest::Harness<'_, DocProbe>| {
+            let f = h.state().dialog.find.as_ref().expect("the bar is open");
+            (f.row_scans, f.rows_looked_at)
+        };
+        let (scans, _) = find(&h);
+        h.run_steps(5);
+        let (scans_after, looked_at) = find(&h);
+        assert_eq!(scans_after, scans, "the rows were walked again while the layout stayed");
+        assert!(looked_at < 100, "{looked_at} rows looked at in a frame, of {} lines", doc.len() + 2);
+    }
+
+    /// Characters whose lowercase is longer (İ) or is ASCII (the Kelvin
+    /// sign) don't shift a match's mark or the selection left on closing:
+    /// both cover exactly the matched characters.
+    #[test]
+    fn find_marks_and_selects_the_matched_characters() {
+        use egui::Modifiers as M;
+        let doc = rongo_core::bson::doc! { "_id": 1, "tr": "İzmir İstanbul", "k": "273 \u{212A}x" };
+        for (needle, want) in [("İstanbul", "İstanbul"), ("i\u{307}zmir", "İzmir"), ("kx", "\u{212A}x")] {
+            let mut h = doc_harness(&doc);
+            press(&mut h, M::COMMAND, Key::F);
+            type_in(&mut h, needle);
+            assert_eq!(find_count(&h).as_deref(), Some("1 of 1"), "{needle}");
+            let (_, current) = find_marks(&h);
+            let [(mark, _)] = current[..] else { panic!("{needle}: one current mark, {current:?}") };
+            // Where egui itself puts those characters in the text.
+            let (pos, galley) = flat_shapes(&h)
+                .into_iter()
+                .find_map(|(_, s)| match s {
+                    egui::Shape::Text(t) if t.galley.text().contains("\"_id\"") => Some((t.pos, t.galley)),
+                    _ => None,
+                })
+                .expect("the document's text drawn");
+            let text = galley.text();
+            let start = text[..text.find(want).unwrap_or_else(|| panic!("{want} in {text}"))].chars().count();
+            let at = |c: usize| galley.pos_from_cursor(egui::text::CCursor::new(c)).translate(pos.to_vec2());
+            let (a, b) = (at(start), at(start + want.chars().count()));
+            assert!((mark.left() - a.left()).abs() < 1.0 && (mark.right() - b.left()).abs() < 1.0 && (mark.top() - a.top()).abs() < 1.0, "{needle}: marked {mark:?}, the characters are {a:?}..{b:?}");
+            press(&mut h, M::NONE, Key::Escape);
+            h.event(egui::Event::Copy);
+            h.run_steps(1);
+            let copied = h.output().platform_output.commands.iter().find_map(|c| match c {
+                egui::OutputCommand::CopyText(t) => Some(t.clone()),
+                _ => None,
+            });
+            assert_eq!(copied.as_deref(), Some(want), "{needle}: the selection left on closing");
+        }
+    }
+
+    /// ⌘S still saves with the find bar open and its field focused.
+    #[test]
+    fn cmd_s_saves_with_the_find_bar_open() {
+        use egui::Modifiers as M;
+        let mut h = doc_harness(&apples());
+        press(&mut h, M::COMMAND, Key::F);
+        type_in(&mut h, "apple");
+        press(&mut h, M::COMMAND, Key::S);
+        assert_eq!(h.state().saved, [apples()]);
+    }
+
+    /// The current match is scrolled into view: in a long document,
+    /// stepping to a match at the bottom and round to the top shows each.
+    #[test]
+    fn the_current_match_is_scrolled_into_view() {
+        use egui::Modifiers as M;
+        let mut doc = rongo_core::bson::doc! { "first": "zebra" };
+        for i in 0..300 {
+            doc.insert(format!("field_{i}"), format!("value {i}"));
+        }
+        doc.insert("last", "zebra");
+        let mut h = doc_harness(&doc);
+        press(&mut h, M::COMMAND, Key::F);
+        type_in(&mut h, "zebra");
+        for (step, want) in [(false, "1 of 2"), (true, "2 of 2"), (true, "1 of 2")] {
+            if step {
+                press(&mut h, M::NONE, Key::Enter);
+            }
+            h.run_steps(3);
+            assert_eq!(find_count(&h).as_deref(), Some(want));
+            let (_, current) = find_marks(&h);
+            let [(rect, clip)] = current[..] else { panic!("{want}: the current match is on screen: {current:?}") };
+            assert!(clip.contains_rect(rect), "{want}: {rect:?} in view ({clip:?})");
+        }
+    }
+
+    /// View Document finds the same way: ⌘F, typing, ↩, and Esc closing
+    /// only the bar, leaving the match selected (⌘C copies it); Esc then
+    /// closes the dialog.
+    #[test]
+    fn view_document_finds_too() {
+        use egui::Modifiers as M;
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut h = view_harness(&apples());
+        press(&mut h, M::COMMAND, Key::F);
+        assert!(h.get_by_role(Role::TextInput).is_focused(), "⌘F focused the find field");
+        type_in(&mut h, "apple");
+        assert_eq!(find_count(&h).as_deref(), Some("1 of 3"));
+        let (others, current) = find_marks(&h);
+        assert_eq!((others.len(), current.len()), (2, 1));
+        press(&mut h, M::NONE, Key::Enter);
+        assert_eq!(find_count(&h).as_deref(), Some("2 of 3"));
+        press(&mut h, M::NONE, Key::Escape);
+        assert!(h.query_by_role(Role::TextInput).is_none() && !h.state().closed, "Esc closed only the bar");
+        h.event(egui::Event::Copy);
+        h.run_steps(1);
+        let copied = h.output().platform_output.commands.iter().find_map(|c| match c {
+            egui::OutputCommand::CopyText(t) => Some(t.clone()),
+            _ => None,
+        });
+        assert_eq!(copied.as_deref(), Some("Apple"), "the current match was selected");
+        press(&mut h, M::NONE, Key::Escape);
+        assert!(h.state().closed, "with the bar closed, Esc closes View Document");
+    }
+
+    /// With a question over the editor (one asked on Save), Esc is the
+    /// question's: it answers it, and the editor's find bar stays open.
+    #[test]
+    fn esc_is_left_to_a_dialog_on_top() {
+        struct Probe {
+            doc: DocDialog,
+            confirm: Option<Confirm>,
+        }
+        let conn = ConnectionProfile::mock().conn_id();
+        let mut doc = DocDialog::edit(conn, Namespace::new("db", "c"), &apples(), None);
+        doc.find = Some(DocFind::default());
+        let confirm = Confirm::new("Question", "Go on?".into(), "OK", Pending::ClearHistory);
+        let mut h = crate::test_support::harness(vec2(1000.0, 800.0), 3, Probe { doc, confirm: Some(confirm) }, |ctx, p: &mut Probe| {
+            _ = p.doc.show(ctx);
+            if p.confirm.as_mut().is_some_and(|c| c.show(ctx).is_some()) {
+                p.confirm = None;
+            }
+        });
+        press(&mut h, egui::Modifiers::NONE, Key::Escape);
+        assert!(h.state().confirm.is_none(), "Esc answered the question");
+        assert!(h.state().doc.find.is_some(), "the find bar under it stayed");
     }
 
     /// The connection manager closes on a click outside; its form, open,

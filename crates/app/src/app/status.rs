@@ -16,10 +16,12 @@ impl RongoApp {
     /// Whether the corner shows this request (once it has taken a moment):
     /// not background work (no `what`), not a result view's own request (its
     /// status line shows it), nor the on-screen History tab's (the tab
-    /// shows it). The repaints the corner asks for follow the same rule.
+    /// shows it), nor, while the Operations panel shows, one it lists. The
+    /// repaints the corner asks for follow the same rule.
     fn shown_in_corner(&self, s: &Sent) -> bool {
         let on_screen = self.tabs.get(self.active_tab).map(|t| t.id);
-        s.what.is_some() && !matches!(s.origin, Origin::View(..)) && !matches!(s.origin, Origin::History { tab, .. } if Some(tab) == on_screen)
+        let in_panel = s.log.is_some() && self.ops_panel_shows();
+        s.what.is_some() && !in_panel && !matches!(s.origin, Origin::View(..)) && !matches!(s.origin, Origin::History { tab, .. } if Some(tab) == on_screen)
     }
 
     /// Running work the status bar shows, oldest first: requests that have
@@ -89,6 +91,7 @@ impl RongoApp {
         match key {
             OpKey::Request(id) if self.requests.pending.get(&id).is_some_and(|s| !s.cancellable) => {}
             OpKey::Request(id) => {
+                self.ops.stopping(id);
                 let tab = match self.requests.cancel(id) {
                     Some(Origin::History { tab, .. }) => Some(*tab),
                     _ => None,
@@ -109,6 +112,17 @@ impl RongoApp {
         }
     }
 
+    /// How far above the window's bottom the corner floats: 10 points, or,
+    /// while the sidebar shows the Operations panel, just above the panel
+    /// (its header, folded), which it would otherwise cover: unfolding it is
+    /// what a long paste calls for.
+    pub(super) fn corner_lift(&self, ctx: &egui::Context) -> f32 {
+        match self.ops_top.filter(|_| self.sidebar.open) {
+            Some(top) => (ctx.content_rect().bottom() - top + 6.0).max(10.0),
+            None => 10.0,
+        }
+    }
+
     /// Work running outside the result view on screen (connecting, the
     /// tree, writes, scripts in other tabs), floating in the bottom-left
     /// corner only while there is some: the latest, how long it has taken,
@@ -125,7 +139,7 @@ impl RongoApp {
         if let Some(op) = ops.last() {
             egui::Area::new(egui::Id::new("activity"))
                 .order(egui::Order::Foreground)
-                .anchor(Align2::LEFT_BOTTOM, egui::vec2(10.0, -10.0))
+                .anchor(Align2::LEFT_BOTTOM, egui::vec2(10.0, -self.corner_lift(ctx)))
                 .interactable(true)
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style()).inner_margin(egui::Margin::symmetric(8, 4)).show(ui, |ui| {

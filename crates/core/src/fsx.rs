@@ -28,6 +28,9 @@
 //! a moment. `rename` and `remove_file` therefore try again for about a
 //! second (`HOLD_WAIT`) while the answer is "in use", then give that error.
 //! On Unix nothing is held that way: they try once, as `std::fs` does.
+//!
+//! `reveal` shows a file in the system's file manager: Finder on macOS,
+//! File Explorer on Windows.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -108,6 +111,71 @@ pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
 /// a loop while holding a lock.
 pub fn remove_file(path: &Path) -> io::Result<()> {
     retry(HOLD_WAIT, sys::held, || std::fs::remove_file(path))
+}
+
+/// Shows `path` selected in the system's file manager: Finder on macOS
+/// (`open -R`), File Explorer on Windows (`explorer.exe /select,"…"`), each
+/// run with its arguments and no shell, the path made absolute first (an
+/// export's path is typed, and may be relative). A file that is gone is
+/// `NotFound` and starts nothing; on any other system this is
+/// `Unsupported`. Waits for `open` on macOS (it says when it failed), not
+/// for Explorer, whose exit code says nothing (1 also when it showed the
+/// file).
+pub fn reveal(path: &Path) -> io::Result<()> {
+    let path = std::path::absolute(path)?;
+    if !path.try_exists()? {
+        return Err(io::Error::new(io::ErrorKind::NotFound, format!("{} is no longer there", path.display())));
+    }
+    let Some(mut cmd) = reveal_command(&path)? else {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "showing a file in a file manager is not supported on this system"));
+    };
+    if cfg!(target_os = "macos") {
+        let out = cmd.output()?;
+        if !out.status.success() {
+            let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(io::Error::other(if why.is_empty() { format!("open -R ended with {}", out.status) } else { why }));
+        }
+        Ok(())
+    } else {
+        cmd.spawn().map(drop)
+    }
+}
+
+/// The command `reveal` runs: `/usr/bin/open -R <path>` on macOS. The
+/// path is made absolute (`std::path::absolute`, which reads nothing on
+/// disk), so a relative one, or one whose name starts with `-`, is never
+/// read as an option.
+#[cfg(target_os = "macos")]
+fn reveal_command(path: &Path) -> io::Result<Option<std::process::Command>> {
+    let path = std::path::absolute(path)?;
+    let mut cmd = std::process::Command::new("/usr/bin/open");
+    cmd.arg("-R").arg(path);
+    Ok(Some(cmd))
+}
+
+/// The command `reveal` runs on Windows: `%WINDIR%\explorer.exe` (not one
+/// found next to rongo or on the path) with `/select,"<path>"` passed as it
+/// is: Explorer reads its command line its own way, and wants the path
+/// absolute (`std::path::absolute`, not `canonicalize`, whose `\\?\`
+/// paths it can't read) and quoted after the comma (a Windows path never
+/// holds a `"`).
+#[cfg(windows)]
+fn reveal_command(path: &Path) -> io::Result<Option<std::process::Command>> {
+    use std::os::windows::process::CommandExt;
+    let path = std::path::absolute(path)?;
+    let windir = [std::env::var_os("WINDIR"), std::env::var_os("SystemRoot")].into_iter().flatten().find(|v| !v.is_empty());
+    let exe = windir.map_or_else(|| std::path::PathBuf::from("explorer.exe"), |w| std::path::PathBuf::from(w).join("explorer.exe"));
+    let mut arg = std::ffi::OsString::from("/select,\"");
+    arg.push(path.as_os_str());
+    arg.push("\"");
+    let mut cmd = std::process::Command::new(exe);
+    cmd.raw_arg(arg);
+    Ok(Some(cmd))
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn reveal_command(_: &Path) -> io::Result<Option<std::process::Command>> {
+    Ok(None)
 }
 
 /// Runs `op` until it succeeds, fails with an error `held` doesn't count, or
@@ -498,6 +566,44 @@ mod tests {
         });
         assert_eq!((r.unwrap_err().kind(), tries.get()), (io::ErrorKind::NotFound, 1));
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    /// A file that is gone is said, and nothing is started.
+    #[test]
+    fn reveal_says_a_file_is_gone() {
+        let t = TempDir::made();
+        let gone = t.0.join("export.json");
+        let e = reveal(&gone).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        assert!(e.to_string().contains("export.json"), "{e}");
+    }
+
+    /// What `reveal` runs, without running it: Finder by `open -R`, the
+    /// path absolute, so a relative one or a name starting with `-` is
+    /// never an option.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reveal_runs_open_r_on_macos() {
+        let cmd = reveal_command(Path::new("/tmp/a b/export.json")).unwrap().unwrap();
+        assert_eq!(cmd.get_program(), "/usr/bin/open");
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["-R", "/tmp/a b/export.json"]);
+        let cmd = reveal_command(Path::new("-x.json")).unwrap().unwrap();
+        let here = std::env::current_dir().unwrap().join("-x.json");
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), [std::ffi::OsStr::new("-R"), here.as_os_str()]);
+        assert!(cmd.get_args().nth(1).unwrap().to_string_lossy().starts_with('/'));
+    }
+
+    /// What `reveal` runs, without running it: Explorer, the path absolute
+    /// and quoted after `/select,`.
+    #[cfg(windows)]
+    #[test]
+    fn reveal_runs_explorer_select_on_windows() {
+        let cmd = reveal_command(Path::new(r"C:\Users\a b\export.json")).unwrap().unwrap();
+        assert!(cmd.get_program().to_string_lossy().to_lowercase().ends_with("explorer.exe"), "{:?}", cmd.get_program());
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), [r#"/select,"C:\Users\a b\export.json""#]);
+        let cmd = reveal_command(Path::new("-x.json")).unwrap().unwrap();
+        let here = std::env::current_dir().unwrap().join("-x.json");
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), [format!("/select,\"{}\"", here.display()).as_str()]);
     }
 
     #[test]

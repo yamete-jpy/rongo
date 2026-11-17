@@ -16,6 +16,10 @@ pub const OK: Color32 = Color32::from_rgb(0x5f, 0xb8, 0x65);
 pub const ERROR: Color32 = Color32::from_rgb(0xf2, 0x6d, 0x6d);
 pub const WARN: Color32 = Color32::from_rgb(0xe5, 0xb5, 0x67);
 
+/// A find bar's matches behind the text, and the current one.
+pub const FIND_MATCH: Color32 = Color32::from_rgba_premultiplied(0x5a, 0x4a, 0x14, 0xa0);
+pub const FIND_CURRENT: Color32 = Color32::from_rgb(0xb0, 0x7a, 0x10);
+
 pub const STRING: Color32 = Color32::from_rgb(0x6a, 0xab, 0x73);
 pub const NUMBER: Color32 = Color32::from_rgb(0x56, 0xa8, 0xf5);
 pub const CONTAINER: Color32 = Color32::from_rgb(0xcf, 0x8e, 0x6d);

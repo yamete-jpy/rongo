@@ -146,26 +146,31 @@ pub type Fetch = Arc<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>;
 /// Opens a page in the default browser.
 pub type Open = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
-/// How the app reaches the outside: the request, and the browser. The app
-/// has the real ones (`system`); test apps have none unless a test gives
-/// them stubs.
+/// Shows a file in the file manager (an export's, from the Operations panel).
+pub type Reveal = Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>;
+
+/// How the app reaches the outside: the request, the browser and the file
+/// manager. The app has the real ones (`system`); test apps have none
+/// unless a test gives them stubs.
 pub struct Hooks {
     /// None: no check at all.
     pub fetch: Option<Fetch>,
     pub open: Open,
+    pub reveal: Reveal,
 }
 
 impl Hooks {
-    /// The real request and browser.
+    /// The real request, browser and file manager.
     #[cfg(not(test))]
     pub fn system() -> Self {
-        Hooks { fetch: Some(Arc::new(fetch_latest)), open: Arc::new(open_page) }
+        Hooks { fetch: Some(Arc::new(fetch_latest)), open: Arc::new(open_page), reveal: Arc::new(|p| rongo_core::fsx::reveal(p).map_err(|e| e.to_string())) }
     }
 
-    /// No request, and a browser that only says it isn't there.
+    /// No request, and a browser and file manager that only say they
+    /// aren't there.
     #[cfg(test)]
     pub fn none() -> Self {
-        Hooks { fetch: None, open: Arc::new(|_| Err("tests never open a browser".into())) }
+        Hooks { fetch: None, open: Arc::new(|_| Err("tests never open a browser".into())), reveal: Arc::new(|_| Err("tests never open a file manager".into())) }
     }
 }
 

@@ -445,8 +445,10 @@ pub enum Event {
     Exported { count: u64, path: PathBuf },
     IndexDetails { ns: Namespace, items: Vec<IndexInfo> },
     /// How far a long request has got. Sent any number of times before the
-    /// request's one terminal event; never ends the request.
-    Progress { done: u64, total: Option<u64>, note: String },
+    /// request's one terminal event; never ends the request. `item`: a
+    /// copy's (`CopyCollections`) index of the item it is copying, in the
+    /// request's order; None from every other request.
+    Progress { done: u64, total: Option<u64>, note: String, item: Option<usize> },
     Copied(CopyReport),
     /// `Command::HistoryConflicts`: how many documents the entry holds, how
     /// many conflict, and the `_id`s of the first 20 that do.

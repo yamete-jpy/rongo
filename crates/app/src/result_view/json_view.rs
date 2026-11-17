@@ -2,14 +2,13 @@
 
 use std::sync::Arc;
 
-use egui::{Color32, Key, RichText, Ui};
-use egui_phosphor::regular as icon;
+use egui::Ui;
 use rongo_core::format::Style;
 
-use super::find::{MAX_MATCHES, Search};
+use super::ResultView;
+use super::find::{Asked, Bar, Search, Status};
 use super::json_text::{Build, TextLines};
-use super::{ResultView, thousands};
-use crate::{highlight, shortcut, theme};
+use crate::{highlight, theme};
 
 impl ResultView {
     pub(super) fn json(&mut self, ui: &mut Ui) {
@@ -71,7 +70,7 @@ impl ResultView {
                     .iter()
                     .enumerate()
                     .take_while(|(_, m)| m.0 == i)
-                    .map(|(k, m)| (m.1..m.2, if first + k == f.current { CURRENT_MATCH } else { MATCH }))
+                    .map(|(k, m)| (m.1..m.2, if first + k == f.current { theme::FIND_CURRENT } else { theme::FIND_MATCH }))
                     .collect();
                 highlight::mark(job, &marks);
             }
@@ -88,49 +87,20 @@ impl ResultView {
         egui::Id::new((self.id, "find"))
     }
 
-    /// The find bar over the JSON view: the text, match case, "n of m", and
-    /// previous/next. ↩ and ⇧↩ step through matches, Esc closes it.
+    /// The find bar over the JSON view (`find::Bar`). The search runs on
+    /// another thread whenever the text or match case changes.
     pub(super) fn find_bar(&mut self, ui: &mut Ui) {
         let id = self.find_id();
         let Some(f) = &mut self.json.find else { return };
-        let (mut step, mut close) = (0i64, false);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(icon::MAGNIFYING_GLASS).color(theme::MUTED));
-            let r = ui.add(egui::TextEdit::singleline(&mut f.text).id(id).hint_text("Find in these documents").desired_width(280.0));
-            if std::mem::take(&mut f.focus) {
-                r.request_focus();
-            }
-            if r.lost_focus() {
-                if ui.input(|i| i.key_pressed(Key::Enter)) {
-                    step = if ui.input(|i| i.modifiers.shift) { -1 } else { 1 };
-                    r.request_focus();
-                } else if ui.input(|i| i.key_pressed(Key::Escape)) {
-                    close = true;
-                }
-            }
-            if ui.selectable_label(f.case, "Aa").on_hover_text("Match case").clicked() {
-                f.case = !f.case;
-            }
-            let any = !f.matches.is_empty();
-            if ui.add_enabled(any, egui::Button::new(icon::CARET_UP)).on_hover_text(shortcut::label("Previous match (⇧↩)")).clicked() {
-                step = -1;
-            }
-            if ui.add_enabled(any, egui::Button::new(icon::CARET_DOWN)).on_hover_text(shortcut::label("Next match (↩)")).clicked() {
-                step = 1;
-            }
-            if f.text.is_empty() {
-            } else if self.json.lines.is_none() || f.running.is_some() {
-                ui.weak("Searching…");
-            } else if !any {
-                ui.colored_label(theme::ERROR, "No matches");
-            } else {
-                let more = if f.matches.len() >= MAX_MATCHES { "+" } else { "" };
-                ui.weak(format!("{} of {}{more}", thousands(f.current as u64 + 1), thousands(f.matches.len() as u64)));
-            }
-            if ui.button(icon::X).on_hover_text("Close (Esc)").clicked() {
-                close = true;
-            }
-        });
+        let status = if f.text.is_empty() {
+            Status::Empty
+        } else if self.json.lines.is_none() || f.running.is_some() {
+            Status::Searching
+        } else {
+            Status::Count { current: f.current, total: f.matches.len() }
+        };
+        let any = !f.matches.is_empty();
+        let Asked { step, close } = Bar { id, hint: "Find in these documents", text: &mut f.text, case: &mut f.case, focus: &mut f.focus, any, status }.show(ui);
         if close {
             self.json.find = None;
             return;
@@ -202,6 +172,3 @@ pub(crate) fn line_view(
         (top, ui.min_rect().bottom(), ui.clip_rect().bottom())
     })
 }
-
-const MATCH: Color32 = Color32::from_rgba_premultiplied(0x5a, 0x4a, 0x14, 0xa0);
-const CURRENT_MATCH: Color32 = Color32::from_rgb(0xb0, 0x7a, 0x10);

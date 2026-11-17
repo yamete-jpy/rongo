@@ -94,12 +94,42 @@ pub struct Sent {
     /// Whether a cancel can stop it (`Command::cancellable`): a write the
     /// server finishes once begun can't be, and shows no ⊗.
     pub cancellable: bool,
+    /// A write or a data move the Operations panel lists, and what the panel
+    /// needs of its command; None for reads and work that runs unseen.
+    pub log: Option<LogSeed>,
+    /// The user asked it to stop (a `Command::Cancel` was sent for it): a
+    /// stop it answers is theirs, not a problem's.
+    pub stop_asked: bool,
+}
+
+/// What the Operations panel keeps of a command it lists: a copy's target
+/// connection and its items (source and target), one child each.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LogSeed {
+    pub to: Option<ConnId>,
+    pub items: Vec<(Namespace, Namespace)>,
+}
+
+impl LogSeed {
+    /// For `cmd`, when the panel lists it: it has words for the status bar
+    /// (`what`) and is not a read. Reads (find, count, the tree's listings,
+    /// statistics, a restore's conflict check), connecting and testing never
+    /// are; neither is what runs unseen (no `what`).
+    pub fn of(what: Option<&str>, cmd: &Command) -> Option<LogSeed> {
+        if what.is_none() || cmd.only_reads() {
+            return None;
+        }
+        Some(match cmd {
+            Command::CopyCollections { to, items, .. } => LogSeed { to: Some(*to), items: items.iter().map(|i| (i.src.clone(), i.dst.clone())).collect() },
+            _ => LogSeed::default(),
+        })
+    }
 }
 
 #[cfg(test)]
 impl Sent {
     pub fn new(origin: Origin) -> Self {
-        Self { origin, conn: None, what: None, started: Instant::now(), progress: None, cancellable: true }
+        Self { origin, conn: None, what: None, started: Instant::now(), progress: None, cancellable: true, log: None, stop_asked: false }
     }
 }
 
@@ -163,6 +193,12 @@ impl Net<'_> {
     pub fn send(&mut self, origin: Origin, conn: Option<ConnId>, cmd: Command) -> RequestId {
         let what = describe(&origin, &cmd);
         let cancellable = cmd.cancellable();
+        let log = LogSeed::of(what.as_deref(), &cmd);
+        if let Command::Cancel(target) = &cmd
+            && let Some(s) = self.pending.get_mut(target)
+        {
+            s.stop_asked = true;
+        }
         let id = self.core.send(conn, cmd);
         if !matches!(origin, Origin::None) {
             // A connect goes out before the connection exists; name it by its id.
@@ -170,7 +206,7 @@ impl Net<'_> {
                 Origin::Connect(c) => Some(c),
                 _ => None,
             });
-            self.pending.insert(id, Sent { origin, conn, what, started: Instant::now(), progress: None, cancellable });
+            self.pending.insert(id, Sent { origin, conn, what, started: Instant::now(), progress: None, cancellable, log, stop_asked: false });
         }
         id
     }

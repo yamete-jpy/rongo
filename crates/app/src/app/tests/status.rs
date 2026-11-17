@@ -8,7 +8,7 @@ fn progress_keeps_the_request_and_shows_in_the_corner() {
     let now = Instant::now();
     let sent = Sent { what: Some("Copying 2 collections".into()), started: now - Duration::from_secs(2), ..Sent::new(Origin::Notify { view: None, tree: None }) };
     app.requests.pending.insert(7, sent);
-    app.handle(Response { id: 7, conn: None, event: Event::Progress { done: 12_000, total: Some(50_000), note: "sit.orders (1/2)".into() } });
+    app.handle(Response { id: 7, conn: None, event: Event::Progress { done: 12_000, total: Some(50_000), note: "sit.orders (1/2)".into(), item: Some(0) } });
     assert!(app.requests.pending.contains_key(&7), "progress is not an answer");
     let ops = app.operations(now);
     assert!(ops[0].text.contains("sit.orders (1/2)") && ops[0].text.contains("12,000 / 50,000"), "{}", ops[0].text);
@@ -31,7 +31,7 @@ fn copy_progress_names_both_connections() {
     app.requests.pending.insert(7, sent);
     let text = |app: &RongoApp| app.operations(now)[0].text.clone();
     assert_eq!(text(&app), "Copying 2 collections · SIT → UAT");
-    app.handle(Response { id: 7, conn: Some(a), event: Event::Progress { done: 1000, total: Some(2500), note: "uat.orders (1/2)".into() } });
+    app.handle(Response { id: 7, conn: Some(a), event: Event::Progress { done: 1000, total: Some(2500), note: "uat.orders (1/2)".into(), item: Some(0) } });
     assert_eq!(text(&app), "Copying 2 collections · SIT → UAT… uat.orders (1/2) 1,000 / 2,500");
 }
 

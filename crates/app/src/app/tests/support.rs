@@ -226,6 +226,11 @@ pub(super) fn history_sent(app: &RongoApp, kind: HistoryReq) -> bool {
 
 /// Clicks the middle of the first drawn text that `pick` accepts.
 pub(super) fn click_text(ctx: &egui::Context, app: &mut RongoApp, what: &str, pick: impl Fn(&str) -> bool) {
+    click_text_with(ctx, app, what, egui::PointerButton::Primary, pick);
+}
+
+/// `click_text` with `button` (`Secondary`: a right-click, its menu then opens).
+pub(super) fn click_text_with(ctx: &egui::Context, app: &mut RongoApp, what: &str, button: egui::PointerButton, pick: impl Fn(&str) -> bool) {
     let mut frame = eframe::Frame::_new_kittest();
     let mut at = None;
     // A new modal is drawn from its second frame.
@@ -235,8 +240,8 @@ pub(super) fn click_text(ctx: &egui::Context, app: &mut RongoApp, what: &str, pi
         at = text_shapes(&out).find(|t| pick(t.galley.text())).map(|t| t.galley.rect.translate(t.pos.to_vec2()).center());
     }
     let at = at.unwrap_or_else(|| panic!("{what} is drawn"));
-    let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
-    for events in [vec![egui::Event::PointerMoved(at)], vec![button(true)], vec![button(false)], vec![]] {
+    let press = |pressed| egui::Event::PointerButton { pos: at, button, pressed, modifiers: Modifiers::NONE };
+    for events in [vec![egui::Event::PointerMoved(at)], vec![press(true)], vec![press(false)], vec![]] {
         let mut input = frame_input();
         input.events = events;
         let mut out = ctx.run_ui(input, |ui| eframe::App::ui(app, ui, &mut frame));

@@ -6,6 +6,7 @@
 
 mod app;
 mod dialogs;
+mod doc_find;
 mod editor;
 mod export_conn;
 mod highlight;
@@ -14,6 +15,7 @@ mod index_form;
 mod indexes;
 mod job;
 mod net;
+mod operations;
 mod paste;
 mod result_view;
 mod settings;

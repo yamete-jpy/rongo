@@ -277,6 +277,21 @@ fn ui_tour() {
         settle(&mut h, 300);
         shot(&mut h, "15-update-banner");
         h.state_mut().update.found = None;
+
+        // The Operations panel, unfolded: a copy running, a ✓, a ⚠ and a ✗.
+        super::operations::tour_entries(h.state_mut());
+        h.state_mut().ops.open = true;
+        h.state_mut().ops.height = 520.0;
+        settle(&mut h, 300);
+        shot(&mut h, "16-operations");
+
+        // Folded, with a write running: the corner floats above the header.
+        let app = h.state_mut();
+        app.ops.open = false;
+        let sent = Sent { what: Some("Clearing shop.carts".into()), started: Instant::now() - Duration::from_secs(3), log: Some(crate::net::LogSeed::default()), cancellable: false, ..Sent::new(Origin::Notify { view: None, tree: None }) };
+        app.requests.pending.insert(9_999_999, sent);
+        settle(&mut h, 600);
+        shot(&mut h, "17-corner-above-the-panel");
     }
 }
 

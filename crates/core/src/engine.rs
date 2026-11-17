@@ -46,11 +46,20 @@ pub(crate) struct Progress {
     conn: Option<ConnId>,
     tx: crossbeam_channel::Sender<Response>,
     waker: Waker,
-    last: Mutex<Option<Instant>>,
+    last: Mutex<Last>,
     /// Called with `done` on every report, unthrottled, so tests can act at
     /// an exact point of a long command.
     #[cfg(test)]
     hook: Option<Box<dyn Fn(u64) + Send + Sync>>,
+}
+
+/// When a request last reported, and on which of a copy's items; and the
+/// item its reports are about now.
+#[derive(Default)]
+struct Last {
+    at: Option<Instant>,
+    item: Option<usize>,
+    current: Option<usize>,
 }
 
 impl Progress {
@@ -60,7 +69,7 @@ impl Progress {
             conn,
             tx,
             waker,
-            last: Mutex::new(None),
+            last: Mutex::new(Last::default()),
             #[cfg(test)]
             hook: None,
         }
@@ -68,23 +77,33 @@ impl Progress {
 
     /// Report `done` of `total` (if known) units, with a short note on what is
     /// being worked on. Sent at most every 100 ms so a tight loop can call it
-    /// per document, except that reaching the total is always sent.
+    /// per document, except that reaching the total is always sent, and so
+    /// is the first report on a copy's next item (`item`).
     pub(crate) fn report(&self, done: u64, total: Option<u64>, note: impl Into<String>) {
         #[cfg(test)]
         if let Some(hook) = &self.hook {
             hook(done);
         }
         let now = Instant::now();
-        {
+        let item = {
             let mut last = self.last.lock().expect("progress");
             let finished = Some(done) == total;
-            if !finished && last.is_some_and(|t| now.saturating_duration_since(t) < PROGRESS_EVERY) {
+            let next_item = last.current != last.item;
+            if !finished && !next_item && last.at.is_some_and(|t| now.saturating_duration_since(t) < PROGRESS_EVERY) {
                 return;
             }
-            *last = Some(now);
-        }
-        let _ = self.tx.send(Response { id: self.id, conn: self.conn, event: Event::Progress { done, total, note: note.into() } });
+            last.at = Some(now);
+            last.item = last.current;
+            last.current
+        };
+        let _ = self.tx.send(Response { id: self.id, conn: self.conn, event: Event::Progress { done, total, note: note.into(), item } });
         (self.waker)();
+    }
+
+    /// A copy: the reports that follow are about its item `k` (its index in
+    /// the request). Reports nothing itself.
+    pub(crate) fn item(&self, k: usize) {
+        self.last.lock().expect("progress").current = Some(k);
     }
 
     /// The last report of work whose total was an estimate, or unknown: says
@@ -423,6 +442,8 @@ mod tests {
         let events: Vec<Event> = rx.try_iter().map(|r| r.event).collect();
         assert!(events.len() < 10, "{} events", events.len());
         assert!(matches!(events.last(), Some(Event::Progress { done: 5000, total: Some(5000), .. })), "{:?}", events.last());
+        // Only a copy names an item.
+        assert!(events.iter().all(|e| matches!(e, Event::Progress { item: None, .. })), "{events:?}");
     }
 
     #[test]

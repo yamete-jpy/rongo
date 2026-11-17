@@ -71,6 +71,8 @@ impl RongoApp {
             self.requests.cancel(id);
         }
         self.net().send(Origin::None, Some(cid), Command::Disconnect);
+        // Its writes still running keep its name in the Operations panel.
+        self.log_sent();
         self.conns.remove(&cid);
         let (gone, kept): (Vec<Tab>, Vec<Tab>) = std::mem::take(&mut self.tabs).into_iter().partition(|t| t.conn() == Some(cid));
         self.tabs = kept;

@@ -1,11 +1,104 @@
-//! The JSON view's find: the find bar's state, and the search, run on other threads.
+//! Find: the find bar the JSON view and the document dialogs share, the
+//! JSON view's find state and its search on other threads, and the matcher.
 
 use std::sync::Arc;
 
-use super::json_text::TextLines;
+use egui::text::{CCursor, CCursorRange};
+use egui::{Key, RichText, Ui};
+use egui_phosphor::regular as icon;
 
-/// Most matches the find bar collects.
-pub(super) const MAX_MATCHES: usize = 100_000;
+use super::json_text::TextLines;
+use super::thousands;
+use crate::{shortcut, theme};
+
+/// Most matches a find bar collects.
+pub(crate) const MAX_MATCHES: usize = 100_000;
+
+/// What a find bar says after its buttons.
+pub(crate) enum Status {
+    /// Nothing typed: nothing said.
+    Empty,
+    Searching,
+    /// Match `current` (from 0) of `total`; "No matches" for none.
+    Count { current: usize, total: usize },
+}
+
+/// A find bar, as the JSON view and the document dialogs show it: the
+/// magnifier, the field, match case (**Aa**), previous / next, what was
+/// found, and close.
+pub(crate) struct Bar<'a> {
+    /// The field's id.
+    pub(crate) id: egui::Id,
+    pub(crate) hint: &'a str,
+    pub(crate) text: &'a mut String,
+    pub(crate) case: &'a mut bool,
+    /// Focus the field and select what is typed in it (⌘F); taken.
+    pub(crate) focus: &'a mut bool,
+    /// There are matches to step through: ↑ and ↓ are enabled.
+    pub(crate) any: bool,
+    pub(crate) status: Status,
+}
+
+/// What a find bar was asked this frame.
+#[derive(Default)]
+pub(crate) struct Asked {
+    /// -1 the previous match, 1 the next, 0 neither.
+    pub(crate) step: i64,
+    pub(crate) close: bool,
+}
+
+impl Bar<'_> {
+    /// ↩ and ⇧↩ in the field step through the matches (the field keeps its
+    /// focus), Esc in it closes the bar, as ✕ does.
+    pub(crate) fn show(self, ui: &mut Ui) -> Asked {
+        let Bar { id, hint, text, case, focus, any, status } = self;
+        let mut asked = Asked::default();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(icon::MAGNIFYING_GLASS).color(theme::MUTED));
+            if std::mem::take(focus) {
+                // Focused before it is drawn: a field drawn without the
+                // focus drops its selection.
+                ui.memory_mut(|m| m.request_focus(id));
+                let mut state = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+                state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(text.chars().count()))));
+                state.store(ui.ctx(), id);
+            }
+            let r = ui.add(egui::TextEdit::singleline(text).id(id).hint_text(hint).desired_width(280.0));
+            // Read before the focus is asked back: after `request_focus`
+            // in the same frame, `lost_focus` is never true.
+            if r.lost_focus() {
+                if ui.input(|i| i.key_pressed(Key::Enter)) {
+                    asked.step = if ui.input(|i| i.modifiers.shift) { -1 } else { 1 };
+                    r.request_focus();
+                } else if ui.input(|i| i.key_pressed(Key::Escape)) {
+                    asked.close = true;
+                }
+            }
+            if ui.selectable_label(*case, "Aa").on_hover_text("Match case").clicked() {
+                *case = !*case;
+            }
+            if ui.add_enabled(any, egui::Button::new(icon::CARET_UP)).on_hover_text(shortcut::label("Previous match (⇧↩)")).clicked() {
+                asked.step = -1;
+            }
+            if ui.add_enabled(any, egui::Button::new(icon::CARET_DOWN)).on_hover_text(shortcut::label("Next match (↩)")).clicked() {
+                asked.step = 1;
+            }
+            match status {
+                Status::Empty => {}
+                Status::Searching => _ = ui.weak("Searching…"),
+                Status::Count { total: 0, .. } => _ = ui.colored_label(theme::ERROR, "No matches"),
+                Status::Count { current, total } => {
+                    let more = if total >= MAX_MATCHES { "+" } else { "" };
+                    ui.weak(format!("{} of {}{more}", thousands(current as u64 + 1), thousands(total as u64)));
+                }
+            }
+            if ui.button(icon::X).on_hover_text("Close (Esc)").clicked() {
+                asked.close = true;
+            }
+        });
+        asked
+    }
+}
 
 /// The JSON view's find bar (⌘F).
 #[derive(Default)]
@@ -60,20 +153,39 @@ impl Drop for Search {
 /// and end on the line's own characters). Big texts are searched on
 /// several threads, by line range.
 pub(super) fn find_matches(lines: &TextLines, needle: &str, case: bool, cancel: &std::sync::atomic::AtomicBool) -> Vec<(usize, usize, usize)> {
-    // About 65,000 lines a thread: fewer aren't worth starting one for.
-    let threads = std::thread::available_parallelism().map_or(1, |p| p.get()).min(lines.len().div_ceil(65_536));
-    find_matches_in(lines, needle, case, cancel, threads)
+    find_matches_in(lines, needle, case, cancel, threads_for(lines), true)
+}
+
+/// Where `needle` occurs in `text`, as byte ranges, in order: the document
+/// dialogs' find. It matches as the JSON view's does (ignoring case unless
+/// `case`; a needle with a line break finds nothing), but searches every
+/// line: in a document, a line starting with "// " is its own text. At
+/// most MAX_MATCHES.
+pub(crate) fn find_in_text(text: &str, needle: &str, case: bool) -> Vec<std::ops::Range<usize>> {
+    let mut lines = TextLines::default();
+    lines.push_text(text);
+    let go = std::sync::atomic::AtomicBool::new(false);
+    let found = find_matches_in(&lines, needle, case, &go, threads_for(&lines), false);
+    found.into_iter().map(|(line, start, end)| lines.starts[line] + start..lines.starts[line] + end).collect()
+}
+
+/// Threads to search `lines` on: about 65,000 lines a thread, as fewer
+/// aren't worth starting one for.
+fn threads_for(lines: &TextLines) -> usize {
+    std::thread::available_parallelism().map_or(1, |p| p.get()).min(lines.len().div_ceil(65_536))
 }
 
 /// `find_matches` on `threads` threads, each searching its own range of
 /// lines for at most MAX_MATCHES; their matches are joined in order.
-fn find_matches_in(lines: &TextLines, needle: &str, case: bool, cancel: &std::sync::atomic::AtomicBool, threads: usize) -> Vec<(usize, usize, usize)> {
+/// `numbered`: the text is the JSON view's, whose `// n` lines (document
+/// numbers) are not searched.
+fn find_matches_in(lines: &TextLines, needle: &str, case: bool, cancel: &std::sync::atomic::AtomicBool, threads: usize, numbered: bool) -> Vec<(usize, usize, usize)> {
     // A line never holds a line break.
     if needle.is_empty() || needle.contains('\n') {
         return Vec::new();
     }
     let lower = needle.to_lowercase();
-    let search = Finder::new(needle, &lower, case);
+    let search = Finder::new(needle, &lower, case, numbered);
     let n = lines.len();
     let threads = threads.clamp(1, n.max(1));
     let per = n.div_ceil(threads);
@@ -133,6 +245,8 @@ struct Finder<'a> {
     /// them), and, for an ASCII needle, the Kelvin sign, which lowercases
     /// into "k".
     special: Vec<memchr::memmem::Finder<'static>>,
+    /// The `// n` lines are left out (the JSON view's document numbers).
+    numbered: bool,
 }
 
 /// Buffers `fold_line` and the ASCII search reuse from line to line.
@@ -144,7 +258,7 @@ struct FindBuf {
 }
 
 impl<'a> Finder<'a> {
-    fn new(needle: &'a str, lower: &'a str, case: bool) -> Self {
+    fn new(needle: &'a str, lower: &'a str, case: bool, numbered: bool) -> Self {
         let fold = if case || !needle.chars().any(cased) {
             Fold::Exact
         } else if needle.is_ascii() {
@@ -160,7 +274,7 @@ impl<'a> Finder<'a> {
             _ => Vec::new(),
         };
         let anchor = lower.bytes().enumerate().min_by_key(|&(_, b)| commonness(b)).map_or(0, |(k, _)| k);
-        Self { needle, lower, fold, exact: memchr::memmem::Finder::new(needle.as_bytes()), anchor, special }
+        Self { needle, lower, fold, exact: memchr::memmem::Finder::new(needle.as_bytes()), anchor, special, numbered }
     }
 
     /// The matches in lines `range`, at most MAX_MATCHES; None when cancelled.
@@ -222,7 +336,7 @@ impl<'a> Finder<'a> {
                 self.fold_line(lines, special[next], buf, out);
                 next += 1;
             }
-            if special.get(next) == Some(&line) || lines.line(line).starts_with("// ") {
+            if special.get(next) == Some(&line) || (self.numbered && lines.line(line).starts_with("// ")) {
                 continue;
             }
             let at = begin + at - lines.starts[line];
@@ -241,7 +355,7 @@ impl<'a> Finder<'a> {
     /// starts or ends inside one character's lowercase form is dropped.
     fn fold_line(&self, lines: &TextLines, i: usize, buf: &mut FindBuf, out: &mut Vec<(usize, usize, usize)>) {
         let line = lines.line(i);
-        if line.starts_with("// ") {
+        if self.numbered && line.starts_with("// ") {
             return;
         }
         if line.is_ascii() {
@@ -361,10 +475,34 @@ pub(super) mod tests {
         assert_eq!(find_matches(&tricky, "x i\u{307}", false, &go), [(0, 5, 9)]);
     }
 
+    /// The document dialogs' find searches every line, "// " lines too
+    /// (in a document they are its own text), and answers byte ranges
+    /// into the text, in order, by the JSON view's rules.
+    #[test]
+    fn find_in_text_searches_every_line() {
+        let text = "// 1 note\n{\n    a: \"ไทย DGM\",\n    b: \"dgm-x\"\n}";
+        let at = |s: &str| text.find(s).unwrap_or_else(|| panic!("{s} in the text"));
+        let found = |needle: &str, case: bool| find_in_text(text, needle, case).into_iter().map(|r| (r.start, r.end)).collect::<Vec<_>>();
+        let (upper, lower) = (at("DGM"), at("dgm"));
+        assert_eq!(found("dgm", false), [(upper, upper + 3), (lower, lower + 3)]);
+        assert_eq!(found("DGM", true), [(upper, upper + 3)]);
+        assert_eq!(found("1 note", false), [(3, 9)], "the comment line is searched");
+        assert_eq!(found("ไทย d", false), [(at("ไทย"), upper + 1)]);
+        assert!(find_in_text(text, "", false).is_empty());
+        assert!(find_in_text(text, "\",\n    b", false).is_empty(), "a needle with a line break finds nothing");
+        let many = "ab ".repeat(MAX_MATCHES + 10);
+        assert_eq!(find_in_text(&many, "AB", false).len(), MAX_MATCHES);
+    }
+
     /// `find_matches` as it was before its fast paths: every line on its
     /// own, a non-ASCII line lowercased a character at a time. The fast
     /// paths must find exactly what this finds.
     pub(in crate::result_view) fn find_matches_before(lines: &TextLines, needle: &str, case: bool) -> Vec<(usize, usize, usize)> {
+        find_matches_before_in(lines, needle, case, true)
+    }
+
+    /// `find_matches_before`, leaving the `// n` lines out or not (`numbered`).
+    fn find_matches_before_in(lines: &TextLines, needle: &str, case: bool, numbered: bool) -> Vec<(usize, usize, usize)> {
         let mut out = Vec::new();
         if needle.is_empty() {
             return out;
@@ -372,7 +510,7 @@ pub(super) mod tests {
         let lower = needle.to_lowercase();
         for i in 0..lines.len() {
             let line = lines.line(i);
-            if line.starts_with("// ") {
+            if numbered && line.starts_with("// ") {
                 continue;
             }
             if case {
@@ -444,7 +582,8 @@ pub(super) mod tests {
 
     /// The fast byte paths and the threads find what the line-by-line
     /// search found: the same lines, offsets and order, case-insensitive
-    /// and not, for needles in every script on the lines above.
+    /// and not, for needles in every script on the lines above; and with
+    /// the `// n` lines searched too, as the document dialogs search.
     #[test]
     fn find_matches_equal_the_line_by_line_search() {
         // Smaller in debug builds, where the line-by-line search is slow;
@@ -490,16 +629,18 @@ pub(super) mod tests {
             for case in [false, true] {
                 let before = find_matches_before(&lines, needle, case);
                 for threads in [1, 3, 8] {
-                    assert_eq!(find_matches_in(&lines, needle, case, &go, threads), before, "{needle:?} case={case} on {threads} threads");
+                    assert_eq!(find_matches_in(&lines, needle, case, &go, threads, true), before, "{needle:?} case={case} on {threads} threads");
                 }
                 assert_eq!(find_matches(&lines, needle, case, &go), before, "{needle:?} case={case}");
+                let every_line = find_matches_before_in(&lines, needle, case, false);
+                assert_eq!(find_matches_in(&lines, needle, case, &go, 3, false), every_line, "{needle:?} case={case}, every line");
             }
         }
         // More than MAX_MATCHES: the first ones, in order.
         let lines = mixed_script_lines(if debug { 15_000 } else { 30_000 });
         let many = find_matches_before(&lines, " ", false);
         assert_eq!(many.len(), MAX_MATCHES);
-        assert_eq!(find_matches_in(&lines, " ", false, &go, 5), many);
+        assert_eq!(find_matches_in(&lines, " ", false, &go, 5, true), many);
     }
 
     /// What the fast paths rely on, checked on every character of this

@@ -11,24 +11,35 @@ use crate::tools::ToolKind;
 use crate::tabs::TabKind;
 
 use super::RongoApp;
+use super::ops::answer_of;
 use super::outcome::{copy_summary, copy_toast, copy_troubled, move_failed, outcome_text, troubled};
 
 impl RongoApp {
     pub(super) fn handle(&mut self, r: Response) {
-        if let Event::Progress { done, total, note } = r.event {
+        // Into the Operations log first, while it is still pending.
+        self.log_sent();
+        if let Event::Progress { done, total, note, item } = r.event {
             // Not an answer: the request stays pending for its terminal event.
+            self.ops.progress(r.id, done, total, &note, item, std::time::Instant::now());
             if let Some(s) = self.requests.pending.get_mut(&r.id) {
                 s.progress = Some((done, total, note));
             }
             return;
         }
-        let origin = self.requests.pending.remove(&r.id).map(|s| s.origin).unwrap_or(Origin::None);
+        let sent = self.requests.pending.remove(&r.id);
+        if sent.as_ref().is_some_and(|s| s.stop_asked) {
+            self.ops.stopping(r.id);
+        }
+        let origin = sent.map(|s| s.origin).unwrap_or(Origin::None);
         // A recorded write refused, before writing anything, because its
-        // history would not fit: offer to send it without history.
+        // history would not fit: offer to send it without history. Nothing
+        // was written: the Operations panel keeps no entry (a request sent
+        // again gets its own).
         if let Some(u) = self.requests.unrecorded.remove(&r.id)
             && let Event::Failed(CoreError::HistoryTooLarge { needed, limit, free }) = &r.event
             && let Some(conn) = r.conn
         {
+            self.ops.forget(r.id);
             let why = format!("Collection History would need about {} for this operation; the size limit is {} and {} is free on the disk.", mb(*needed), mb(*limit), mb(*free));
             // A dialog waiting for this answer stays open, ready again.
             if let Some((waiting, _)) = self.waiting_dialog(&origin)
@@ -49,6 +60,10 @@ impl RongoApp {
             }
             (_, event) => Response { event, ..r },
         };
+        // A logged request's entry: the toasts said while its answer is
+        // handled are its result.
+        let answer = self.ops.begin_answer(r.id).then(|| answer_of(&r.event));
+        let id = r.id;
         match origin {
             Origin::None => {}
             o @ (Origin::Connect(_) | Origin::Test(_)) => self.on_connect(o, r),
@@ -60,6 +75,9 @@ impl RongoApp {
             o @ (Origin::Tool { .. } | Origin::Validator) => self.on_tool(o, r),
             o @ (Origin::Info { .. } | Origin::IndexTab(_)) => self.on_info(o, r),
             Origin::History { tab, ns, req } => self.history_answer(tab, ns, req, r.id, r.conn, r.event),
+        }
+        if let Some(a) = answer {
+            self.ops.finish(id, a, std::time::Instant::now());
         }
     }
 

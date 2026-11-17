@@ -39,6 +39,7 @@ impl Requests {
         self.core.send(None, Command::Cancel(id));
         let s = self.pending.get_mut(&id)?;
         s.what = None;
+        s.stop_asked = true;
         Some(&s.origin)
     }
 

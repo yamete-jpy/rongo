@@ -53,6 +53,7 @@ pub(crate) async fn copy_collections(
         }
         let mut out = CopiedItem { src: item.src.clone(), dst: item.dst.clone(), inserted: 0, overwritten: 0, skipped: 0, recorded: None, warning: None, error: None, unconfirmed: false };
         let note = format!("{} ({}/{})", item.dst, k + 1, items.len());
+        progress.item(k);
         match copier.item(item, &note, &mut out).await {
             Ok(Outcome::Complete) => {}
             Ok(Outcome::Cancelled) => report.cancelled = true,
@@ -608,10 +609,43 @@ mod tests {
     fn progress_of(rx: &crossbeam_channel::Receiver<crate::api::Response>) -> Vec<(u64, Option<u64>, String)> {
         rx.try_iter()
             .filter_map(|r| match r.event {
-                Event::Progress { done, total, note } => Some((done, total, note)),
+                Event::Progress { done, total, note, .. } => Some((done, total, note)),
                 _ => None,
             })
             .collect()
+    }
+
+    /// Each of a copy's progress reports names the item it is about (its
+    /// index in the request), and the first report on an item is sent at
+    /// once, however soon after the previous item's last one: the app sees
+    /// each item start, and which one is running, without reading the note.
+    #[tokio::test]
+    async fn progress_names_the_item_being_copied() {
+        let (src, dst) = (mock(), mock());
+        let names = ["a", "b", "c"];
+        for (n, size) in names.iter().zip([2500, 2500, 5]) {
+            seed(&src, &ns("db1", n), size).await;
+        }
+        let items: Vec<CopyItem> = names.iter().map(|n| item(ns("db1", n), ns("db2", n), SKIP)).collect();
+        let (progress, rx) = Progress::channel();
+        copy_collections(&src, &dst, false, &items, CopyOptions::default(), &progress, &CancellationToken::new()).await.unwrap();
+        let events: Vec<(Option<usize>, u64, Option<u64>, String)> = rx
+            .try_iter()
+            .filter_map(|r| match r.event {
+                Event::Progress { done, total, note, item } => Some((item, done, total, note)),
+                _ => None,
+            })
+            .collect();
+        for (item, _, _, note) in &events {
+            let k = item.unwrap_or_else(|| panic!("every report names its item: {events:?}"));
+            assert!(note.ends_with(&format!("({}/3)", k + 1)), "the note is today's: {note}");
+        }
+        assert!(events.windows(2).all(|w| w[0].0 <= w[1].0), "in order: {events:?}");
+        let first = |k| events.iter().find(|e| e.0 == Some(k)).map(|e| (e.1, e.2));
+        // Its first batch, though it came right after item 0's last report.
+        assert_eq!(first(1), Some((1000, Some(2500))), "{events:?}");
+        let last = |k| events.iter().rev().find(|e| e.0 == Some(k)).map(|e| (e.1, e.2));
+        assert_eq!([last(0), last(1), last(2)], [Some((2500, Some(2500))), Some((2500, Some(2500))), Some((5, Some(5)))]);
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@
 
 mod docs;
 mod drill;
-mod find;
+pub(crate) mod find;
 mod json_text;
 mod json_view;
 mod keys;

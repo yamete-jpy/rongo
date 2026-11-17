@@ -39,7 +39,7 @@ fn github_with(answer: Result<String, String>, open_fails: Option<&'static str>)
         keep.lock().unwrap().push(url.to_string());
         open_fails.map_or(Ok(()), |e| Err(e.to_string()))
     });
-    (Hooks { fetch: Some(fetch), open }, Stub { asked, opened })
+    (Hooks { fetch: Some(fetch), open, ..Hooks::none() }, Stub { asked, opened })
 }
 
 fn github(answer: Result<String, String>) -> (Hooks, Stub) {

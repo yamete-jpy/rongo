@@ -5,6 +5,7 @@ mod actions;
 mod chrome;
 mod conns;
 mod history;
+mod ops;
 mod outcome;
 mod paste;
 mod requests;
@@ -29,6 +30,7 @@ use crate::history_tab::RestoreAsk;
 use crate::job::Job;
 use crate::dialogs::{Confirm, ConnectDialog, DocDialog, ViewDocDialog};
 use crate::net::Net;
+use crate::operations::Operations;
 use crate::paste::{CollClip, PasteDialog};
 use crate::sidebar::{self, OpenConn, Sidebar};
 use crate::settings::{ChangePasswordDialog, HistoryFiles, Settings, SettingsDialog};
@@ -123,6 +125,14 @@ pub struct RongoApp {
     /// The update check: GitHub's latest release, asked at launch, and the
     /// banner offering it (`update_check.rs`).
     update: UpdateCheck,
+    /// The Operations panel under the tree: the writes and data moves of
+    /// this session (`ops.rs`, `crate::operations`).
+    ops: Operations,
+    /// Showing an export's file in the file manager, off the UI thread.
+    revealing: Option<Job<Result<(), String>>>,
+    /// Where the Operations panel began last frame (its header, folded),
+    /// while the sidebar shows: the corner floats above it.
+    ops_top: Option<f32>,
     /// Tests: the app's own folder (connections, settings, history, vault),
     /// removed with the app.
     #[cfg(test)]
@@ -222,6 +232,9 @@ impl RongoApp {
             keychain: crate::unlock::keychain(),
             keychain_forget: None,
             update: UpdateCheck::new(hooks),
+            ops: Operations::default(),
+            revealing: None,
+            ops_top: None,
             #[cfg(test)]
             _temp: temp,
         };
@@ -256,9 +269,13 @@ impl RongoApp {
             || self.reset_ask.is_some()
     }
 
+    /// A toast; said while a logged request's answer is handled, it is also
+    /// that entry's result in the Operations panel.
     fn toast(&mut self, text: impl Into<String>, error: bool) {
+        let text = text.into();
+        self.ops.said(&text, error);
         let secs = if error { 8 } else { 4 };
-        self.toasts.push(Toast { text: text.into(), error, until: Instant::now() + Duration::from_secs(secs) });
+        self.toasts.push(Toast { text, error, until: Instant::now() + Duration::from_secs(secs) });
     }
 
     fn next_tab(&mut self) -> u64 {
@@ -326,6 +343,8 @@ fn initial_vault(paths: &AppPaths, _store: Option<&ProfileStore>) -> (Option<Arc
 
 impl eframe::App for RongoApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        // What the last frame's dialogs sent goes into the Operations log.
+        self.log_sent();
         while let Some(r) = self.requests.core.try_recv() {
             self.handle(r);
         }
@@ -333,6 +352,7 @@ impl eframe::App for RongoApp {
         self.poll_keychain_forget();
         self.poll_startup_purge();
         self.poll_update_check();
+        self.poll_reveal();
         let ctx = ui.ctx().clone();
         // Until the vault is open the window shows the launch dialog over an
         // empty window: no toolbar, tree or tabs. Toasts still show (a
@@ -376,22 +396,38 @@ impl eframe::App for RongoApp {
             .show(ui, |ui| sidebar::strip(ui, &mut self.sidebar));
         if self.sidebar.open {
             let mut actions = Vec::new();
+            let mut op_actions = Vec::new();
+            let (now, tz) = (Instant::now(), self.settings.timezone);
             self.sidebar_rect = egui::Panel::left("sidebar")
                 .resizable(true)
                 .default_size(300.0)
                 .size_range(200.0..=600.0)
                 .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(6, 6)))
                 .show(ui, |ui| {
+                    // Exactly the panel's area, the tree above the Operations
+                    // panel: nothing in either can widen it.
+                    let area = ui.available_rect_before_wrap();
+                    ui.allocate_rect(area, egui::Sense::hover());
+                    let (tree_area, ops_area) = self.ops.split(area);
+                    self.ops_top = Some(ops_area.top());
                     let order: Vec<ConnId> = self.store.as_ref().map(|s| s.profiles().iter().map(|p| p.conn_id()).collect()).unwrap_or_default();
                     self.sidebar.can_paste = self.coll_clip.is_some();
                     let mut net = self.requests.net(false);
-                    actions = sidebar::tree(ui, &mut self.sidebar, &mut self.conns, &order, &mut net);
+                    let mut tree_ui = ui.new_child(egui::UiBuilder::new().max_rect(tree_area).layout(egui::Layout::top_down(egui::Align::Min)));
+                    actions = sidebar::tree(&mut tree_ui, &mut self.sidebar, &mut self.conns, &order, &mut net);
+                    let mut ops_ui = ui.new_child(egui::UiBuilder::new().max_rect(ops_area).layout(egui::Layout::top_down(egui::Align::Min)));
+                    op_actions = crate::operations::panel(&mut ops_ui, &mut self.ops, now, tz);
                 })
                 .response
                 .rect;
             for a in actions {
                 self.tree_action(a);
             }
+            for a in op_actions {
+                self.ops_action(a);
+            }
+        } else {
+            self.ops_top = None;
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin { left: 6, right: 8, top: 6, bottom: 6 }))
@@ -403,6 +439,8 @@ impl eframe::App for RongoApp {
                 });
             });
 
+        // Before the corner, which leaves out what the panel lists.
+        self.log_sent();
         self.activity(&ctx);
         self.dialogs(&ctx);
         self.toasts(&ctx);

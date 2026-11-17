@@ -26,6 +26,7 @@ use support::*;
 
 mod history;
 mod history_tab;
+mod operations;
 mod paste;
 mod settings;
 mod status;

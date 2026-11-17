@@ -4516,7 +4516,7 @@ dependencies = [
 
 [[package]]
 name = "rongo"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bson",
  "crossbeam-channel",
@@ -4543,7 +4543,7 @@ dependencies = [
 
 [[package]]
 name = "rongo-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "argon2",
  "bson",
@@ -4571,7 +4571,7 @@ dependencies = [
 
 [[package]]
 name = "rongo-shell"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "crossbeam-channel",
  "rongo-core",

@@ -37,6 +37,12 @@ keyring = { version = "3", features = ["apple-native"] }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
+[features]
+# The demo connection serves the large test data set the app's tests are
+# written against, not the small demo (`mock::served`). Only the app's
+# dev-dependency on this crate turns it on.
+test-data = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 

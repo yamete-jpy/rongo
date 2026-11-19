@@ -1,6 +1,7 @@
 //! Helpers the app's tests share: a temporary folder and vault, a
 //! Keychain in memory, a dialog on screen, a click outside it, a long
-//! driver error.
+//! driver error, keys and typing in a harness, and what a find bar says
+//! and marks.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -125,4 +126,57 @@ pub fn long_driver_error() -> String {
         server(1),
         server(2)
     )
+}
+
+/// Every shape the last frame drew, `Shape::Vec`s opened, with the
+/// clip it was drawn in.
+pub fn flat_shapes<S>(h: &egui_kittest::Harness<'_, S>) -> Vec<(egui::Rect, egui::Shape)> {
+    fn open(clip: egui::Rect, s: &egui::Shape, out: &mut Vec<(egui::Rect, egui::Shape)>) {
+        match s {
+            egui::Shape::Vec(v) => v.iter().for_each(|s| open(clip, s, out)),
+            s => out.push((clip, s.clone())),
+        }
+    }
+    let mut out = Vec::new();
+    for c in &h.output().shapes {
+        open(c.clip_rect, &c.shape, &mut out);
+    }
+    out
+}
+
+/// What a find bar says: "n of m" or "No matches", if anything.
+pub fn find_count<S>(h: &egui_kittest::Harness<'_, S>) -> Option<String> {
+    flat_shapes(h).into_iter().find_map(|(_, s)| match s {
+        egui::Shape::Text(t) if t.galley.text() == "No matches" || (t.galley.text().contains(" of ") && t.galley.text().starts_with(|c: char| c.is_ascii_digit())) => Some(t.galley.text().to_string()),
+        _ => None,
+    })
+}
+
+/// The find marks the last frame drew behind a text: the matches, then
+/// the current one, each as (its rect, the clip it is drawn in).
+pub type Marks = Vec<(egui::Rect, egui::Rect)>;
+pub fn find_marks<S>(h: &egui_kittest::Harness<'_, S>) -> (Marks, Marks) {
+    let (mut others, mut current) = (Vec::new(), Vec::new());
+    for (clip, s) in flat_shapes(h) {
+        if let egui::Shape::Rect(r) = s {
+            if r.fill == crate::theme::FIND_MATCH {
+                others.push((r.rect, clip));
+            } else if r.fill == crate::theme::FIND_CURRENT {
+                current.push((r.rect, clip));
+            }
+        }
+    }
+    (others, current)
+}
+
+/// `key` pressed with `modifiers`, then two frames.
+pub fn press<S>(h: &mut egui_kittest::Harness<'_, S>, modifiers: egui::Modifiers, key: egui::Key) {
+    h.key_press_modifiers(modifiers, key);
+    h.run_steps(2);
+}
+
+/// Types `text` into the focused field.
+pub fn type_in<S>(h: &mut egui_kittest::Harness<'_, S>, text: &str) {
+    h.event(egui::Event::Text(text.into()));
+    h.run_steps(2);
 }

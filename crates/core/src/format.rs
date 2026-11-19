@@ -998,7 +998,7 @@ mod tests {
 
     /// The demo server's bet_logs, users and providers.
     fn sample_docs() -> Vec<Document> {
-        let s = crate::mock::MockStore::demo();
+        let s = crate::mock::MockStore::test_data();
         let mut docs = Vec::new();
         for coll in ["bet_logs", "users", "providers"] {
             docs.extend(s.find(&crate::api::Namespace::new("demo-games", coll), &doc! {}, None, None, 0, None).unwrap());

@@ -1,7 +1,27 @@
 //! An in-memory stand-in for a MongoDB server, used by `rongo --mock` and by
 //! tests that should not need a real server.
 
+mod demo;
 pub mod query;
+
+pub use demo::{DEMO_DB, DEMO_SCRIPT, served, served_shell};
+
+/// The test data's main database, where the demo shell opens in tests.
+pub const TEST_DB: &str = "demo-games";
+
+/// The demo shell's script on the test data, which the app's tests run.
+pub const TEST_SCRIPT: &str = r#"// IntelliShell runs mongosh-style JavaScript. ⌘↩ runs everything (or the
+// selection), ⇧⌘↩ runs the statement under the cursor. A find() you don't
+// read opens as a result tab you can page through.
+db.getCollection("advertisers").find({})
+
+db.bet_logs.find({ status: "pending", amount: { $gt: 1000 } }).sort({ amount: -1 })
+
+db.bet_logs.aggregate([
+    { $group: { _id: "$provider", bets: { $sum: 1 }, total: { $sum: "$amount" } } },
+    { $sort: { total: -1 } }
+])
+"#;
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -155,23 +175,53 @@ impl MockStore {
     }
 
     /// `createIndexes`: each spec has `key` and the index options, `name`
-    /// included (MongoDB's usual name when missing). Existing names are kept.
-    /// A missing collection is created, as on a server.
-    pub fn create_indexes(&mut self, ns: &Namespace, specs: Vec<Document>) {
+    /// included (MongoDB's usual name when missing). A missing collection is
+    /// created, as on a server. Returns how many indexes were built. As a
+    /// server (4.4 and newer) does:
+    /// - an identical index already there is skipped ("all indexes already
+    ///   exist"); `background` doesn't count, nor 1.0 for 1;
+    /// - the same name with another key pattern, collation or partial filter
+    ///   is refused with 86 (IndexKeySpecsConflict), with other options
+    ///   (unique, sparse, TTL, …) with 85 (IndexOptionsConflict);
+    /// - the same key pattern, collation and partial filter under another
+    ///   name is refused with 85;
+    /// - a refused command builds none of its indexes.
+    pub fn create_indexes(&mut self, ns: &Namespace, specs: Vec<Document>) -> CoreResult<usize> {
         let c = self.coll_mut(ns);
+        let mut indexes = c.indexes.clone();
+        let before = indexes.len();
+        let conflict = |code, msg: String| CoreError::Server { code, msg };
         for spec in specs {
             let name = match spec.get_str("name") {
                 Ok(n) => n.to_string(),
                 Err(_) => crate::conn::default_index_name(&spec.get_document("key").cloned().unwrap_or_default()),
             };
-            if c.indexes.iter().any(|i| i.get_str("name").ok() == Some(name.as_str())) {
-                continue;
-            }
             let mut index = doc! { "v": 2 };
             index.extend(spec);
-            index.insert("name", name);
-            c.indexes.push(index);
+            index.insert("name", name.clone());
+            if let Some(old) = indexes.iter().find(|i| i.get_str("name").ok() == Some(name.as_str())) {
+                match (same_identity(old, &index), same_options(old, &index)) {
+                    (true, true) => continue,
+                    (false, _) => {
+                        let msg = format!("An existing index has the same name as the requested index. When index names are not specified, they are auto generated and can cause conflicts. Requested index: {index}, existing index: {old}");
+                        return Err(conflict(86, msg));
+                    }
+                    (true, false) => return Err(conflict(85, format!("An equivalent index already exists with the same name but different options. Requested index: {index}, existing index: {old}"))),
+                }
+            }
+            if let Some(old) = indexes.iter().find(|i| same_identity(i, &index)) {
+                let msg = if same_options(old, &index) {
+                    format!("Index already exists with a different name: {}", old.get_str("name").unwrap_or_default())
+                } else {
+                    format!("An equivalent index already exists with a different name and options. Requested index: {index}, existing index: {old}")
+                };
+                return Err(conflict(85, msg));
+            }
+            indexes.push(index);
         }
+        let built = indexes.len() - before;
+        c.indexes = indexes;
+        Ok(built)
     }
 
     pub fn drop_index(&mut self, ns: &Namespace, name: &str) -> CoreResult<()> {
@@ -492,7 +542,12 @@ impl MockStore {
             if name == "_id_" {
                 return Err(CoreError::Server { code: 72, msg: "cannot hide the _id index".into() });
             }
-            idx.insert("hidden", h);
+            // A server lists a shown index without the field.
+            if h {
+                idx.insert("hidden", true);
+            } else {
+                idx.remove("hidden");
+            }
         }
         if let Some(t) = ttl {
             if !idx.contains_key("expireAfterSeconds") {
@@ -595,8 +650,10 @@ impl MockStore {
         })
     }
 
-    /// Made-up demo data for --mock.
-    pub fn demo() -> Self {
+    /// The data the tests are written against: a large made-up database
+    /// (25,000 documents in one collection, ~300 collections in all) for
+    /// paging, long lists and timings. `--mock` serves `demo` instead.
+    pub fn test_data() -> Self {
         let mut rng = StdRng::seed_from_u64(7);
         let mut s = Self::empty();
         let mut put = |db: &str, coll: &str, docs: Vec<Document>| {
@@ -698,6 +755,33 @@ fn ns_not_found(ns: &Namespace) -> CoreError {
     CoreError::Server { code: 26, msg: format!("ns not found: {ns}") }
 }
 
+/// What tells two indexes apart for a server: the key pattern (in order),
+/// the collation and the partial filter.
+fn same_identity(a: &Document, b: &Document) -> bool {
+    let key = |d: &Document| d.get_document("key").map(|k| k.iter().map(|(f, v)| (f.clone(), by_value(v))).collect::<Vec<_>>()).unwrap_or_default();
+    key(a) == key(b) && ["collation", "partialFilterExpression"].iter().all(|k| a.get(k).map(by_value) == b.get(k).map(by_value))
+}
+
+/// Whether two indexes' other options (unique, sparse, TTL, …) match;
+/// `background` is ignored, as servers do.
+fn same_options(a: &Document, b: &Document) -> bool {
+    let rest = |d: &Document| -> Document {
+        d.iter().filter(|(k, _)| !matches!(k.as_str(), "v" | "ns" | "name" | "key" | "collation" | "partialFilterExpression" | "background")).map(|(k, v)| (k.clone(), by_value(v))).collect()
+    };
+    rest(a) == rest(b)
+}
+
+/// Numbers as doubles, so `1`, `1.0` and `NumberLong(1)` compare equal.
+fn by_value(v: &Bson) -> Bson {
+    match v {
+        Bson::Int32(n) => Bson::Double(f64::from(*n)),
+        Bson::Int64(n) => Bson::Double(*n as f64),
+        Bson::Document(d) => Bson::Document(d.iter().map(|(k, v)| (k.clone(), by_value(v))).collect()),
+        Bson::Array(a) => Bson::Array(a.iter().map(by_value).collect()),
+        v => v.clone(),
+    }
+}
+
 fn pick<'a>(rng: &mut StdRng, items: &[&'a str]) -> &'a str {
     items[rng.random_range(0..items.len())]
 }
@@ -731,8 +815,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn demo_has_expected_shape() {
-        let s = MockStore::demo();
+    fn test_data_has_expected_shape() {
+        let s = MockStore::test_data();
         let names: Vec<_> = s.list_databases().into_iter().map(|d| d.name).collect();
         assert_eq!(names, ["admin", "analytics", "demo-games"]);
         assert_eq!(s.list_collections("demo-games").len(), 294);
@@ -748,7 +832,7 @@ mod tests {
         let mut s = MockStore::empty();
         let ns = Namespace::new("t", "a");
         s.insert(&ns, doc! { "x": 1 }).unwrap();
-        s.create_indexes(&ns, vec![doc! { "key": { "x": 1 } }]);
+        s.create_indexes(&ns, vec![doc! { "key": { "x": 1 } }]).unwrap();
         s.insert(&Namespace::new("t", "b"), doc! { "x": 1 }).unwrap();
         assert!(matches!(s.rename_collection(&ns, "b"), Err(CoreError::Server { code: 48, .. })));
         s.rename_collection(&ns, "c").unwrap();
@@ -765,7 +849,7 @@ mod tests {
         let mut s = MockStore::empty();
         let ns = Namespace::new("t", "a");
         s.insert(&ns, doc! { "at": 1 }).unwrap();
-        s.create_indexes(&ns, vec![doc! { "key": { "at": 1 }, "name": "ttl", "expireAfterSeconds": 60 }]);
+        s.create_indexes(&ns, vec![doc! { "key": { "at": 1 }, "name": "ttl", "expireAfterSeconds": 60 }]).unwrap();
         let sum = crate::api::CollSummary::from_stats(&s.coll_stats(&ns).unwrap());
         assert_eq!((sum.count, sum.indexes, sum.total_index_size), (1, 2, 8192));
         s.modify_index(&ns, "ttl", Some(true), Some(120)).unwrap();
@@ -833,11 +917,53 @@ mod tests {
         assert_eq!(s.count(&ns, &doc! {}).unwrap(), 3);
         assert_eq!(s.count(&ns, &doc! { "old": true }).unwrap(), 1, "the existing document is untouched");
 
-        s.create_indexes(&ns, vec![doc! { "key": { "a": 1 }, "name": "a_1", "unique": true }, doc! { "key": { "b": -1 } }, doc! { "key": { "a": 1 }, "name": "a_1" }]);
+        s.create_indexes(&ns, vec![doc! { "key": { "a": 1 }, "name": "a_1", "unique": true }, doc! { "key": { "b": -1 } }]).unwrap();
         let indexes = s.list_indexes(&ns);
         let names: Vec<&str> = indexes.iter().map(|i| i.get_str("name").unwrap()).collect();
         assert_eq!(names, ["_id_", "a_1", "b_-1"]);
         assert_eq!(indexes[1], doc! { "v": 2, "key": { "a": 1 }, "name": "a_1", "unique": true });
+    }
+
+    /// createIndexes as a server answers it:
+    /// - an identical index is left as it is (nothing built: the server's
+    ///   "all indexes already exist"); `background` and 1.0 for 1 don't count;
+    /// - the same name with other keys, collation or partial filter is
+    ///   refused with code 86 (IndexKeySpecsConflict), with other options
+    ///   (unique, sparse, …) with code 85 (IndexOptionsConflict);
+    /// - the same keys, collation and partial filter under another name is
+    ///   refused with code 85, whatever the other options;
+    /// - another collation or partial filter makes a separate index;
+    /// - a refused command builds nothing, not even the specs before it.
+    #[test]
+    fn create_indexes_answers_like_a_server() {
+        let mut s = MockStore::empty();
+        let ns = Namespace::new("t", "c");
+        let code = |r: CoreResult<usize>| match r {
+            Err(CoreError::Server { code, .. }) => code,
+            other => panic!("refused, not {other:?}"),
+        };
+        assert_eq!(s.create_indexes(&ns, vec![doc! { "key": { "email": 1 } }]).unwrap(), 1);
+        assert_eq!(s.create_indexes(&ns, vec![doc! { "key": { "email": 1.0 }, "name": "email_1", "background": true }]).unwrap(), 0, "identical");
+        assert_eq!(code(s.create_indexes(&ns, vec![doc! { "key": { "email": -1 }, "name": "email_1" }])), 86, "same name, other keys");
+        assert_eq!(code(s.create_indexes(&ns, vec![doc! { "key": { "email": 1 }, "name": "email_1", "collation": { "locale": "th" } }])), 86, "same name, other collation");
+        assert_eq!(code(s.create_indexes(&ns, vec![doc! { "key": { "email": 1 }, "unique": true }])), 85, "same name, other options");
+        assert_eq!(code(s.create_indexes(&ns, vec![doc! { "key": { "email": 1 }, "name": "email_unique", "unique": true }])), 85, "same keys, other name");
+        assert_eq!(code(s.create_indexes(&ns, vec![doc! { "key": { "email": 1 }, "name": "email_again" }])), 85, "same keys, other name, same options");
+        assert_eq!(code(s.create_indexes(&ns, vec![doc! { "key": { "a": 1 } }, doc! { "key": { "email": 1 }, "name": "x" }])), 85);
+        let separate = vec![
+            doc! { "key": { "email": 1 }, "name": "email_th", "collation": { "locale": "th" } },
+            doc! { "key": { "email": 1 }, "name": "email_live", "partialFilterExpression": { "live": true } },
+        ];
+        assert_eq!(s.create_indexes(&ns, separate).unwrap(), 2);
+        let names: Vec<String> = s.list_indexes(&ns).iter().map(|i| i.get_str("name").unwrap().to_string()).collect();
+        assert_eq!(names, ["_id_", "email_1", "email_th", "email_live"], "nothing of a refused command was built");
+
+        // Hidden, then shown again: as a server lists it, no `hidden` field
+        // is left, so the same index is still identical.
+        s.modify_index(&ns, "email_1", Some(true), None).unwrap();
+        s.modify_index(&ns, "email_1", Some(false), None).unwrap();
+        assert!(!s.list_indexes(&ns)[1].contains_key("hidden"), "{:?}", s.list_indexes(&ns)[1]);
+        assert_eq!(s.create_indexes(&ns, vec![doc! { "key": { "email": 1 } }]).unwrap(), 0, "identical after unhiding");
     }
 
     #[test]
@@ -897,7 +1023,7 @@ mod tests {
         let upserted = Namespace::new("t", "upserted");
         s.update(&upserted, &doc! { "k": 1 }, &doc! { "$set": { "a": 1 } }, false, true).unwrap();
         s.replace(&Namespace::new("t", "replaced"), &doc! { "_id": 1 }, doc! { "a": 1 }, true).unwrap();
-        s.create_indexes(&Namespace::new("t", "indexed"), vec![doc! { "key": { "a": 1 } }]);
+        s.create_indexes(&Namespace::new("t", "indexed"), vec![doc! { "key": { "a": 1 } }]).unwrap();
         let names: Vec<String> = s.list_collections("t").into_iter().map(|c| c.name).collect();
         assert_eq!(names, ["indexed", "replaced", "upserted"]);
     }
@@ -954,7 +1080,7 @@ mod tests {
     /// way gives.
     #[test]
     fn short_cuts_give_what_the_general_way_gives() {
-        let s = MockStore::demo();
+        let s = MockStore::test_data();
         let ns = Namespace::new("demo-games", "bet_logs");
         let all = s.find(&ns, &doc! {}, None, None, 0, None).unwrap();
         let pending: Vec<Document> = all.iter().filter(|d| d.get_str("status").ok() == Some("pending")).cloned().collect();
@@ -980,7 +1106,7 @@ mod tests {
     #[test]
     #[ignore = "timing; run explicitly in release mode"]
     fn report_mock_time() {
-        let mut s = MockStore::demo();
+        let mut s = MockStore::test_data();
         let ns = Namespace::new("demo-games", "bet_logs");
         let docs = s.find(&ns, &doc! {}, None, None, 0, None).unwrap();
         let time = |what: &str, f: &mut dyn FnMut() -> usize| {

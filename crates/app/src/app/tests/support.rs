@@ -225,12 +225,13 @@ pub(super) fn history_sent(app: &RongoApp, kind: HistoryReq) -> bool {
 }
 
 /// Clicks the middle of the first drawn text that `pick` accepts.
-pub(super) fn click_text(ctx: &egui::Context, app: &mut RongoApp, what: &str, pick: impl Fn(&str) -> bool) {
-    click_text_with(ctx, app, what, egui::PointerButton::Primary, pick);
+pub(super) fn click_text(ctx: &egui::Context, app: &mut RongoApp, what: &str, pick: impl Fn(&str) -> bool) -> Vec<String> {
+    click_text_with(ctx, app, what, egui::PointerButton::Primary, pick)
 }
 
-/// `click_text` with `button` (`Secondary`: a right-click, its menu then opens).
-pub(super) fn click_text_with(ctx: &egui::Context, app: &mut RongoApp, what: &str, button: egui::PointerButton, pick: impl Fn(&str) -> bool) {
+/// `click_text` with `button` (`Secondary`: a right-click, its menu then
+/// opens). Returns what the click copied to the clipboard.
+pub(super) fn click_text_with(ctx: &egui::Context, app: &mut RongoApp, what: &str, button: egui::PointerButton, pick: impl Fn(&str) -> bool) -> Vec<String> {
     let mut frame = eframe::Frame::_new_kittest();
     let mut at = None;
     // A new modal is drawn from its second frame.
@@ -241,12 +242,18 @@ pub(super) fn click_text_with(ctx: &egui::Context, app: &mut RongoApp, what: &st
     }
     let at = at.unwrap_or_else(|| panic!("{what} is drawn"));
     let press = |pressed| egui::Event::PointerButton { pos: at, button, pressed, modifiers: Modifiers::NONE };
+    let mut copied = Vec::new();
     for events in [vec![egui::Event::PointerMoved(at)], vec![press(true)], vec![press(false)], vec![]] {
         let mut input = frame_input();
         input.events = events;
         let mut out = ctx.run_ui(input, |ui| eframe::App::ui(app, ui, &mut frame));
         out.textures_delta.clear();
+        copied.extend(out.platform_output.commands.into_iter().filter_map(|c| match c {
+            egui::OutputCommand::CopyText(t) => Some(t),
+            _ => None,
+        }));
     }
+    copied
 }
 
 /// Opens Settings and waits until it has measured the history.

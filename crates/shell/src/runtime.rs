@@ -1050,8 +1050,9 @@ fn db_op(st: &mut State, s: &Session, op: &str, a: &mut Json) -> Result<Json, Fa
             Ok(Json::Array(colls.into_iter().map(|c| json!({ "name": c.name, "type": kind(c.kind) })).collect()))
         }
         "create_index" => {
-            let name = wait(&stop, s, conn.create_index(&ns_arg(a)?, doc_arg(a, "keys")?, opt_doc(a, "options")?))?;
-            Ok(json!(name))
+            // The name, built or already there, as mongosh returns it.
+            let index = wait(&stop, s, conn.create_index(&ns_arg(a)?, doc_arg(a, "keys")?, opt_doc(a, "options")?))?;
+            Ok(json!(index.name))
         }
         "get_indexes" => Ok(docs_json(wait(&stop, s, conn.list_indexes(&ns_arg(a)?))?)),
         "drop_index" => {

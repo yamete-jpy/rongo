@@ -354,9 +354,10 @@ async fn run(reg: &Registry, conn_id: Option<ConnId>, cmd: Command, progress: &P
             reg.conn(conn_id)?.duplicate_collection(&ns, &to, progress, cancel).await?;
             Ok(Event::Done)
         }
+        // `existingIndex`: an identical index was already there, nothing was built.
         Command::CreateIndex { ns, keys, options } => {
-            let name = reg.conn(conn_id)?.create_index(&ns, keys, options).await?;
-            Ok(Event::Document(doc! { "createdIndex": name }))
+            let index = reg.conn(conn_id)?.create_index(&ns, keys, options).await?;
+            Ok(Event::Document(if index.created { doc! { "createdIndex": index.name } } else { doc! { "existingIndex": index.name } }))
         }
         Command::DropIndex { ns, name } => {
             reg.conn(conn_id)?.drop_index(&ns, &name).await?;

@@ -35,8 +35,10 @@ pub const MAX_BODY: usize = 1 << 20;
 /// How often rongo asks, at most.
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
-/// The Homebrew line's command (macOS).
-pub const BREW_UPGRADE: &str = "brew upgrade --cask rongo";
+/// The Homebrew line's command (macOS). `brew update` first: `brew upgrade`
+/// alone may not see the new release yet (Homebrew refreshes its copy of
+/// the tap at most daily, and says nothing when that fails).
+pub const BREW_UPGRADE: &str = "brew update && brew upgrade --cask rongo";
 
 /// A release's number, compared number by number (0.1.10 is newer than 0.1.9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -221,6 +223,8 @@ pub enum BannerAction {
     Open,
     /// Later: hide it until a newer version is out.
     Later,
+    /// Copy: the Homebrew command to the clipboard (macOS).
+    CopyBrew,
 }
 
 /// The banner's message.
@@ -252,7 +256,15 @@ pub fn banner(ui: &mut Ui, release: &Release) -> Option<BannerAction> {
                         part.append_to(&mut line, &style, egui::FontSelection::Default, Align::Center);
                     }
                     ui.add_space(6.0);
-                    ui.add(egui::Label::new(line).truncate());
+                    // The line in what Copy leaves, cut short rather than
+                    // pushing Copy off.
+                    let copy = format!("{}  Copy", icon::COPY);
+                    let copy_w = egui::WidgetText::from(copy.as_str()).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Button).size().x + 2.0 * ui.spacing().button_padding.x;
+                    let room = (ui.available_width() - copy_w - ui.spacing().item_spacing.x).max(0.0);
+                    ui.allocate_ui_with_layout(egui::vec2(room, ui.available_height()), Layout::left_to_right(Align::Center), |ui| ui.add(egui::Label::new(line).truncate()));
+                    if ui.add(egui::Button::new(copy).small()).on_hover_text("Copy the command").clicked() {
+                        action = Some(BannerAction::CopyBrew);
+                    }
                 }
             });
         });
@@ -455,17 +467,14 @@ mod tests {
         assert!(!offer(&release(v(0, 1, 6)), running, Some(v(0, 1, 7))), "older than the one Later hid");
     }
 
-    /// The banner: the message, Open Download Page and Later, all on screen
-    /// in the narrowest window; the Homebrew line only on macOS.
-    #[test]
-    fn the_banner_names_the_version_and_offers_the_page_and_later() {
+    /// The banner drawn in a window `width` wide: each text and where.
+    fn draw_banner(width: f32) -> Vec<(String, egui::Rect)> {
         let ctx = egui::Context::default();
         theme::install(&ctx);
         let release = Release { version: v(0, 1, 6), url: LATEST_PAGE.into() };
-        let size = egui::vec2(960.0, 80.0);
         let mut drawn = Vec::new();
         for _ in 0..3 {
-            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() };
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 80.0))), ..Default::default() };
             let mut out = ctx.run_ui(input, |ui| _ = banner(ui, &release));
             out.textures_delta.clear();
             drawn = out.shapes.iter().filter_map(|s| match &s.shape {
@@ -473,21 +482,37 @@ mod tests {
                 _ => None,
             }).collect::<Vec<_>>();
         }
-        let texts: Vec<&str> = drawn.iter().map(|(t, _)| t.as_str()).collect();
-        for want in ["rongo 0.1.6 is available.", "Open Download Page", "Later"] {
-            assert!(texts.contains(&want), "{want}: {texts:?}");
+        drawn
+    }
+
+    /// The banner: the message, Open Download Page and Later, all on screen
+    /// in the narrowest window; the Homebrew line only on macOS, with Copy
+    /// after it, which stays whole when the line is cut short.
+    #[test]
+    fn the_banner_names_the_version_and_offers_the_page_and_later() {
+        let copy = format!("{}  Copy", icon::COPY);
+        for width in [960.0, 1440.0] {
+            let drawn = draw_banner(width);
+            let texts: Vec<&str> = drawn.iter().map(|(t, _)| t.as_str()).collect();
+            for want in ["rongo 0.1.6 is available.", "Open Download Page", "Later"] {
+                assert!(texts.contains(&want), "{want}: {texts:?}");
+            }
+            for (text, rect) in &drawn {
+                assert!(rect.left() >= 0.0 && rect.right() <= width, "{text} is inside the window: {rect:?}");
+            }
+            let at = |want: &str| drawn.iter().find(|(t, _)| t == want).unwrap_or_else(|| panic!("{want}: {texts:?}")).1;
+            assert!(at("rongo 0.1.6 is available.").left() < at("Open Download Page").left() && at("Open Download Page").left() < at("Later").left(), "the message, then the buttons on the right");
+            let line = drawn.iter().find(|(t, _)| t.starts_with("Installed with Homebrew?"));
+            if cfg!(target_os = "macos") {
+                let (text, line) = line.unwrap_or_else(|| panic!("the Homebrew line: {texts:?}"));
+                if width > 1000.0 {
+                    assert_eq!(text, "Installed with Homebrew? Run brew update && brew upgrade --cask rongo.");
+                }
+                assert!(line.right() <= at(&copy).left() && at(&copy).right() <= at("Open Download Page").left(), "Copy after the line, before the buttons: {line:?} {:?}", at(&copy));
+            } else {
+                assert!(line.is_none() && !texts.contains(&copy.as_str()), "Homebrew is macOS only: {texts:?}");
+            }
         }
-        let brew = texts.iter().find(|t| t.contains(BREW_UPGRADE));
-        if cfg!(target_os = "macos") {
-            assert_eq!(brew, Some(&"Installed with Homebrew? Run brew upgrade --cask rongo."), "{texts:?}");
-        } else {
-            assert_eq!(brew, None, "Homebrew is macOS only: {texts:?}");
-        }
-        for (text, rect) in &drawn {
-            assert!(rect.left() >= 0.0 && rect.right() <= size.x, "{text} is inside the window: {rect:?}");
-        }
-        let x = |want: &str| drawn.iter().find(|(t, _)| t == want).unwrap().1.left();
-        assert!(x("rongo 0.1.6 is available.") < x("Open Download Page") && x("Open Download Page") < x("Later"), "the message, then the buttons on the right");
     }
 
     /// The bookkeeping Settings keeps reads back; text that isn't a time or

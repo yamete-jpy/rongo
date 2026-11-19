@@ -17,8 +17,9 @@ use crate::theme;
 pub enum IndexAction {
     Add(ConnId, Namespace),
     Drop(ConnId, Namespace, String),
+    /// Edit index and View details: the index as the server listed it.
     Edit(ConnId, Namespace, Document),
-    View(Document),
+    View(ConnId, Namespace, Document),
     SetHidden(ConnId, Namespace, String, bool),
 }
 
@@ -171,7 +172,7 @@ impl IndexTab {
         ui.add_space(4.0);
 
         // What the toolbar needs of the selected index (its spec is cloned
-        // only for Edit, when clicked).
+        // only for Edit or View, when clicked).
         let sel = self.selected_spec();
         let has_sel = sel.is_some();
         let sel_name = sel.and_then(|s| s.get_str("name").ok().map(str::to_string));
@@ -199,16 +200,16 @@ impl IndexTab {
             let can_edit = !locked && has_sel && (has_ttl || !is_id);
             if why(ui
                 .add_enabled(can_edit, egui::Button::new(format!("{}  Edit index", icon::PENCIL_SIMPLE)))
-                .on_hover_text("MongoDB can change only the TTL and whether an index is hidden"))
+                .on_hover_text("Changes only the TTL and whether an index is hidden; its Add as New Index… makes a new index for anything else"))
                 .clicked()
                 && let Some(s) = self.selected_spec()
             {
                 actions.push(IndexAction::Edit(conn_id, ns.clone(), s.clone()));
             }
             if ui.add_enabled(has_sel, egui::Button::new(format!("{}  View details", icon::FILE_TEXT))).clicked()
-                && let Some(i) = self.selected.and_then(|i| self.items.as_ref()?.get(i))
+                && let Some(s) = self.selected_spec()
             {
-                actions.push(IndexAction::View(details_doc(i)));
+                actions.push(IndexAction::View(conn_id, ns.clone(), s.clone()));
             }
             let label = if hidden { format!("{}  Unhide index", icon::EYE) } else { format!("{}  Hide index", icon::EYE_SLASH) };
             if why(ui
@@ -220,7 +221,7 @@ impl IndexTab {
                 actions.push(IndexAction::SetHidden(conn_id, ns.clone(), n.clone(), !hidden));
             }
             ui.label(RichText::new(icon::INFO).color(theme::ACCENT)).on_hover_text(
-                "To change an index's keys or options, drop it and add it again.\nUsage counts operations since the server started (needs the indexStats privilege).",
+                "To change an index's keys or options, Add as New Index… (in Edit index or View details) makes a new index from it; then drop the old one.\nUsage counts operations since the server started (needs the indexStats privilege).",
             );
             if self.loading.is_some() {
                 ui.spinner();
@@ -302,7 +303,7 @@ impl IndexTab {
                 resp.context_menu(|ui| {
                     self.selected = Some(i);
                     if ui.button(format!("{}  View details", icon::FILE_TEXT)).clicked() {
-                        actions.push(IndexAction::View(details_doc(info)));
+                        actions.push(IndexAction::View(self.conn, self.ns.clone(), spec.clone()));
                         ui.close();
                     }
                     if ui.button(format!("{}  Copy keys", icon::CLIPBOARD_TEXT)).clicked() {
@@ -327,16 +328,6 @@ impl IndexTab {
         self.items = Some(items);
         self.rows = rows;
     }
-}
-
-/// Everything known about one index, for View details.
-fn details_doc(i: &IndexInfo) -> Document {
-    let mut d = i.spec.clone();
-    if let Some(s) = i.size {
-        d.insert("size", format!("{} ({s} bytes)", format::human_bytes(s)));
-    }
-    d.insert("usage", usage_text(i));
-    d
 }
 
 #[cfg(test)]

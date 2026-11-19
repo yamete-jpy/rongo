@@ -12,7 +12,7 @@ use crate::tabs::TabKind;
 
 use super::RongoApp;
 use super::ops::answer_of;
-use super::outcome::{copy_summary, copy_toast, copy_troubled, move_failed, outcome_text, troubled};
+use super::outcome::{copy_summary, copy_toast, copy_troubled, did_nothing, move_failed, outcome_text, troubled};
 
 impl RongoApp {
     pub(super) fn handle(&mut self, r: Response) {
@@ -437,7 +437,8 @@ impl RongoApp {
                 let detail = outcome_text(&ev);
                 // A write that stopped (⊗) didn't finish, and one the server
                 // did not confirm may not have: no "… finished" / "… saved".
-                let unfinished = matches!(&ev, Event::Written(w) if w.cancelled || w.unconfirmed);
+                // Nor "Index created" for an index that was already there.
+                let unfinished = matches!(&ev, Event::Written(w) if w.cancelled || w.unconfirmed) || did_nothing(&ev);
                 let text = if unfinished {
                     detail
                 } else if detail == "Done" {

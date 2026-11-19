@@ -183,6 +183,40 @@ fn read_only_views_offer_no_writes() {
     assert!(acts.iter().any(|a| matches!(a, ViewAction::Delete { .. })), "Delete");
 }
 
+/// A page on its way shows in the status bar (once it takes a moment), not
+/// as a spinner beside the view picker as well. (Only an empty view, still
+/// waiting for its first page, has one: in the middle, where rows go.)
+#[test]
+fn a_loading_page_has_no_spinner_by_the_view_picker() {
+    use egui_kittest::Harness;
+    use egui::accesskit::Role;
+    use egui_kittest::kittest::Queryable;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+    let core = rongo_core::CoreHandle::start(rt.handle().clone(), Arc::new(|| {}));
+    let mut v = ResultView::new(1, "c", Source::Find { conn: ConnId(uuid::Uuid::nil()), spec: FindSpec::all(Namespace::new("db", "c"), 50), max: None });
+    // Rows on screen, the page asked for again (a refresh).
+    v.rows = Docs::from_docs(&[doc! { "_id": 1, "a": 1 }]);
+    v.paging.needs_fetch = true;
+    struct State {
+        view: ResultView,
+        pending: HashMap<RequestId, crate::net::Sent>,
+        next: u64,
+    }
+    let mut h = Harness::builder().with_size(vec2(900.0, 500.0)).build_ui_state(
+        |ui, st: &mut State| {
+            let mut net = Net { core: &core, pending: &mut st.pending, next_view_id: &mut st.next, keys_enabled: true };
+            st.view.ui(ui, &mut net);
+        },
+        State { view: v, pending: HashMap::new(), next: 0 },
+    );
+    h.run_steps(2);
+    assert!(h.state().view.paging.loading.is_some(), "the page was asked for (nothing answers it here)");
+    assert_eq!(h.state().view.rows.len(), 1, "the rows stay while it loads");
+    assert_eq!(h.query_all_by_role(Role::ProgressIndicator).count(), 0);
+}
+
 /// A page request discarded from the status bar stops the spinner and
 /// keeps the rows already on screen.
 #[test]

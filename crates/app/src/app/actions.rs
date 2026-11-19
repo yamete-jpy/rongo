@@ -57,9 +57,23 @@ impl RongoApp {
     /// Open Add Index with the collection's field names for the picker,
     /// sampling them first if they are not known yet.
     pub(super) fn add_index_dialog(&mut self, conn: ConnId, ns: Namespace) {
-        let known = self.conns.get(&conn).and_then(|c| c.fields.get(&ns).cloned());
-        self.sample_fields(conn, &ns);
-        self.tool = Some(ToolDialog::index(conn, ns, known.unwrap_or_default()));
+        let known = self.known_fields(conn, &ns);
+        self.tool = Some(ToolDialog::index(conn, ns, known));
+    }
+
+    /// Add as New Index…: Add Index filled from `spec` (an index as the
+    /// server listed it), its name left empty. Nothing is dropped.
+    pub(super) fn add_index_as_new(&mut self, conn: ConnId, ns: Namespace, spec: &Document) {
+        let known = self.known_fields(conn, &ns);
+        self.tool = Some(ToolDialog::index_as_new(conn, ns, known, spec));
+    }
+
+    /// The collection's field names for Add Index's picker, as far as
+    /// known; a sample is asked for if they are not.
+    fn known_fields(&mut self, conn: ConnId, ns: &Namespace) -> Vec<String> {
+        let known = self.conns.get(&conn).and_then(|c| c.fields.get(ns).cloned());
+        self.sample_fields(conn, ns);
+        known.unwrap_or_default()
     }
 
     pub(super) fn index_action(&mut self, a: IndexAction) {
@@ -70,7 +84,7 @@ impl RongoApp {
                 self.confirm = Some(Confirm::new("Drop Index", msg, "Drop", Pending::DropIndex { conn, ns, name }).danger());
             }
             IndexAction::Edit(conn, ns, spec) => self.tool = Some(ToolDialog::edit_index(conn, ns, &spec)),
-            IndexAction::View(doc) => self.view_doc = Some(ViewDocDialog::new(&doc)),
+            IndexAction::View(conn, ns, spec) => self.tool = Some(ToolDialog::view_index(conn, ns, &spec)),
             IndexAction::SetHidden(conn, ns, name, hidden) => {
                 let origin = Origin::TreeWrite { conn, db: ns.db.clone() };
                 let cmd = Command::ModifyIndex { ns, name, hidden: Some(hidden), expire_after_seconds: None };
@@ -288,6 +302,7 @@ impl RongoApp {
             Pending::SaveSettings(s) => self.save_settings(*s),
             Pending::DeleteProfile { id } => self.delete_profile(id, ticked),
             Pending::ResetVault => self.reset_vault(ticked),
+            Pending::CloseTabs { ids, focus } => self.close_tab_ids(&ids, focus),
             Pending::WithoutHistory { origin, conn, cmd, name } => self.send_without_history(origin, conn, *cmd, &name, &input),
         }
     }

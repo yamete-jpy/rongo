@@ -17,6 +17,7 @@ use crate::theme;
 use crate::vault_ui;
 
 use super::RongoApp;
+use super::tab_ops::CloseWhich;
 
 impl RongoApp {
     pub(super) fn toolbar(&mut self, ui: &mut Ui) {
@@ -107,6 +108,8 @@ impl RongoApp {
         let mut close = None;
         let mut scrolled = None;
         let mut pick = None;
+        let mut menu = None;
+        let count = self.tabs.len();
         ui.horizontal(|ui| {
         // Room on the right for the list of every tab, when they overflow.
         let list_w = 30.0;
@@ -126,6 +129,12 @@ impl RongoApp {
                         if r.middle_clicked() {
                             close = Some(i);
                         }
+                        let conn_name = tab.conn().and_then(|c| conns.get(&c)).map(|c| c.profile.name.as_str());
+                        r.context_menu(|ui| {
+                            if let Some(which) = tab_menu(ui, i, count, conn_name) {
+                                menu = Some((i, which));
+                            }
+                        });
                         if ui.add(egui::Button::new(RichText::new(icon::X).size(11.0).color(theme::MUTED)).frame(false)).clicked() {
                             close = Some(i);
                         }
@@ -167,6 +176,8 @@ impl RongoApp {
         }
         if let Some(i) = close {
             self.close_tab(i);
+        } else if let Some((i, which)) = menu {
+            self.close_from_menu(i, which);
         }
     }
 
@@ -345,9 +356,12 @@ impl RongoApp {
             self.view_doc = None;
         }
         if let Some(t) = &mut self.tool {
+            t.read_only = self.conns.get(&t.conn).is_some_and(|c| c.profile.read_only);
+            let conn = t.conn;
             match t.show(ctx) {
                 Some(ToolAction::Close) => self.tool = None,
                 Some(ToolAction::Send(cmd)) => self.tool_send(cmd),
+                Some(ToolAction::AddAsNew(ns, spec)) => self.add_index_as_new(conn, ns, &spec),
                 None => {}
             }
         }
@@ -389,12 +403,16 @@ impl RongoApp {
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Comma)) {
             self.open_settings();
         }
-        // A result view under the pointer, or with its find bar focused,
-        // claimed ⌘F last frame for its own find bar. The sidebar wins when
-        // the pointer is over it.
+        // With the keyboard focus in the script of the IntelliShell tab on
+        // screen (or in its find bar's field), ⌘F finds in the script,
+        // wherever the pointer is: the tab takes it. Otherwise a result view
+        // under the pointer, or with its find bar focused, claimed ⌘F last
+        // frame for its own find bar. The sidebar wins when the pointer is
+        // over it.
+        let in_script = matches!(self.tabs.get(self.active_tab).map(|t| &t.kind), Some(TabKind::Shell(s)) if s.script_has_keys(ctx));
         let view_wants_find = ctx.data_mut(|d| d.remove_temp::<bool>(egui::Id::new(crate::result_view::FIND_CLAIM))).unwrap_or(false);
         let over_sidebar = self.sidebar.open && ctx.pointer_hover_pos().is_some_and(|p| self.sidebar_rect.contains(p));
-        if (over_sidebar || !view_wants_find) && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F)) {
+        if !in_script && (over_sidebar || !view_wants_find) && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F)) {
             self.sidebar.open = true;
             ctx.memory_mut(|m| m.request_focus(egui::Id::new("tree-search")));
         }
@@ -450,4 +468,25 @@ fn take_shift_command_at(ctx: &egui::Context, place: Key) -> bool {
         let at = |e: &egui::Event| matches!(e, egui::Event::Key { key, physical_key, pressed: true, modifiers, .. } if (*key == place || *physical_key == Some(place)) && modifiers.matches_logically(Modifiers::COMMAND | Modifiers::SHIFT));
         i.events.extract_if(.., |e| at(e)).count() > 0
     })
+}
+
+/// Tab `i`'s right-click menu (of `count` tabs): its closes. `conn_name`:
+/// the tab's connection, for Close Tabs of it.
+fn tab_menu(ui: &mut Ui, i: usize, count: usize, conn_name: Option<&str>) -> Option<CloseWhich> {
+    let mut picked = None;
+    let mut item = |ui: &mut Ui, enabled: bool, button: egui::Button, which: CloseWhich| {
+        if ui.add_enabled(enabled, button).clicked() {
+            picked = Some(which);
+            ui.close();
+        }
+    };
+    item(ui, true, egui::Button::new("Close").shortcut_text(shortcut::label("⌘W")), CloseWhich::This);
+    item(ui, count > 1, egui::Button::new("Close Others"), CloseWhich::Others);
+    item(ui, i + 1 < count, egui::Button::new("Close Tabs to the Right"), CloseWhich::ToTheRight);
+    ui.separator();
+    if let Some(name) = conn_name {
+        item(ui, true, egui::Button::new(format!("Close Tabs of {name}")), CloseWhich::OfConnection);
+    }
+    item(ui, true, egui::Button::new("Close All"), CloseWhich::All);
+    picked
 }

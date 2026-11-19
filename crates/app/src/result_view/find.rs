@@ -47,13 +47,21 @@ pub(crate) struct Asked {
     pub(crate) close: bool,
 }
 
+/// About the width of what follows a find bar's field: Aa, ↑, ↓, "n of m"
+/// and ✕, with the spaces between them (182 points with "1 of 3", about 35
+/// more with "No matches").
+const AFTER_FIELD: f32 = 230.0;
+
 impl Bar<'_> {
     /// ↩ and ⇧↩ in the field step through the matches (the field keeps its
-    /// focus), Esc in it closes the bar, as ✕ does.
+    /// focus), Esc in it closes the bar, as ✕ does. The field takes the room
+    /// the rest of the bar leaves (120 to 280 points), and what still
+    /// doesn't fit goes on to another row: the bar never widens what it is
+    /// in.
     pub(crate) fn show(self, ui: &mut Ui) -> Asked {
         let Bar { id, hint, text, case, focus, any, status } = self;
         let mut asked = Asked::default();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(icon::MAGNIFYING_GLASS).color(theme::MUTED));
             if std::mem::take(focus) {
                 // Focused before it is drawn: a field drawn without the
@@ -63,7 +71,9 @@ impl Bar<'_> {
                 state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(text.chars().count()))));
                 state.store(ui.ctx(), id);
             }
-            let r = ui.add(egui::TextEdit::singleline(text).id(id).hint_text(hint).desired_width(280.0));
+            // What is left of this row (`available_width` is a whole row's here).
+            let width = (ui.available_size_before_wrap().x - AFTER_FIELD).clamp(120.0, 280.0);
+            let r = ui.add(egui::TextEdit::singleline(text).id(id).hint_text(hint).desired_width(width));
             // Read before the focus is asked back: after `request_focus`
             // in the same frame, `lost_focus` is never true.
             if r.lost_focus() {

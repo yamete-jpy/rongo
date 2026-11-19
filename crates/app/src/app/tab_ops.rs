@@ -3,6 +3,7 @@
 use rongo_core::bson::Document;
 use rongo_core::{Command, ConnId, FindSpec, Namespace};
 
+use crate::dialogs::{Confirm, Pending};
 use crate::indexes::IndexTab;
 use crate::net::{HistoryReq, Origin};
 use crate::result_view::{Mode, ResultView, Source};
@@ -10,7 +11,78 @@ use crate::tabs::{CollectionTab, ShellTab, Tab, TabKind};
 
 use super::RongoApp;
 
+/// What a tab's right-click menu closes, from the tab right-clicked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CloseWhich {
+    This,
+    Others,
+    ToTheRight,
+    /// Every tab of its connection.
+    OfConnection,
+    All,
+}
+
 impl RongoApp {
+    /// The tab menu's closes, from tab `i`. Close is the tab's ✕. The
+    /// others close several: a tab running a script stays (said once), and
+    /// when shell tabs holding a script would close, it asks first, since
+    /// a script goes with its tab.
+    pub(super) fn close_from_menu(&mut self, i: usize, which: CloseWhich) {
+        let Some(tab) = self.tabs.get(i) else { return };
+        if which == CloseWhich::This {
+            return self.close_tab(i);
+        }
+        let (id, conn) = (tab.id, tab.conn());
+        let ids: Vec<u64> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(k, t)| match which {
+                CloseWhich::This => *k == i,
+                CloseWhich::Others => *k != i,
+                CloseWhich::ToTheRight => *k > i,
+                CloseWhich::OfConnection => conn.is_some() && t.conn() == conn,
+                CloseWhich::All => true,
+            })
+            .map(|(_, t)| t.id)
+            .collect();
+        // The tab right-clicked is shown if the active one closes.
+        let focus = Some(id);
+        let scripts = self.tabs.iter().filter(|t| ids.contains(&t.id) && matches!(&t.kind, TabKind::Shell(s) if s.has_script() && !s.is_running())).count();
+        if ids.len() > 1 && scripts > 0 {
+            let lost = if scripts == 1 { "The script in 1 IntelliShell tab closes with it.".to_string() } else { format!("The scripts in {scripts} IntelliShell tabs close with them.") };
+            let msg = format!("Close {} tabs? {lost}", ids.len());
+            self.confirm = Some(Confirm::new("Close Tabs", msg, "Close", Pending::CloseTabs { ids, focus }));
+            return;
+        }
+        self.close_tab_ids(&ids, focus);
+    }
+
+    /// Closes the tabs with these ids that are still open, except one
+    /// running a script: those stay, said once. The active tab stays active
+    /// if it is left; if not, `focus` is shown when it is left.
+    pub(super) fn close_tab_ids(&mut self, ids: &[u64], focus: Option<u64>) {
+        let active = self.tabs.get(self.active_tab).map(|t| t.id);
+        let mut running = 0;
+        for id in ids {
+            let Some(i) = self.tabs.iter().position(|t| t.id == *id) else { continue };
+            if matches!(&self.tabs[i].kind, TabKind::Shell(s) if s.is_running()) {
+                running += 1;
+                continue;
+            }
+            self.close_tab(i);
+        }
+        let position = |id: Option<u64>| id.and_then(|id| self.tabs.iter().position(|t| t.id == id));
+        if let Some(i) = position(active).or_else(|| position(focus)) {
+            self.active_tab = i;
+        }
+        match running {
+            0 => {}
+            1 => self.toast("1 tab stays open: its script is running", true),
+            n => self.toast(format!("{n} tabs stay open: their scripts are running"), true),
+        }
+    }
+
     /// The collection tab's view for `ns`, if one is open.
     pub(super) fn view_for(&self, conn: ConnId, ns: &Namespace) -> Option<u64> {
         self.tabs.iter().find_map(|t| match &t.kind {

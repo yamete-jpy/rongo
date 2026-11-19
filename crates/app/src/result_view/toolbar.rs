@@ -183,16 +183,13 @@ impl ResultView {
         }
     }
 
+    /// Table, Tree or JSON. A page on its way shows in the status bar, not here.
     fn mode_picker(&mut self, ui: &mut Ui) {
-        let loading = self.paging.loading.is_some();
         egui::ComboBox::from_id_salt((self.id, "mode")).width(110.0).selected_text(self.mode.label()).show_ui(ui, |ui| {
             for m in [Mode::Table, Mode::Tree, Mode::Json] {
                 ui.selectable_value(&mut self.mode, m, m.label());
             }
         });
-        if loading {
-            ui.spinner();
-        }
     }
 
     pub(super) fn breadcrumb(&mut self, ui: &mut Ui) {

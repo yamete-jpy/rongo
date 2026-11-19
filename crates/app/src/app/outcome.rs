@@ -87,14 +87,22 @@ pub(super) fn outcome_text(ev: &Event) -> String {
         }
         Event::Exported { count, path } => format!("Exported {} document{} to {}", thousands(*count), plural(*count), path.display()),
         Event::Document(d) if d.contains_key("createdIndex") => format!("Created index {}", d.get_str("createdIndex").unwrap_or("?")),
+        Event::Document(d) if d.contains_key("existingIndex") => format!("Index {} already exists; nothing was created", d.get_str("existingIndex").unwrap_or("?")),
         _ => "Done".into(),
     }
 }
 
+/// Whether an outcome says the write did nothing: an index that was
+/// already there, identical (its toast mustn't read "… created").
+pub(super) fn did_nothing(ev: &Event) -> bool {
+    matches!(ev, Event::Document(d) if d.contains_key("existingIndex"))
+}
+
 /// Whether a write's outcome carries a problem to show as an error: a
-/// recorded write that stopped on one, or whose history may be incomplete.
+/// recorded write that stopped on one, or whose history may be incomplete;
+/// or an index that already existed, so nothing was created.
 pub(super) fn troubled(ev: &Event) -> bool {
-    matches!(ev, Event::Written(w) if w.warning.is_some() || w.unconfirmed)
+    matches!(ev, Event::Written(w) if w.warning.is_some() || w.unconfirmed) || did_nothing(ev)
 }
 
 /// What a restore did, for its toast, and whether to show it as an error:

@@ -1,6 +1,7 @@
-//! Find in the document dialogs (Edit / Add Document, View Document): ⌘F
-//! shows the JSON view's find bar above the text, the matches are marked
-//! behind it, and the current one is scrolled into view.
+//! Find in a text editor: the document dialogs (Edit / Add Document, View
+//! Document) and IntelliShell's script. ⌘F shows the JSON view's find bar
+//! above the text, the matches are marked behind it, and the current one is
+//! scrolled into view.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use crate::theme;
 /// they keep their size (and their buttons stay on a short window).
 pub const BAR_H: f32 = 30.0;
 
-/// A document dialog's find bar and what it found.
+/// A find bar over a text, and what it found.
 #[derive(Default)]
 pub struct DocFind {
     needle: String,
@@ -69,25 +70,60 @@ pub struct Edit {
     pub caret: usize,
 }
 
-/// The find bar of a document dialog, drawn where it is called (above the
-/// text). ⌘F opens it, or focuses its field again with what is typed
-/// selected. Esc or ✕ closes it and gives the focus to the text, the
-/// `TextEdit` `editor`; the dialog sees no Esc. From the bar (its field,
-/// its buttons, ✕), the text gets the current match selected; Esc pressed
-/// in the text leaves its caret and selection as they were. The keys are
-/// left alone while another dialog was over this one last frame. `text` is
-/// the document's text; `version` changes whenever it does.
-pub fn bar(find: &mut Option<DocFind>, ui: &mut Ui, editor: Id, text: &str, version: u64) {
+/// Where a find bar takes ⌘F and Esc.
+#[derive(Clone, Copy)]
+pub enum Keys {
+    /// A dialog's: anywhere in the dialog while no other dialog is over it,
+    /// and Esc while the bar is open, so the dialog never sees it then.
+    Dialog,
+    /// An editor's in the window (IntelliShell's script): only while the
+    /// text or the bar's field has the keyboard focus, and `enabled` (no
+    /// dialog open). Esc pressed in the text is left to it while
+    /// `text_esc` (its suggestions are open).
+    Focus { enabled: bool, text_esc: bool },
+}
+
+/// The id of the find bar's field over the text `editor`.
+pub fn field_id(editor: Id) -> Id {
+    editor.with("find")
+}
+
+/// The find bar over the text `editor` (a `TextEdit`), drawn where it is
+/// called (above the text), its field showing `hint`. ⌘F opens it, or
+/// focuses its field again with what is typed selected, where `keys` says.
+/// Esc or ✕ closes it and gives the focus to the text; nothing drawn after
+/// the bar sees that Esc. From the bar (its field, its buttons, ✕), the
+/// text gets the current match selected; Esc pressed in the text leaves
+/// its caret and selection as they were. The keys are left alone while a
+/// dialog was over this one last frame. `text` is the editor's text;
+/// `version` changes whenever it does.
+pub fn bar(find: &mut Option<DocFind>, ui: &mut Ui, editor: Id, hint: &str, keys: Keys, text: &str, version: u64) {
+    let field = field_id(editor);
     let on_top = ui.ctx().memory(|m| m.allows_interaction(ui.layer_id()));
-    if on_top && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F)) {
+    let (cmd_f, esc_ours) = match keys {
+        Keys::Dialog => (on_top, on_top),
+        // Esc has taken the focus from whatever had it: ask who had it.
+        Keys::Focus { enabled, text_esc } => ui.memory(|m| {
+            let on = on_top && enabled;
+            (on && (m.has_focus(editor) || m.has_focus(field)), on && (m.had_focus_last_frame(field) || (m.had_focus_last_frame(editor) && !text_esc)))
+        }),
+    };
+    if cmd_f && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F)) {
         find.get_or_insert_default().focus = true;
     }
     let Some(f) = find else { return };
     let status = if f.needle.is_empty() { Status::Empty } else { Status::Count { current: f.current, total: f.matches.len() } };
     let any = !f.matches.is_empty();
-    let Asked { step, close } = Bar { id: editor.with("find"), hint: "Find in this document", text: &mut f.needle, case: &mut f.case, focus: &mut f.focus, any, status }.show(ui);
-    // Taken here, before the dialog looks for it.
-    let esc = on_top && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+    let shown = ui.scope(|ui| Bar { id: field, hint, text: &mut f.needle, case: &mut f.case, focus: &mut f.focus, any, status }.show(ui));
+    let Asked { step, close } = shown.inner;
+    // A click anywhere on an editor's bar (Aa, ↑, ↓, the magnifier, between
+    // them) leaves the keys (⌘F, ↩, Esc) in its field: the click took the
+    // focus from it, and with the focus nowhere they wouldn't be the bar's.
+    if matches!(keys, Keys::Focus { .. }) && !close && ui.input(|i| i.pointer.primary_clicked()) && shown.response.contains_pointer() {
+        ui.memory_mut(|m| m.request_focus(field));
+    }
+    // Taken here, before the dialog (or a view drawn after the text) looks for it.
+    let esc = esc_ours && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
     if on_top && (close || esc) {
         // Esc has taken the focus from whatever had it: ask who had it.
         let in_text = !close && ui.memory(|m| m.had_focus_last_frame(editor));
@@ -108,6 +144,24 @@ pub fn bar(find: &mut Option<DocFind>, ui: &mut Ui, editor: Id, text: &str, vers
     }
 }
 
+/// Before the text `editor` is drawn, while the bar is open: where its
+/// selection begins. What is typed this frame leaves the text before it as
+/// it was.
+pub fn edit_from(find: &Option<DocFind>, ctx: &egui::Context, editor: Id) -> Option<usize> {
+    find.as_ref().and_then(|_| egui::TextEdit::load_state(ctx, editor)?.cursor.char_range()).map(|r| r.as_sorted_char_range().start.0)
+}
+
+/// After the text is drawn (`out`), when it was edited this frame (its
+/// `version` new): found again at once, so the marks drawn next are for
+/// this text. `from` is what `edit_from` said before it was drawn.
+pub fn edited(find: &mut Option<DocFind>, ctx: &egui::Context, text: &str, version: u64, from: Option<usize>, out: &egui::text_edit::TextEditOutput) {
+    if let Some(f) = find {
+        let caret = out.cursor_range.map(|r| r.primary.index.0);
+        let at = from.zip(caret).map(|(from, caret)| Edit { start: from.min(caret), caret });
+        f.update(ctx, text, version, at);
+    }
+}
+
 impl DocFind {
     /// Tests: an open bar with `needle` typed in it.
     #[cfg(test)]
@@ -119,6 +173,25 @@ impl DocFind {
     #[cfg(test)]
     pub fn needle_mut(&mut self) -> &mut String {
         &mut self.needle
+    }
+
+    /// Tests: what is typed in the bar.
+    #[cfg(test)]
+    pub fn needle(&self) -> &str {
+        &self.needle
+    }
+
+    /// The text was replaced by another (Load file, New): the next search
+    /// starts over, at its first match. (Where the old text was scrolled to
+    /// says nothing about the new one.)
+    pub fn restart(&mut self) {
+        self.searched = None;
+        self.top = 0;
+    }
+
+    /// The current match, as a character range, if any.
+    pub fn current(&self) -> Option<Range<usize>> {
+        self.matches.get(self.current).cloned()
     }
 
     /// Finds again when the needle, match case or the text (`version`)

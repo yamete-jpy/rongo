@@ -20,7 +20,8 @@ impl RongoApp {
         if !self.conns.contains_key(&cid) {
             self.connect(profile);
         }
-        self.open_shell(cid, Some("demo-games".into()), Some(demo_script()));
+        let (db, script) = rongo_core::mock::served_shell();
+        self.open_shell(cid, Some(db.into()), Some(shortcut::label(script).into_owned()));
         if let Some(TabKind::Shell(s)) = self.tabs.last_mut().map(|t| &mut t.kind) {
             s.run_when_ready = true;
         }
@@ -421,20 +422,4 @@ impl RongoApp {
         }
         Some(result)
     }
-}
-
-/// The demo shell's script, its shortcuts written for this OS.
-fn demo_script() -> String {
-    shortcut::label(r#"// IntelliShell runs mongosh-style JavaScript. ⌘↩ runs everything (or the
-// selection), ⇧⌘↩ runs the statement under the cursor. A find() you don't
-// read opens as a result tab you can page through.
-db.getCollection("advertisers").find({})
-
-db.bet_logs.find({ status: "pending", amount: { $gt: 1000 } }).sort({ amount: -1 })
-
-db.bet_logs.aggregate([
-    { $group: { _id: "$provider", bets: { $sum: 1 }, total: { $sum: "$amount" } } },
-    { $sort: { total: -1 } }
-])
-"#).into_owned()
 }

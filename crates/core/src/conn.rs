@@ -174,7 +174,7 @@ impl RawCursor {
 impl Conn {
     pub async fn open(req: &ConnectRequest) -> CoreResult<Conn> {
         if req.profile.is_mock() {
-            let conn = Conn::mock(MockStore::demo(), true);
+            let conn = Conn::mock(crate::mock::served(), true);
             conn.set_read_only(req.profile.read_only);
             return Ok(conn);
         }
@@ -627,7 +627,7 @@ impl Conn {
     /// definition goes to `createIndexes` unchanged, so options the driver's
     /// typed `IndexOptions` does not know (text weights, 2d bounds, …) still
     /// reach the server. Without a name, MongoDB's usual one is used.
-    pub async fn create_index(&self, ns: &Namespace, keys: Document, options: Option<Document>) -> CoreResult<String> {
+    pub async fn create_index(&self, ns: &Namespace, keys: Document, options: Option<Document>) -> CoreResult<CreatedIndex> {
         self.writable("create index")?;
         let mut spec = options.unwrap_or_default();
         let name = match spec.get_str("name") {
@@ -638,14 +638,10 @@ impl Conn {
         let mut index = doc! { "key": keys };
         index.extend(spec);
         match self {
-            Conn::Mock(m) => Self::with_mock(m, |s| {
-                s.create_indexes(ns, vec![index]);
-                Ok(name)
-            })
-            .await,
+            Conn::Mock(m) => Self::with_mock(m, |s| Ok(CreatedIndex { created: s.create_indexes(ns, vec![index])? > 0, name })).await,
             Conn::Real(c) => {
-                c.client.database(&ns.db).run_command(doc! { "createIndexes": &ns.coll, "indexes": [index] }).await?;
-                Ok(name)
+                let reply = c.client.database(&ns.db).run_command(doc! { "createIndexes": &ns.coll, "indexes": [index] }).await?;
+                Ok(CreatedIndex { created: !created_nothing(&reply), name })
             }
         }
     }
@@ -666,11 +662,7 @@ impl Conn {
             return Ok(());
         }
         match self {
-            Conn::Mock(m) => Self::with_mock(m, |s| {
-                s.create_indexes(ns, specs);
-                Ok(())
-            })
-            .await,
+            Conn::Mock(m) => Self::with_mock(m, |s| s.create_indexes(ns, specs).map(|_| ())).await,
             Conn::Real(c) => {
                 c.client.database(&ns.db).run_command(doc! { "createIndexes": &ns.coll, "indexes": specs }).await?;
                 Ok(())
@@ -887,17 +879,10 @@ impl Conn {
 
     pub async fn modify_index(&self, ns: &Namespace, name: &str, hidden: Option<bool>, ttl: Option<i64>) -> CoreResult<()> {
         self.writable("modify index")?;
-        let mut change = doc! { "name": name };
-        if let Some(h) = hidden {
-            change.insert("hidden", h);
-        }
-        if let Some(t) = ttl {
-            change.insert("expireAfterSeconds", t);
-        }
         match self {
             Conn::Mock(m) => Self::with_mock(m, |s| s.modify_index(ns, name, hidden, ttl)).await,
             Conn::Real(c) => {
-                c.client.database(&ns.db).run_command(doc! { "collMod": &ns.coll, "index": change }).await?;
+                c.client.database(&ns.db).run_command(modify_index_command(ns, name, hidden, ttl)).await?;
                 Ok(())
             }
         }
@@ -991,6 +976,47 @@ fn command_pipeline_writes(cmd: &Document) -> bool {
     match cmd.get_array("pipeline") {
         Ok(stages) => stages.iter().any(|s| s.as_document().is_none_or(|d| d.contains_key("$out") || d.contains_key("$merge"))),
         Err(_) => true,
+    }
+}
+
+/// The `collMod` that `Command::ModifyIndex` runs on `ns.db`: the index by
+/// name, with only what changes.
+pub fn modify_index_command(ns: &Namespace, name: &str, hidden: Option<bool>, ttl: Option<i64>) -> Document {
+    let mut change = doc! { "name": name };
+    if let Some(h) = hidden {
+        change.insert("hidden", h);
+    }
+    if let Some(t) = ttl {
+        change.insert("expireAfterSeconds", t);
+    }
+    doc! { "collMod": &ns.coll, "index": change }
+}
+
+/// What `create_index` did: the index's name (MongoDB's default when none
+/// was given), and whether it was built. `created: false` means an
+/// identical index was already there and the server built nothing ("all
+/// indexes already exist").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreatedIndex {
+    pub name: String,
+    pub created: bool,
+}
+
+/// Whether a `createIndexes` reply says nothing was built: it carries a
+/// `note` ("all indexes already exist"), or the index count didn't change.
+/// Through mongos each shard answers under `raw`: nothing was built when
+/// none of them built anything.
+pub fn created_nothing(reply: &Document) -> bool {
+    let count = |r: &Document, k: &str| match r.get(k) {
+        Some(Bson::Int32(n)) => Some(i64::from(*n)),
+        Some(Bson::Int64(n)) => Some(*n),
+        Some(Bson::Double(f)) => Some(*f as i64),
+        _ => None,
+    };
+    let one = |r: &Document| r.contains_key("note") || count(r, "numIndexesBefore").is_some_and(|b| Some(b) == count(r, "numIndexesAfter"));
+    match reply.get_document("raw") {
+        Ok(shards) if !shards.is_empty() => shards.values().all(|s| s.as_document().is_some_and(one)),
+        _ => one(reply),
     }
 }
 
@@ -1231,7 +1257,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_find_page_reports_more() {
-        let conn = Conn::mock(MockStore::demo(), false);
+        let conn = Conn::mock(MockStore::test_data(), false);
         let spec = FindSpec::all(Namespace::new("demo-games", "advertisers"), 3);
         let (docs, more) = conn.find_page(&spec).await.unwrap();
         assert_eq!((docs.len(), more), (3, true));
@@ -1246,16 +1272,43 @@ mod tests {
         let c = Conn::mock(MockStore::empty(), false);
         let ns = Namespace::new("t", "c");
         c.insert_one(&ns, doc! { "at": 1 }).await.unwrap();
-        let name = c.create_index(&ns, doc! { "at": 1 }, Some(doc! { "expireAfterSeconds": 60, "unique": true })).await.unwrap();
+        let name = c.create_index(&ns, doc! { "at": 1 }, Some(doc! { "expireAfterSeconds": 60, "unique": true })).await.unwrap().name;
         assert_eq!(name, "at_1");
         let indexes = c.list_indexes(&ns).await.unwrap();
         let index = indexes.iter().find(|i| i.get_str("name").ok() == Some("at_1")).expect("created");
         assert_eq!((index.get_document("key").unwrap(), index.get_i32("expireAfterSeconds").ok(), index.get_bool("unique").ok()), (&doc! { "at": 1 }, Some(60), Some(true)), "{index}");
         c.modify_index(&ns, "at_1", None, Some(120)).await.unwrap();
-        let named = c.create_index(&ns, doc! { "b": -1 }, Some(doc! { "name": "by_b", "sparse": true })).await.unwrap();
+        let named = c.create_index(&ns, doc! { "b": -1 }, Some(doc! { "name": "by_b", "sparse": true })).await.unwrap().name;
         assert_eq!(named, "by_b");
         let indexes = c.list_indexes(&ns).await.unwrap();
         assert!(indexes.iter().any(|i| i.get_str("name").ok() == Some("by_b") && i.get_bool("sparse").ok() == Some(true)), "{indexes:?}");
+    }
+
+    /// Creating an index that is already there, identical, builds nothing
+    /// and says so (the app must never report it as created); a different
+    /// one under the same name is refused.
+    #[tokio::test]
+    async fn create_index_says_when_nothing_was_built() {
+        let c = Conn::mock(MockStore::empty(), false);
+        let ns = Namespace::new("t", "c");
+        let built = |created| CreatedIndex { name: "email_1".into(), created };
+        assert_eq!(c.create_index(&ns, doc! { "email": 1 }, None).await.unwrap(), built(true));
+        assert_eq!(c.create_index(&ns, doc! { "email": 1 }, None).await.unwrap(), built(false), "already there");
+        let refused = c.create_index(&ns, doc! { "email": 1 }, Some(doc! { "unique": true })).await;
+        assert!(matches!(refused, Err(CoreError::Server { code: 85, .. })), "{refused:?}");
+        assert_eq!(c.list_indexes(&ns).await.unwrap().len(), 2);
+    }
+
+    /// A `createIndexes` reply that built nothing: a note, or the same
+    /// count before and after; through mongos, every shard's answer.
+    #[test]
+    fn create_indexes_replies_that_built_nothing() {
+        assert!(created_nothing(&doc! { "numIndexesBefore": 2, "numIndexesAfter": 2, "note": "all indexes already exist", "ok": 1.0 }));
+        assert!(created_nothing(&doc! { "numIndexesBefore": 2, "numIndexesAfter": 2, "ok": 1.0 }));
+        assert!(!created_nothing(&doc! { "numIndexesBefore": 1, "numIndexesAfter": 2, "createdCollectionAutomatically": false, "ok": 1.0 }));
+        let shard = |before: i32, after: i32| doc! { "numIndexesBefore": before, "numIndexesAfter": after, "ok": 1.0 };
+        assert!(created_nothing(&doc! { "raw": { "rs0/a:27018": shard(2, 2), "rs1/b:27018": shard(2, 2) }, "ok": 1.0 }));
+        assert!(!created_nothing(&doc! { "raw": { "rs0/a:27018": shard(2, 2), "rs1/b:27018": shard(1, 2) }, "ok": 1.0 }), "built on one shard");
     }
 
     /// Duplicate Collection makes the copy with the collection's options
@@ -1334,7 +1387,7 @@ mod tests {
     /// `explain` explains. Anything it can't check is refused.
     #[tokio::test]
     async fn read_only_commands_are_checked_inside() {
-        let c = Conn::mock(MockStore::demo(), false);
+        let c = Conn::mock(MockStore::test_data(), false);
         c.set_read_only(true);
         let db = "demo-games";
         let locked = |r: &CoreResult<Document>| matches!(r, Err(CoreError::ReadOnly(_)));
@@ -1381,7 +1434,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "timing; run explicitly in release mode"]
     async fn report_index_details_time() {
-        let c = Conn::mock(MockStore::demo(), true);
+        let c = Conn::mock(MockStore::test_data(), true);
         let ns = Namespace::new("demo-games", "bet_logs");
         let t = std::time::Instant::now();
         for _ in 0..30 {
@@ -1392,7 +1445,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_only_connections_refuse_every_write() {
-        let c = Conn::mock(MockStore::demo(), false);
+        let c = Conn::mock(MockStore::test_data(), false);
         c.set_read_only(true);
         assert!(c.is_read_only());
         let ns = Namespace::new("demo-games", "advertisers");

@@ -24,6 +24,8 @@ fi
 # The icon and version info are put into rongo.exe by crates/app/build.rs
 # (windres); the icon itself is assets/icon.ico (scripts/make-icon.py).
 . ./scripts/trim-paths.sh
+# The green leaf; other builds show an orange one (crates/app/src/main.rs).
+export RONGO_RELEASE=1
 cargo build --release --target x86_64-pc-windows-gnu -p rongo >&2
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 exe=target/x86_64-pc-windows-gnu/release/rongo.exe

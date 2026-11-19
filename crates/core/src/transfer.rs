@@ -879,7 +879,7 @@ mod tests {
     /// with '= survives CSV's formula defusing.
     #[tokio::test]
     async fn longs_and_quoted_formulas_round_trip() {
-        let conn = Conn::mock(MockStore::demo(), false);
+        let conn = Conn::mock(MockStore::test_data(), false);
         let ns = Namespace::new("types", "c");
         conn.insert_one(&ns, doc! { "_id": 1, "n": 5_i64, "big": 9_007_199_254_740_993_i64, "i": 7, "s": "'=x", "f": "=SUM(A1)" }).await.unwrap();
         let dir = std::env::temp_dir().join(format!("rongo-types-{}", std::process::id()));
@@ -1079,7 +1079,7 @@ mod tests {
     /// `_id`s), and import reads it back in that order.
     #[tokio::test]
     async fn json_export_keeps_field_order() {
-        let conn = Conn::mock(MockStore::demo(), false);
+        let conn = Conn::mock(MockStore::test_data(), false);
         let ns = Namespace::new("order", "c");
         let original = doc! { "_id": { "z": 1, "a": 2 }, "name": "x", "age": 3 };
         conn.insert_one(&ns, original.clone()).await.unwrap();
@@ -1132,7 +1132,7 @@ mod tests {
     #[tokio::test]
     async fn an_export_replaces_the_real_file_as_it_was_set_up() {
         use std::os::unix::fs::PermissionsExt;
-        let conn = Conn::mock(MockStore::demo(), false);
+        let conn = Conn::mock(MockStore::test_data(), false);
         let dir = temp_dir("replace");
         let spec = |path: &Path| ExportSpec { ns: Namespace::new("demo-games", "providers"), filter: doc! {}, sort: None, projection: None, format: ExportFormat::JsonArray, path: path.to_path_buf(), fields: None };
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
@@ -1175,7 +1175,7 @@ mod tests {
     /// the file that was there as it was, and nothing next to it.
     #[tokio::test]
     async fn a_cancelled_or_failed_export_keeps_the_previous_file() {
-        let conn = Conn::mock(MockStore::demo(), false);
+        let conn = Conn::mock(MockStore::test_data(), false);
         let dir = std::env::temp_dir().join(format!("rongo-part-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bets.json");
@@ -1209,7 +1209,7 @@ mod tests {
 
     #[tokio::test]
     async fn export_then_import_round_trips() {
-        let conn = Conn::mock(MockStore::demo(), false);
+        let conn = Conn::mock(MockStore::test_data(), false);
         let ns = Namespace::new("demo-games", "providers");
         let dir = std::env::temp_dir().join(format!("rongo-transfer-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1258,7 +1258,7 @@ mod tests {
         let scope = Bson::JavaScriptCodeWithScope(bson::JavaScriptCodeWithScope { code: "f".into(), scope: doc! { "n": 5_i64, "in": [7_i64, { "m": 8_i64 }] } });
         let dates: Vec<Bson> = (-3000_i64..3000).map(|k| Bson::DateTime(bson::DateTime::from_millis(k * 98_765_432_101 + k))).collect();
         let mut docs = vec![every.clone(), doc! { "code": scope, "n": [1_i64, { "m": 2_i64 }], "dates": dates }];
-        let demo = MockStore::demo();
+        let demo = MockStore::test_data();
         for coll in ["users", "providers", "bet_logs"] {
             docs.extend(demo.find(&Namespace::new("demo-games", coll), &doc! {}, None, None, 0, Some(2000)).unwrap());
         }
@@ -1301,7 +1301,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "timing; run explicitly in release mode"]
     async fn report_transfer_time() {
-        let demo = MockStore::demo();
+        let demo = MockStore::test_data();
         let bets = demo.find(&Namespace::new("demo-games", "bet_logs"), &doc! {}, None, None, 0, None).unwrap();
         let mut store = MockStore::empty();
         let ns = Namespace::new("t", "bets");

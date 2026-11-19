@@ -9,6 +9,10 @@ with signed distance fields for smooth edges. Writes:
   assets/icon.ico        the Windows icon (16 to 256 px, each size drawn
                          afresh rather than scaled down), embedded in
                          rongo.exe and used by the installer
+  assets/icon-dev-256.rgba  the same leaf in orange on warm dark: the icon of
+                         any build not made by the release scripts (cargo
+                         run, a test build), so it is never taken for the
+                         installed rongo
 
 Usage: python3 scripts/make-icon.py
 """
@@ -31,16 +35,18 @@ def hexrgb(h):
     return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
 
 
-BG_TOP, BG_BOTTOM = hexrgb("#24322b"), hexrgb("#121a16")
-LEAF_LIGHT, LEAF_DARK = hexrgb("#7ccf7f"), hexrgb("#3e9b52")
-RIB = hexrgb("#2b6f3a")
+# (background top, background bottom, leaf light, leaf dark, rib)
+GREEN = tuple(map(hexrgb, ("#24322b", "#121a16", "#7ccf7f", "#3e9b52", "#2b6f3a")))
+ORANGE = tuple(map(hexrgb, ("#3a2a20", "#1c140f", "#ffb15c", "#e0701f", "#94400f")))
 
 # Apple's icon grid: an 824/1024 rounded square with a ~185 corner radius.
 BOX_HALF, BOX_RADIUS = 412 / 1024, 185 / 1024
 
 # The leaf is the lens where two circles overlap, along an axis tilted 45°.
 LEAF_LEN, LEAF_WIDTH = 0.50, 0.27
-LEAF_CENTER = (0.53, 0.47)
+# Low enough that the leaf and its stem sit a touch above the middle (where
+# the eye puts the centre): 16% of the icon free above them, 20% below.
+LEAF_CENTER = (0.53, 0.515)
 ANGLE = math.radians(-45)
 R = ((LEAF_LEN / 2) ** 2 + (LEAF_WIDTH / 2) ** 2) / LEAF_WIDTH
 C = R - LEAF_WIDTH / 2
@@ -82,7 +88,8 @@ def over(dst, color, alpha):
     return (blend(color[0], r), blend(color[1], g), blend(color[2], b), out_a)
 
 
-def render(size):
+def render(size, colors=GREEN):
+    bg_top, bg_bottom, leaf_light, leaf_dark, rib_color = colors
     px = size
     rows = []
     for j in range(size):
@@ -93,18 +100,18 @@ def render(size):
             p = (0.0, 0.0, 0.0, 0.0)
             box = rounded_box(x, y)
             if box * px < 1:
-                p = over(p, mix(BG_TOP, BG_BOTTOM, y), cover(box, px))
+                p = over(p, mix(bg_top, bg_bottom, y), cover(box, px))
                 u, v = to_leaf(x, y)
                 # Stem: from the leaf's base outward, slightly curved.
                 stem = segment(u + v * v * 0.6, v, -LEAF_LEN / 2 - 0.10, -LEAF_LEN / 2 + 0.02, 0.012)
-                p = over(p, LEAF_DARK, cover(stem, px))
+                p = over(p, leaf_dark, cover(stem, px))
                 d = leaf(u, v)
                 if d * px < 1:
-                    shade = mix(LEAF_LIGHT, LEAF_DARK, min(max((u + LEAF_LEN / 2) / LEAF_LEN * 0.5 + (v + LEAF_WIDTH / 2) / LEAF_WIDTH * 0.5, 0), 1))
+                    shade = mix(leaf_light, leaf_dark, min(max((u + LEAF_LEN / 2) / LEAF_LEN * 0.5 + (v + LEAF_WIDTH / 2) / LEAF_WIDTH * 0.5, 0), 1))
                     p = over(p, shade, cover(d, px))
                     inside = cover(d + 0.025, px)
                     rib = segment(u, v, -LEAF_LEN / 2 + 0.03, LEAF_LEN / 2 - 0.05, 0.007)
-                    p = over(p, RIB, cover(rib, px) * inside)
+                    p = over(p, rib_color, cover(rib, px) * inside)
                     # Three pairs of side veins, angled toward the tip.
                     for k in range(3):
                         u0 = -LEAF_LEN / 2 + 0.11 + k * 0.09
@@ -114,7 +121,7 @@ def render(size):
                                 du, dv = 0.55, 0.835  # direction of a vein
                                 t = min(max(vu * du + vv * dv, 0), 0.09)
                                 vein = math.hypot(vu - du * t, vv - dv * t) - 0.004
-                                p = over(p, RIB, cover(vein, px) * inside * 0.9)
+                                p = over(p, rib_color, cover(vein, px) * inside * 0.9)
             row += bytes(round(c * 255) for c in p)
         rows.append(bytes(row))
     return rows
@@ -155,7 +162,9 @@ def main():
         f.write(b"".join(rows256))
     images = [(size, png_bytes(size, rows256 if size == 256 else render(size))) for size in ICO_SIZES]
     write_ico(os.path.join(ASSETS, "icon.ico"), images)
-    print("wrote assets/icon-1024.png, assets/icon-256.rgba and assets/icon.ico")
+    with open(os.path.join(ASSETS, "icon-dev-256.rgba"), "wb") as f:
+        f.write(b"".join(render(256, ORANGE)))
+    print("wrote assets/icon-1024.png, assets/icon-256.rgba, assets/icon.ico and assets/icon-dev-256.rgba")
 
 
 if __name__ == "__main__":

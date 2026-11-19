@@ -1,6 +1,6 @@
 //! The shell's code editor: a monospace `TextEdit` with JavaScript colouring,
-//! a line-number gutter, the current line highlighted, an error marker, and an
-//! autocomplete popup.
+//! a line-number gutter, the current line highlighted, an error marker, an
+//! autocomplete popup, and a find bar (⌘F).
 
 use std::sync::Arc;
 
@@ -8,6 +8,7 @@ use egui::text::{CCursor, CCursorRange};
 use egui::{Align2, Area, Frame, Galley, Id, Key, Modifiers, Order, Rect, Sense, Shape, TextEdit, Ui, pos2, vec2};
 use rongo_shell::complete::{self, Completion, Kind};
 
+use crate::doc_find::{self, DocFind};
 use crate::{highlight, theme};
 
 pub struct CodeEditor {
@@ -23,6 +24,10 @@ pub struct CodeEditor {
     awaiting_fields: Option<String>,
     /// The text as last laid out, reused while it stays the same.
     laid: Option<Laid>,
+    /// The find bar (⌘F), while it is open.
+    find: Option<DocFind>,
+    /// Counts the edits of `text`: the find bar searches it again.
+    version: u64,
 }
 
 /// The editor's text as laid out (coloured, wrapped at `wrap`), kept while
@@ -58,13 +63,44 @@ pub struct EditorOutput {
 
 impl CodeEditor {
     pub fn new(id: Id, text: impl Into<String>) -> Self {
-        Self { text: text.into(), id, completion: None, cursor: 0, selection: None, error_line: None, awaiting_fields: None, laid: None }
+        Self { text: text.into(), id, completion: None, cursor: 0, selection: None, error_line: None, awaiting_fields: None, laid: None, find: None, version: 0 }
+    }
+
+    /// The find bar, drawn where it is called (above the text). ⌘F opens it
+    /// while the text or the bar's field has the keyboard focus and `keys`
+    /// (no dialog open), and Esc there closes it; with the suggestions open,
+    /// Esc is theirs.
+    pub fn find_bar(&mut self, ui: &mut Ui, keys: bool) {
+        let keys = doc_find::Keys::Focus { enabled: keys, text_esc: self.completion.is_some() };
+        doc_find::bar(&mut self.find, ui, self.id, "Find in this script", keys, &self.text, self.version);
+    }
+
+    /// Whether the text, or its find bar's field, has the keyboard focus:
+    /// ⌘F finds in the text then.
+    pub fn has_keys(&self, ctx: &egui::Context) -> bool {
+        ctx.memory(|m| m.has_focus(self.id) || m.has_focus(doc_find::field_id(self.id)))
+    }
+
+    /// Tests: the find bar, while it is open.
+    #[cfg(test)]
+    pub fn find(&self) -> Option<&DocFind> {
+        self.find.as_ref()
+    }
+
+    /// Tests: whether the suggestions are open.
+    #[cfg(test)]
+    pub fn completing(&self) -> bool {
+        self.completion.is_some()
     }
 
     /// Replace the whole text (Load file, New). The old cursor and
     /// selection don't belong to it: Run would run a slice of the new text.
     pub fn set_text(&mut self, text: String) {
         self.text = text;
+        self.version += 1;
+        if let Some(f) = &mut self.find {
+            f.restart();
+        }
         self.cursor = 0;
         self.selection = None;
         self.completion = None;
@@ -85,14 +121,24 @@ impl CodeEditor {
                 let line_offset = self.text[..start].matches('\n').count() as u32;
                 RunRequest { code: self.text[start..end].to_string(), line_offset }
             }
-            _ => RunRequest { code: self.text.clone(), line_offset: 0 },
+            _ => self.run_everything(),
         }
+    }
+
+    /// All of the text, whatever is selected.
+    fn run_everything(&self) -> RunRequest {
+        RunRequest { code: self.text.clone(), line_offset: 0 }
     }
 
     /// The paragraph (lines between blank lines) around the cursor.
     pub fn run_current(&self) -> RunRequest {
+        self.run_statement_at(self.cursor)
+    }
+
+    /// The paragraph (lines between blank lines) around character `at`.
+    fn run_statement_at(&self, at: usize) -> RunRequest {
         let lines: Vec<&str> = self.text.split('\n').collect();
-        let (line, _) = self.line_col();
+        let line = 1 + self.text.chars().take(at).filter(|&c| c == '\n').count();
         let mut cur = (line - 1).min(lines.len().saturating_sub(1));
         // On a blank line, use the statement just above it.
         while cur > 0 && lines[cur].trim().is_empty() {
@@ -125,12 +171,17 @@ impl CodeEditor {
             }
         }
 
-        // Keys that must not reach the TextEdit.
-        if has_focus {
+        // Keys that must not reach the TextEdit. They run from the find bar's
+        // field too, where the text shows no selection or caret: ⌘↩ (F5)
+        // runs all of it, ⇧⌘↩ the statement holding the current match (the
+        // caret's when nothing matches).
+        let in_find = self.find.is_some() && ui.memory(|m| m.has_focus(doc_find::field_id(self.id)));
+        if has_focus || in_find {
             if ui.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Enter)) {
-                out.run = Some(self.run_current());
+                let at = self.find.as_ref().and_then(DocFind::current).filter(|_| in_find).map_or(self.cursor, |m| m.start);
+                out.run = Some(self.run_statement_at(at));
             } else if ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter)) || ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F5)) {
-                out.run = Some(self.run_all());
+                out.run = Some(if in_find { self.run_everything() } else { self.run_all() });
             }
         }
         let mut accept = None;
@@ -159,6 +210,7 @@ impl CodeEditor {
         let line_count = memchr::memchr_iter(b'\n', self.text.as_bytes()).count() + 1;
         let gutter_w = (line_count.to_string().len().max(2) as f32) * char_w + 18.0;
 
+        let keys_kept = self.keys_kept();
         // Taken out for the frame, so the closures below can borrow the rest.
         let mut laid = self.laid.take();
         let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
@@ -181,12 +233,15 @@ impl CodeEditor {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 let (gutter, _) = ui.allocate_exact_size(vec2(gutter_w, row_height), Sense::hover());
                 let background = ui.painter().add(Shape::Noop);
+                // The find bar's matches, over the line marks and behind the text.
+                let marks = ui.painter().add(Shape::Noop);
+                let edit_from = doc_find::edit_from(&self.find, ui.ctx(), self.id);
                 let output = TextEdit::multiline(&mut self.text)
                     .id(self.id)
                     .font(font.clone())
                     .code_editor()
                     .frame(egui::Frame::NONE)
-                    .lock_focus(true)
+                    .event_filter(keys_kept)
                     .desired_width(f32::INFINITY)
                     .desired_rows((ui.available_height() / row_height).max(4.0) as usize)
                     .layouter(&mut layouter)
@@ -197,6 +252,12 @@ impl CodeEditor {
                     let (a, b) = (range.primary.index.0, range.secondary.index.0);
                     self.selection = Some((a.min(b), a.max(b)));
                 }
+                if output.response.changed() {
+                    self.version += 1;
+                    // Found again at once: the marks are for this text.
+                    doc_find::edited(&mut self.find, ui.ctx(), &self.text, self.version, edit_from, &output);
+                }
+                doc_find::paint(&mut self.find, ui, marks, &output);
 
                 // Gutter numbers, current line and error line, for the rows
                 // in view: the rows above are only counted.
@@ -288,7 +349,17 @@ impl CodeEditor {
                 ui.memory_mut(|m| m.request_focus(self.id));
             }
         }
+        // The suggestions opened or closed after the text was drawn: from
+        // the next frame's Esc on, as they are now.
+        ui.memory_mut(|m| m.set_focus_lock_filter(self.id, self.keys_kept()));
         out
+    }
+
+    /// The keys the text keeps while it has the focus: the arrows, Tab (it
+    /// indents), and Esc while the suggestions are open, which Esc closes.
+    /// egui moves the focus away on any other: Esc then leaves the text.
+    fn keys_kept(&self) -> egui::EventFilter {
+        egui::EventFilter { horizontal_arrows: true, vertical_arrows: true, tab: true, escape: self.completion.is_some() }
     }
 
     fn refresh_completion(&mut self, collections: &dyn Fn() -> Vec<String>, fields: &dyn Fn(&str) -> Option<Vec<String>>, forced: bool) {
@@ -319,6 +390,11 @@ impl CodeEditor {
         }
         self.text.replace_range(p.start_byte..cursor_byte, &item.insert);
         let new_cursor = self.text[..p.start_byte + item.insert.len()].chars().count();
+        self.version += 1;
+        if let Some(f) = &mut self.find {
+            let start = self.text[..p.start_byte].chars().count();
+            f.update(ctx, &self.text, self.version, Some(doc_find::Edit { start, caret: new_cursor }));
+        }
         self.set_cursor(ctx, new_cursor);
     }
 
@@ -576,6 +652,109 @@ mod tests {
         let scaled = galley(&e);
         assert!(!Arc::ptr_eq(&typed, &scaled), "laid out again for the new scale");
         assert_eq!(scaled.pixels_per_point, 2.0);
+    }
+
+    /// With the find bar open, the matches in view are marked behind the
+    /// script and its layout is kept: frames with nothing changed lay
+    /// nothing out, search nothing, work out where the rows start once,
+    /// and look only at the rows in view, also scrolled to the end.
+    #[test]
+    fn the_layout_is_kept_with_the_find_bar_open() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let script: String = (0..5_000).map(|i| format!("print({i})\n")).collect();
+        let mut e = CodeEditor::new(Id::new("ed"), script);
+        e.find = Some(DocFind::typed("print"));
+        let fields = |_: &str| None;
+        // A quarter of a second a frame: scrolling to a match is animated.
+        let time = std::cell::Cell::new(0.0);
+        let frame = |e: &mut CodeEditor| -> usize {
+            time.set(time.get() + 0.25);
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 500.0))), time: Some(time.get()), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                e.find_bar(ui, true);
+                e.ui(ui, &Vec::new, &fields);
+            });
+            out.textures_delta.clear();
+            let mut marks = 0;
+            let mut count = |s: &egui::Shape| if let egui::Shape::Rect(r) = s && (r.fill == theme::FIND_MATCH || r.fill == theme::FIND_CURRENT) { marks += 1 };
+            for c in &out.shapes {
+                match &c.shape {
+                    egui::Shape::Vec(v) => v.iter().for_each(&mut count),
+                    s => count(s),
+                }
+            }
+            marks
+        };
+        for _ in 0..3 {
+            frame(&mut e);
+        }
+        let galley = e.laid.as_ref().expect("laid out").galley.clone();
+        let f = e.find.as_ref().expect("the bar is open");
+        let (searches, scans) = (f.searches, f.row_scans);
+        for _ in 0..5 {
+            let marks = frame(&mut e);
+            assert!(marks > 0 && marks < 100, "{marks} matches marked, the ones in view");
+        }
+        let f = e.find.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&galley, &e.laid.as_ref().unwrap().galley), "the script was laid out again");
+        assert_eq!((f.searches, f.row_scans), (searches, scans), "searched again, or the rows walked again");
+        assert!(f.rows_looked_at < 100, "{} rows looked at in a frame", f.rows_looked_at);
+        // A needle found only at the end scrolls there.
+        *e.find.as_mut().unwrap().needle_mut() = "print(4999)".into();
+        for _ in 0..3 {
+            frame(&mut e);
+        }
+        let f = e.find.as_ref().unwrap();
+        assert_eq!(f.row_scans, scans, "the rows walked again");
+        assert!(f.rows_looked_at < 100, "{} rows looked at in a frame, at the end", f.rows_looked_at);
+        assert_eq!(frame(&mut e), 1, "the match at the end is in view");
+    }
+
+    /// From the find bar's field, ⌘↩ runs the whole script, never a
+    /// selection the script no longer shows, and ⇧⌘↩ the statement holding
+    /// the current match (the caret's when nothing matches).
+    #[test]
+    fn run_keys_from_the_find_field() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let text = "db.a.find()\n\ndb.b.find({ x: \"pie\" })\n\nprint(1)";
+        let mut e = CodeEditor::new(Id::new("ed"), text);
+        let fields = |_: &str| None;
+        let frame = |e: &mut CodeEditor, events: Vec<egui::Event>| -> Option<RunRequest> {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 500.0))), events, ..Default::default() };
+            let mut run = None;
+            let mut out = ctx.run_ui(input, |ui| {
+                e.find_bar(ui, true);
+                run = e.ui(ui, &Vec::new, &fields).run;
+            });
+            out.textures_delta.clear();
+            run
+        };
+        let key = |key, modifiers| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+        frame(&mut e, vec![]);
+        // "db.a" selected in the script.
+        ctx.memory_mut(|m| m.request_focus(e.id));
+        let mut state = TextEdit::load_state(&ctx, e.id).unwrap_or_default();
+        state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(4))));
+        state.store(&ctx, e.id);
+        frame(&mut e, vec![]);
+        frame(&mut e, vec![]);
+        assert_eq!(e.run_all().code, "db.a", "from the script, the selection runs");
+        frame(&mut e, vec![key(Key::F, Modifiers::COMMAND)]);
+        frame(&mut e, vec![egui::Event::Text("pie".into())]);
+        frame(&mut e, vec![]);
+        assert!(ctx.memory(|m| m.has_focus(doc_find::field_id(e.id))), "the find field has the focus");
+        let run = frame(&mut e, vec![key(Key::Enter, Modifiers::COMMAND)]).expect("⌘↩ ran");
+        assert_eq!(run.code, text, "the whole script, not the selection the script no longer shows");
+        let run = frame(&mut e, vec![key(Key::F5, Modifiers::NONE)]).expect("F5 ran");
+        assert_eq!(run.code, text, "F5 as ⌘↩");
+        let run = frame(&mut e, vec![key(Key::Enter, Modifiers::COMMAND | Modifiers::SHIFT)]).expect("⇧⌘↩ ran");
+        assert_eq!((run.code.as_str(), run.line_offset), ("db.b.find({ x: \"pie\" })", 2), "the current match's statement");
+        *e.find.as_mut().unwrap().needle_mut() = "zzz".into();
+        frame(&mut e, vec![]);
+        let run = frame(&mut e, vec![key(Key::Enter, Modifiers::COMMAND | Modifiers::SHIFT)]).expect("⇧⌘↩ ran");
+        assert_eq!((run.code.as_str(), run.line_offset), ("db.a.find()", 0), "no match: the caret's statement");
     }
 
     /// Line and column count characters (Thai is one column a character),

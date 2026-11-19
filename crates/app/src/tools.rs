@@ -8,6 +8,7 @@ use rongo_core::bson::{Bson, Document, doc};
 use rongo_core::format::{self, Style};
 use rongo_core::{Command, ConnId, ExportFormat, ExportSpec, FindSpec, ImportFormat, Namespace, RequestId};
 
+use crate::index_form::{IndexForm, Purpose};
 use crate::theme;
 
 pub struct ToolDialog {
@@ -24,6 +25,9 @@ pub struct ToolDialog {
     /// The code field's laid-out text (one shows at a time), dropped with
     /// the dialog.
     layout: theme::CodeLayout,
+    /// The connection is read-only (kept current by the app): Add as New
+    /// Index… is greyed out.
+    pub read_only: bool,
 }
 
 /// "Apply predefined query" choices in the Update/Delete dialog.
@@ -142,24 +146,41 @@ pub enum ToolKind {
     Export { query: FindSpec, query_text: String, query_hover: String, scope: ExportScope, format: ExportFormat, path: String, fields: String },
     Import { db: String, coll: String, path: String, format: ImportFormat },
     Value { ns: Namespace, id: Bson, path: String, text: String },
-    /// TTL and hidden are all MongoDB lets you change on an existing index.
-    EditIndex { ns: Namespace, name: String, ttl: Option<String>, original_ttl: Option<String>, hidden: bool, original_hidden: bool },
 }
 
 pub enum ToolAction {
     Send(Command),
     Close,
+    /// Add as New Index…: close, and open Add Index filled from this
+    /// index (as the server listed it).
+    AddAsNew(Namespace, Document),
 }
 
 impl ToolDialog {
     pub fn new(conn: ConnId, view: Option<u64>, kind: ToolKind) -> Self {
-        let refresh_tree = matches!(kind, ToolKind::Index(_) | ToolKind::Import { .. } | ToolKind::EditIndex { .. });
-        Self { conn, view, refresh_tree, running: None, error: None, kind, typed: false, layout: theme::CodeLayout::default() }
+        let refresh_tree = matches!(kind, ToolKind::Index(_) | ToolKind::Import { .. });
+        Self { conn, view, refresh_tree, running: None, error: None, kind, typed: false, layout: theme::CodeLayout::default(), read_only: false }
     }
 
     /// `fields` are the collection's field names for the field picker.
     pub fn index(conn: ConnId, ns: Namespace, fields: Vec<String>) -> Self {
-        Self::new(conn, None, ToolKind::Index(Box::new(crate::index_form::IndexForm::new(ns, fields))))
+        Self::new(conn, None, ToolKind::Index(Box::new(IndexForm::new(ns, fields))))
+    }
+
+    /// View details: the Add Index form filled from `spec` (an index as
+    /// the server listed it), read-only.
+    pub fn view_index(conn: ConnId, ns: Namespace, spec: &Document) -> Self {
+        Self::new(conn, None, ToolKind::Index(Box::new(IndexForm::view(ns, spec))))
+    }
+
+    /// Edit index: the same form, with only the TTL and Hidden open.
+    pub fn edit_index(conn: ConnId, ns: Namespace, spec: &Document) -> Self {
+        Self::new(conn, None, ToolKind::Index(Box::new(IndexForm::edit(ns, spec))))
+    }
+
+    /// Add as New Index…: Add Index filled from `spec`, without its name.
+    pub fn index_as_new(conn: ConnId, ns: Namespace, fields: Vec<String>, spec: &Document) -> Self {
+        Self::new(conn, None, ToolKind::Index(Box::new(IndexForm::add_as_new(ns, fields, spec))))
     }
 
     /// Field names for the Add Index picker arrived.
@@ -270,18 +291,6 @@ impl ToolDialog {
         Self::new(conn, view, ToolKind::Value { ns, id, path, text })
     }
 
-    pub fn edit_index(conn: ConnId, ns: Namespace, spec: &Document) -> Self {
-        let name = spec.get_str("name").unwrap_or_default().to_string();
-        let ttl = spec.get("expireAfterSeconds").map(|v| match v {
-            Bson::Int32(n) => n.to_string(),
-            Bson::Int64(n) => n.to_string(),
-            Bson::Double(f) => (*f as i64).to_string(),
-            other => format::cell_text(other),
-        });
-        let hidden = spec.get_bool("hidden").unwrap_or(false);
-        Self::new(conn, None, ToolKind::EditIndex { ns, name, original_ttl: ttl.clone(), ttl, hidden, original_hidden: hidden })
-    }
-
     /// The current validator arrived in answer to `req`: taken only by the
     /// validator dialog still waiting for that answer (one cancelled before
     /// it loaded may have been followed by this one, on another collection).
@@ -307,14 +316,13 @@ impl ToolDialog {
 
     pub fn success_message(&self) -> &'static str {
         match &self.kind {
-            ToolKind::Index(_) => "Index created",
+            ToolKind::Index(f) => f.success_message(),
             ToolKind::Validator { .. } => "Validator saved",
             ToolKind::Bulk(b) if b.delete => "Delete finished",
             ToolKind::Bulk(_) => "Update finished",
             ToolKind::Export { .. } => "Export finished",
             ToolKind::Import { .. } => "Import finished",
             ToolKind::Value { .. } => "Value saved",
-            ToolKind::EditIndex { .. } => "Index updated",
         }
     }
 
@@ -322,14 +330,13 @@ impl ToolDialog {
         let mut action = None;
         let busy = self.running.is_some();
         let title = match &self.kind {
-            ToolKind::Index(f) => format!("{}  Add index — {}", icon::LIGHTNING, f.ns),
+            ToolKind::Index(f) => f.title(),
             ToolKind::Validator { ns, .. } => format!("{}  Validator — {ns}", icon::SHIELD_CHECK),
             ToolKind::Bulk(b) if b.delete => format!("{}  Delete Documents — {}", icon::BROOM, b.ns),
             ToolKind::Bulk(b) => format!("{}  Update Documents — {}", icon::PENCIL_LINE, b.ns),
             ToolKind::Export { query, .. } => format!("{}  Export — {}", icon::EXPORT, query.ns),
             ToolKind::Import { db, .. } => format!("{}  Import into {db}", icon::DOWNLOAD_SIMPLE),
             ToolKind::Value { path, .. } => format!("{}  Edit Value — {path}", icon::PENCIL_SIMPLE),
-            ToolKind::EditIndex { ns, name, .. } => format!("{}  Edit Index {name} — {ns}", icon::LIGHTNING),
         };
         let edits = theme::text_edits(ctx);
         let modal = Modal::new(Id::new("tool-dialog")).show(ctx, |ui| {
@@ -339,26 +346,12 @@ impl ToolDialog {
             let primary = match &mut self.kind {
                 ToolKind::Index(f) => {
                     f.ui(ui);
-                    "Create index"
+                    f.primary()
                 }
                 ToolKind::Validator { loading, text, level, action, .. } => validator_form(ui, loading.is_some(), text, level, action, &mut self.layout),
                 ToolKind::Bulk(b) => bulk_form(ui, b, &mut self.layout),
                 ToolKind::Export { scope, format, path, fields, query, query_text, query_hover, .. } => export_form(ui, query, (query_text, query_hover), scope, format, path, fields),
                 ToolKind::Import { db, coll, path, format } => import_form(ui, db, coll, path, format),
-                ToolKind::EditIndex { name, ttl, hidden, .. } => {
-                    egui::Grid::new("edit-index").num_columns(2).spacing(vec2(12.0, 8.0)).show(ui, |ui| {
-                        if let Some(t) = ttl {
-                            ui.label("Expire after (seconds)");
-                            ui.add(egui::TextEdit::singleline(t).desired_width(160.0));
-                            ui.end_row();
-                        }
-                        ui.label("Hidden");
-                        ui.add_enabled(name != "_id_", egui::Checkbox::new(hidden, "keep it updated but unused by queries"));
-                        ui.end_row();
-                    });
-                    ui.weak("To change keys, uniqueness or other options, drop the index and add it again.");
-                    "Save"
-                }
                 ToolKind::Value { text, .. } => {
                     ui.weak("Shell syntax: \"text\", 42, Double(1), NumberLong(\"…\"), ISODate(\"…\"), ObjectId(\"…\"), { … }, [ … ]");
                     code_field(ui, text, 8, &mut self.layout);
@@ -370,6 +363,17 @@ impl ToolDialog {
             }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
+                // View details and Edit index: a new index from this one,
+                // for what Edit index doesn't change.
+                if let ToolKind::Index(f) = &self.kind
+                    && let Some(listed) = f.listed()
+                {
+                    let r = ui.add_enabled(!busy && !self.read_only, egui::Button::new("Add as New Index…"));
+                    let r = if self.read_only { r.on_disabled_hover_text(crate::result_view::LOCKED) } else { r };
+                    if r.on_hover_text("Add Index filled from this index, with no name: change what you need, create it, then drop this one yourself").clicked() {
+                        action = Some(ToolAction::AddAsNew(f.ns.clone(), listed.clone()));
+                    }
+                }
                 if busy {
                     ui.spinner();
                     ui.label("Working…");
@@ -391,7 +395,9 @@ impl ToolDialog {
                 });
             });
         });
-        self.typed |= theme::text_edits(ctx) > edits;
+        // Edit index's Hidden is a box, not typed text: a pending change counts too.
+        let edited = matches!(&self.kind, ToolKind::Index(f) if f.purpose == Purpose::Edit && f.ready());
+        self.typed |= theme::text_edits(ctx) > edits || edited;
         if theme::may_close(&modal, self.typed) && action.is_none() && !busy {
             action = Some(ToolAction::Close);
         }
@@ -446,19 +452,6 @@ impl ToolDialog {
                     return Err("Enter the collection to import into".into());
                 }
                 Command::Import { ns: Namespace::new(db.clone(), coll.trim()), path: path.trim().into(), format: *format }
-            }
-            ToolKind::EditIndex { ns, name, ttl, original_ttl, hidden, original_hidden } => {
-                let new_ttl = match ttl {
-                    Some(t) if Some(t.trim()) != original_ttl.as_deref().map(str::trim) => {
-                        Some(t.trim().parse::<i64>().ok().filter(|n| *n >= 0).ok_or("Expire after must be a whole number of seconds")?)
-                    }
-                    _ => None,
-                };
-                let new_hidden = (*hidden != *original_hidden).then_some(*hidden);
-                if new_ttl.is_none() && new_hidden.is_none() {
-                    return Err("Nothing changed".into());
-                }
-                Command::ModifyIndex { ns: ns.clone(), name: name.clone(), hidden: new_hidden, expire_after_seconds: new_ttl }
             }
             ToolKind::Value { ns, id, path, text } => {
                 let value = rongo_shell::parse_value(text).map_err(|e| e.to_string())?;
@@ -981,24 +974,277 @@ mod tests {
         }
     }
 
-    /// A tool dialog in a harness, noting when it asks to close.
+    /// A tool dialog in a harness, noting when it asks to close, what it
+    /// sends, and the index Add as New Index… hands on.
     struct Probe {
         dialog: ToolDialog,
         closed: bool,
+        sent: Vec<Command>,
+        as_new: Vec<(Namespace, Document)>,
     }
 
     fn harness(dialog: ToolDialog, size: egui::Vec2) -> egui_kittest::Harness<'static, Probe> {
         let mut h = egui_kittest::Harness::builder().with_size(size).build_ui_state(
             |ui, p: &mut Probe| {
                 crate::theme::install(ui.ctx());
-                if let Some(ToolAction::Close) = p.dialog.show(ui.ctx()) {
-                    p.closed = true;
+                match p.dialog.show(ui.ctx()) {
+                    Some(ToolAction::Close) => p.closed = true,
+                    Some(ToolAction::Send(cmd)) => p.sent.push(cmd),
+                    Some(ToolAction::AddAsNew(ns, spec)) => p.as_new.push((ns, spec)),
+                    None => {}
                 }
             },
-            Probe { dialog, closed: false },
+            Probe { dialog, closed: false, sent: Vec::new(), as_new: Vec::new() },
         );
         h.run_steps(3);
         h
+    }
+
+    /// A TTL index with a partial filter, as the server lists it.
+    fn ttl_index() -> Document {
+        doc! { "v": 2, "key": { "ingestedAt": 1 }, "name": "ingest_ttl", "expireAfterSeconds": 3600, "partialFilterExpression": { "kind": "temp" } }
+    }
+
+    const TABS: [&str; 5] = ["Fields", "Options", "Text options", "Geo options", "Collation"];
+
+    /// The inputs of the form on screen that can be used: text fields,
+    /// boxes, menus and buttons, bar the tabs, JSON, Cancel and Add as
+    /// New Index….
+    fn open_inputs(h: &egui_kittest::Harness<'_, Probe>) -> Vec<String> {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::NodeT;
+        let free = |label: &str| TABS.contains(&label) || ["Cancel", "Add as New Index…"].contains(&label) || label.ends_with("JSON");
+        h.root()
+            .children_recursive()
+            .map(|n| n.accesskit_node())
+            .filter(|a| matches!(a.role(), Role::TextInput | Role::MultilineTextInput | Role::CheckBox | Role::ComboBox | Role::Button))
+            .filter(|a| !a.is_disabled() && !free(&a.label().unwrap_or_default()))
+            .map(|a| format!("{:?} {:?} {:?}", a.role(), a.label().unwrap_or_default(), a.value().unwrap_or_default()))
+            .collect()
+    }
+
+    /// Shows the tab labelled `tab`.
+    /// (The dialog takes the new tab's height and centres again over the
+    /// next few frames.)
+    fn show_tab(h: &mut egui_kittest::Harness<'_, Probe>, tab: &str) {
+        use egui_kittest::kittest::Queryable;
+        h.get_by_label(tab).click();
+        h.run_steps(4);
+    }
+
+    /// The values of the text fields on screen.
+    fn field_values(h: &egui_kittest::Harness<'_, Probe>) -> Vec<String> {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        h.query_all_by_role(Role::TextInput).chain(h.query_all_by_role(Role::MultilineTextInput)).filter_map(|n| n.value()).collect()
+    }
+
+    fn ticked(h: &egui_kittest::Harness<'_, Probe>, label: &str) -> bool {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        h.get_by_label(label).accesskit_node().toggled() == Some(egui::accesskit::Toggled::True)
+    }
+
+    /// The texts drawn once the pointer has rested on the middle of `at`,
+    /// a tooltip's among them.
+    fn hover_texts(h: &mut egui_kittest::Harness<'_, Probe>, at: egui::Rect) -> Vec<String> {
+        h.event(egui::Event::PointerMoved(at.center()));
+        h.run_steps(6);
+        h.output().shapes.iter().filter_map(|s| match &s.shape {
+            egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+            _ => None,
+        }).collect()
+    }
+
+    /// After a switch to a tab taller than the room for it, the index
+    /// dialog settles at once: its buttons are where they will stay two
+    /// frames later (they used to creep for many frames, so a click went
+    /// where a box had been).
+    #[test]
+    fn the_index_dialog_settles_after_a_tab_switch() {
+        use egui_kittest::kittest::Queryable;
+        let mut spec = ttl_index();
+        spec.insert("wildcardProjection", doc! { "a": 1 });
+        let d = ToolDialog::index_as_new(ConnId(uuid::Uuid::nil()), Namespace::new("db", "c"), Vec::new(), &spec);
+        let mut h = harness(d, egui::vec2(1000.0, 900.0));
+        h.get_by_label("Options").click();
+        h.run_steps(3);
+        let soon = h.get_by_label("Unique").rect();
+        h.run_steps(30);
+        assert_eq!(h.get_by_label("Unique").rect(), soon, "settled");
+    }
+
+    /// View details is the Add Index form filled from the index with
+    /// nothing that can be changed on any tab (the tabs still switch): OK
+    /// is greyed out, nothing is sent, Esc closes it, and JSON shows the
+    /// index as the server listed it.
+    #[test]
+    fn view_details_shows_the_index_read_only() {
+        use egui_kittest::kittest::Queryable;
+        let (conn, ns) = (ConnId(uuid::Uuid::nil()), Namespace::new("db", "c"));
+        let mut h = harness(ToolDialog::view_index(conn, ns, &ttl_index()), egui::vec2(1000.0, 900.0));
+        assert!(h.query_by_label_contains("View Index ingest_ttl").is_some(), "its title names it");
+        for tab in TABS {
+            show_tab(&mut h, tab);
+            assert_eq!(open_inputs(&h), Vec::<String>::new(), "{tab}: nothing can be changed");
+            if tab == "Fields" {
+                let values = field_values(&h);
+                assert!(values.contains(&"ingest_ttl".to_string()) && values.contains(&"ingestedAt".to_string()), "its name and key: {values:?}");
+            }
+            if tab == "Options" {
+                assert!(ticked(&h, "TTL") && ticked(&h, "Partial") && !ticked(&h, "Unique"));
+                assert!(field_values(&h).iter().any(|v| v == "3600"), "expires after 3600 seconds: {:?}", field_values(&h));
+            }
+        }
+        assert!(crate::test_support::disabled(&h, "OK"), "OK can't be pressed");
+        assert!(crate::test_support::disabled(&h, "Create in background"));
+
+        h.get_by_label_contains("JSON").click();
+        h.run_steps(3);
+        let json: String = h.output().shapes.iter().filter_map(|s| match &s.shape {
+            egui::Shape::Text(t) if t.galley.text().contains("\"key\"") => Some(t.galley.text().to_string()),
+            _ => None,
+        }).collect();
+        assert_eq!(json, format::doc_to_shell(&ttl_index(), Style::Display), "the index as listed");
+
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        assert!(h.state().closed, "Esc closes it");
+        assert!(h.state().sent.is_empty(), "nothing is sent");
+    }
+
+    /// Edit index is the same form with only what MongoDB changes in
+    /// place open: the TTL's seconds (for a TTL index) and Hidden. The
+    /// rest is greyed out and says so on hover; OK waits for a change and
+    /// sends collMod with only that change, which JSON shows.
+    #[test]
+    fn edit_index_changes_only_the_ttl_and_hidden() {
+        use egui_kittest::kittest::Queryable;
+        let (conn, ns) = (ConnId(uuid::Uuid::nil()), Namespace::new("db", "c"));
+        let mut h = harness(ToolDialog::edit_index(conn, ns.clone(), &ttl_index()), egui::vec2(1000.0, 900.0));
+        assert!(h.query_by_label_contains("Edit Index ingest_ttl").is_some(), "its title names it");
+        assert!(crate::test_support::disabled(&h, "OK"), "nothing changed yet");
+        for tab in TABS {
+            show_tab(&mut h, tab);
+            let open = open_inputs(&h);
+            if tab == "Options" {
+                assert_eq!(open.len(), 2, "only Hidden and the seconds: {open:?}");
+                assert!(open.iter().any(|o| o.contains("\"Hidden\"")) && open.iter().any(|o| o.contains("\"3600\"")), "{open:?}");
+            } else {
+                assert_eq!(open, Vec::<String>::new(), "{tab}: nothing can be changed");
+            }
+        }
+        // What is greyed out says why, and where to go instead.
+        show_tab(&mut h, "Options");
+        let unique = h.get_by_label("Unique").rect();
+        let tip = hover_texts(&mut h, unique);
+        assert!(tip.iter().any(|t| t.contains("Edit index changes only an index's TTL and Hidden") && t.contains("Add as New Index…")), "{tip:?}");
+        assert!(!tip.iter().any(|t| t.contains("MongoDB can't")), "says what rongo does, not what MongoDB can't: {tip:?}");
+
+        h.get_by_label("Hidden").click();
+        h.run_steps(3);
+        assert!(!crate::test_support::disabled(&h, "OK"), "a change: OK is on");
+        // A change is kept like typing: a stray click or Esc doesn't throw it away.
+        crate::test_support::click_outside(&mut h);
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        assert!(!h.state().closed, "the ticked Hidden is kept");
+        h.get_by_label_contains("JSON").click();
+        h.run_steps(3);
+        let texts = hover_texts(&mut h, egui::Rect::from_min_size(egui::pos2(2.0, 2.0), egui::vec2(1.0, 1.0)));
+        let command = format::doc_to_shell(&rongo_core::conn::modify_index_command(&ns, "ingest_ttl", Some(true), None), Style::Display);
+        assert!(texts.contains(&command), "JSON is the command OK sends: {command} in {texts:?}");
+        h.get_by_label("OK").click();
+        h.run_steps(2);
+        match h.state().sent.as_slice() {
+            [Command::ModifyIndex { ns: n, name, hidden: Some(true), expire_after_seconds: None }] => assert!(n == &ns && name == "ingest_ttl"),
+            other => panic!("only Hidden changes: {other:?}"),
+        }
+
+        // Hidden back as it was, the TTL changed: only the TTL goes.
+        h.state_mut().sent.clear();
+        h.get_by_label("Hidden").click();
+        h.run_steps(2);
+        assert!(crate::test_support::disabled(&h, "OK"), "back as it was");
+        let seconds = h.query_all_by_role(egui::accesskit::Role::TextInput).find(|n| n.value().as_deref() == Some("3600")).expect("the seconds");
+        seconds.focus();
+        h.run_steps(1);
+        crate::test_support::press(&mut h, egui::Modifiers::COMMAND, egui::Key::A);
+        crate::test_support::type_in(&mut h, "60");
+        h.get_by_label("OK").click();
+        h.run_steps(2);
+        match h.state().sent.as_slice() {
+            [Command::ModifyIndex { hidden: None, expire_after_seconds: Some(60), .. }] => {}
+            other => panic!("only the TTL changes: {other:?}"),
+        }
+
+        // What was typed is kept: only Cancel closes it now.
+        crate::test_support::click_outside(&mut h);
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        assert!(!h.state().closed, "typed work kept");
+        h.get_by_label("Cancel").click();
+        h.run_steps(2);
+        assert!(h.state().closed);
+    }
+
+    /// The _id index can't be hidden: Edit index greys Hidden out there.
+    #[test]
+    fn the_id_index_cannot_be_hidden() {
+        use egui_kittest::kittest::Queryable;
+        let spec = doc! { "v": 2, "key": { "_id": 1 }, "name": "_id_" };
+        let mut h = harness(ToolDialog::edit_index(ConnId(uuid::Uuid::nil()), Namespace::new("db", "c"), &spec), egui::vec2(1000.0, 900.0));
+        show_tab(&mut h, "Options");
+        assert!(crate::test_support::disabled(&h, "Hidden"));
+        assert_eq!(open_inputs(&h), Vec::<String>::new(), "nothing to change on _id_");
+        let hidden = h.get_by_label("Hidden").rect();
+        assert!(hover_texts(&mut h, hidden).iter().any(|t| t.contains("_id")), "says why");
+    }
+
+    /// Add as New Index… in View details and Edit index hands the index
+    /// on for Add Index; on a read-only connection it is greyed out.
+    #[test]
+    fn add_as_new_index_hands_the_index_on() {
+        use egui_kittest::kittest::Queryable;
+        let (conn, ns) = (ConnId(uuid::Uuid::nil()), Namespace::new("db", "c"));
+        let view = || ToolDialog::view_index(conn, ns.clone(), &ttl_index());
+        let edit = || ToolDialog::edit_index(conn, ns.clone(), &ttl_index());
+        for (what, make) in [("View details", &view as &dyn Fn() -> ToolDialog), ("Edit index", &edit)] {
+            let mut h = harness(make(), egui::vec2(1000.0, 900.0));
+            h.get_by_label("Add as New Index…").click();
+            h.run_steps(2);
+            assert_eq!(h.state().as_new, [(ns.clone(), ttl_index())], "{what}");
+            assert!(h.state().sent.is_empty(), "{what}: nothing is sent");
+
+            let mut locked = make();
+            locked.read_only = true;
+            let mut h = harness(locked, egui::vec2(1000.0, 900.0));
+            assert!(crate::test_support::disabled(&h, "Add as New Index…"), "{what}: read-only");
+            let at = h.get_by_label("Add as New Index…").rect();
+            assert!(hover_texts(&mut h, at).iter().any(|t| t == crate::result_view::LOCKED), "{what}: says why");
+        }
+    }
+
+    /// Add as New Index… opens Add Index filled from the index with its
+    /// name left empty (MongoDB's default name unless one is typed),
+    /// saying what of the old index it doesn't carry over.
+    #[test]
+    fn add_as_new_index_is_add_index_filled_without_a_name() {
+        use egui_kittest::kittest::Queryable;
+        let mut spec = ttl_index();
+        spec.insert("wildcardProjection", doc! { "a": 1 });
+        let d = ToolDialog::index_as_new(ConnId(uuid::Uuid::nil()), Namespace::new("db", "c"), Vec::new(), &spec);
+        let ToolKind::Index(f) = &d.kind else { unreachable!() };
+        let (keys, options) = f.definition().unwrap();
+        assert_eq!(keys, doc! { "ingestedAt": 1 });
+        assert_eq!(options, doc! { "expireAfterSeconds": 3600_i64, "partialFilterExpression": { "kind": "temp" } }, "no name");
+        let mut h = harness(d, egui::vec2(1000.0, 900.0));
+        assert!(h.query_by_label_contains("Add index").is_some());
+        assert!(!crate::test_support::disabled(&h, "Create index"));
+        let texts = hover_texts(&mut h, egui::Rect::from_min_size(egui::pos2(2.0, 2.0), egui::vec2(1.0, 1.0)));
+        assert!(texts.iter().any(|t| t.contains("ingest_ttl")), "names the old index: {texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("Not carried over") && t.contains("no place") && t.ends_with(": wildcardProjection")), "{texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("Not carried over") && t.contains("server sets") && t.ends_with(": v")), "{texts:?}");
+        assert!(open_inputs(&h).len() > 5, "everything open");
     }
 
     /// A click outside a tool dialog, or Esc, closes it only while nothing

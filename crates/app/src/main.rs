@@ -30,8 +30,16 @@ mod unlock;
 mod update;
 mod vault_ui;
 
-const ICON_RGBA: &[u8] = include_bytes!("../../../assets/icon-256.rgba");
-const _: () = assert!(ICON_RGBA.len() == 256 * 256 * 4, "assets/icon-256.rgba must be 256x256 RGBA");
+const RELEASE_ICON_RGBA: &[u8] = include_bytes!("../../../assets/icon-256.rgba");
+const DEV_ICON_RGBA: &[u8] = include_bytes!("../../../assets/icon-dev-256.rgba");
+const _: () = assert!(RELEASE_ICON_RGBA.len() == 256 * 256 * 4 && DEV_ICON_RGBA.len() == 256 * 256 * 4, "assets/icon-256.rgba and icon-dev-256.rgba must be 256x256 RGBA");
+
+/// The window and Dock icon. The release scripts (bundle-macos.sh,
+/// bundle-windows.sh) build with RONGO_RELEASE set, for the app bundle's
+/// green leaf; any other build (cargo run, a test build) shows it in orange,
+/// so it is never taken for the installed rongo. Cargo rebuilds when the
+/// variable changes.
+const ICON_RGBA: &[u8] = if option_env!("RONGO_RELEASE").is_some() { RELEASE_ICON_RGBA } else { DEV_ICON_RGBA };
 
 /// Workers for the tokio runtime, given the cores available: at least four,
 /// so history file I/O (a sync per saved batch, retention) on one or two
@@ -184,6 +192,32 @@ mod tests {
         let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &options.wgpu_options.wgpu_setup else { panic!("a new wgpu setup") };
         assert!(setup.native_adapter_selector.is_none());
         assert!(setup.instance_descriptor.backends.contains(eframe::wgpu::Backends::DX12 | eframe::wgpu::Backends::METAL), "{:?}", setup.instance_descriptor.backends);
+    }
+
+    /// A build that isn't a release shows the same leaf in orange on warm
+    /// dark, so it is never taken for the installed (green) rongo.
+    #[test]
+    fn the_dev_icon_is_the_same_leaf_in_orange() {
+        let (release, dev) = (super::RELEASE_ICON_RGBA, super::DEV_ICON_RGBA);
+        assert!(release.chunks(4).zip(dev.chunks(4)).all(|(r, d)| r[3] == d[3]), "the same shape, pixel for pixel");
+        // Red against green over the whole icon: green leans to green, orange to red.
+        let warmth = |icon: &[u8]| icon.chunks(4).map(|p| (i64::from(p[0]) - i64::from(p[1])) * i64::from(p[3])).sum::<i64>();
+        assert!(warmth(release) < 0 && warmth(dev) > 0, "{} {}", warmth(release), warmth(dev));
+        // This test build is not a release one.
+        assert!(std::ptr::eq(super::ICON_RGBA, super::DEV_ICON_RGBA) || option_env!("RONGO_RELEASE").is_some());
+    }
+
+    /// The disk image and the installer are built with RONGO_RELEASE, so
+    /// what people download shows the green leaf.
+    #[test]
+    fn the_release_scripts_build_with_the_release_icon() {
+        let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts");
+        for name in ["bundle-macos.sh", "bundle-windows.sh"] {
+            let text = std::fs::read_to_string(scripts.join(name)).unwrap();
+            let set = text.find("\nexport RONGO_RELEASE=1\n").unwrap_or_else(|| panic!("{name} sets RONGO_RELEASE"));
+            let build = text.find("\ncargo build").unwrap_or_else(|| panic!("{name} builds"));
+            assert!(set < build, "{name} sets RONGO_RELEASE before it builds");
+        }
     }
 }
 

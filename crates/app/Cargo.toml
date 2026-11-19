@@ -40,6 +40,8 @@ ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 open = { version = "5.4", features = ["shellexecute-on-windows"] }
 
 [dev-dependencies]
+# The tests' demo connection serves the test data they are written against.
+rongo-core = { workspace = true, features = ["test-data"] }
 # Renders the UI to images for the screenshot tour (an ignored test).
 egui_kittest = { version = "0.36", features = ["wgpu", "eframe"] }
 image = { version = "0.25", default-features = false, features = ["png"] }

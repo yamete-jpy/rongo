@@ -290,6 +290,24 @@ impl ShellTab {
         self.running.is_some()
     }
 
+    /// Whether the editor holds a script (anything but blank space), which
+    /// closing the tab would lose.
+    pub fn has_script(&self) -> bool {
+        !self.editor.text.trim().is_empty()
+    }
+
+    /// Whether the script, or its find bar's field, has the keyboard focus:
+    /// ⌘F finds in the script then, wherever the pointer is.
+    pub fn script_has_keys(&self, ctx: &egui::Context) -> bool {
+        self.editor.has_keys(ctx)
+    }
+
+    /// Tests: the script's editor.
+    #[cfg(test)]
+    pub fn script(&self) -> &CodeEditor {
+        &self.editor
+    }
+
     /// When the running script started, if one is running.
     pub fn running_since(&self) -> Option<Instant> {
         self.running.map(|(_, t)| t)
@@ -430,7 +448,7 @@ impl ShellTab {
         ui.add_space(2.0);
 
         let mut run = self.toolbar(ui, net);
-        if let Some(r) = self.editor_pane(ui, conn) {
+        if let Some(r) = self.editor_pane(ui, conn, net.keys_enabled) {
             run = Some(r);
         }
 
@@ -505,10 +523,11 @@ impl ShellTab {
         run
     }
 
-    /// The editor and its footer, and under them the handle that drags
-    /// the split. Returns the run the editor asked for (⌘↩, F5), unless a
-    /// script is running.
-    fn editor_pane(&mut self, ui: &mut Ui, conn: Option<&OpenConn>) -> Option<RunRequest> {
+    /// The editor, with its find bar (⌘F) over it, and its footer, and
+    /// under them the handle that drags the split. Returns the run the
+    /// editor asked for (⌘↩, F5), unless a script is running. `keys`: no
+    /// dialog is open.
+    fn editor_pane(&mut self, ui: &mut Ui, conn: Option<&OpenConn>, keys: bool) -> Option<RunRequest> {
         let mut run: Option<RunRequest> = None;
         // Editor on top, results below. The split is a stored height that only
         // changes when the user drags the handle: sizing it from the content
@@ -525,7 +544,10 @@ impl ShellTab {
             let ui = &mut ui;
             {
                 let footer_h = 24.0;
-                ui.allocate_ui(egui::vec2(width, (inner.height() - footer_h).max(20.0)), |ui| {
+                // The find bar's height comes off the script's: the results stay where they are.
+                self.editor.find_bar(ui, keys);
+                let script_h = (ui.available_height() - footer_h).max(20.0);
+                ui.allocate_ui(egui::vec2(width, script_h), |ui| {
                     let db = self.db.clone();
                     // Read when completing, not copied every frame.
                     let collections = || conn.map(|c| c.collection_names(&db)).unwrap_or_default();
@@ -607,7 +629,11 @@ impl ShellTab {
         } else {
             self.raw.all = false;
             let idx = self.active - 1;
-            self.results[idx].view.ui(ui, net)
+            // In an area of its own: a view claims ⌘F (and a click ends its
+            // select-all) for the pointer over its `max_rect`, which would
+            // otherwise be the whole tab, the script and its find bar too.
+            let area = ui.available_rect_before_wrap();
+            ui.scope_builder(egui::UiBuilder::new().max_rect(area), |ui| self.results[idx].view.ui(ui, net)).inner
         }
     }
 }
@@ -931,5 +957,354 @@ mod tests {
             })
             .fold(f64::INFINITY, f64::min);
         eprintln!("raw output, 200,000 lines printed 2,000 a frame: appending {appending:.1} ms in all, frames {drawing:.1} ms in all (slowest {slowest:.1} ms); then {idle:.2} ms/frame idle");
+    }
+
+    /// A shell tab in a harness, 1200×800, drawn as the app draws it, with
+    /// no connection; `keys` off is a dialog open over the window.
+    struct ShellProbe {
+        tab: ShellTab,
+        core: rongo_core::CoreHandle,
+        pending: HashMap<rongo_core::RequestId, crate::net::Sent>,
+        next_view: u64,
+        waker: Waker,
+        keys: bool,
+        _rt: tokio::runtime::Runtime,
+    }
+
+    fn shell_harness(script: &str) -> egui_kittest::Harness<'static, ShellProbe> {
+        shell_harness_sized(script, egui::vec2(1200.0, 800.0))
+    }
+
+    fn shell_harness_sized(script: &str, size: egui::Vec2) -> egui_kittest::Harness<'static, ShellProbe> {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let core = rongo_core::CoreHandle::start(rt.handle().clone(), Arc::new(|| {}));
+        let tab = ShellTab::new(ConnId(uuid::Uuid::nil()), "test".into(), 7, script.into());
+        let probe = ShellProbe { tab, core, pending: HashMap::new(), next_view: 0, waker: Arc::new(|| {}), keys: true, _rt: rt };
+        let mut h = egui_kittest::Harness::builder().with_size(size).build_ui_state(
+            |ui, p: &mut ShellProbe| {
+                crate::theme::install(ui.ctx());
+                let mut net = Net { core: &p.core, pending: &mut p.pending, next_view_id: &mut p.next_view, keys_enabled: p.keys };
+                p.tab.ui(ui, &mut net, None, || None, &p.waker);
+            },
+            probe,
+        );
+        h.run_steps(3);
+        h
+    }
+
+    /// Three matches of "apple" ignoring case, two matching it.
+    const APPLES: &str = "db.apple.find({ name: \"Apple pie\" })\nprint(\"pineapple\")\n";
+
+    /// The script editor's id (the tab's id is 7).
+    fn script_id() -> egui::Id {
+        egui::Id::new(("shell-editor", 7u64))
+    }
+
+    /// Focuses the script with its caret just after the first `after` in
+    /// it ("" for the start).
+    fn caret_after(h: &mut egui_kittest::Harness<'_, ShellProbe>, after: &str) {
+        use egui_kittest::kittest::Queryable;
+        h.get_by_role(egui::accesskit::Role::MultilineTextInput).focus();
+        h.run_steps(2);
+        let text = h.state().tab.editor.text.clone();
+        let at = text.find(after).unwrap_or_else(|| panic!("{after:?} in {text}")) + after.len();
+        let mut state = egui::TextEdit::load_state(&h.ctx, script_id()).expect("the script's state");
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(text[..at].chars().count()))));
+        state.store(&h.ctx, script_id());
+        h.run_steps(2);
+    }
+
+    /// The texts the last frame drew.
+    fn drawn(h: &egui_kittest::Harness<'_, ShellProbe>) -> Vec<String> {
+        crate::test_support::flat_shapes(h).into_iter().filter_map(|(_, s)| if let egui::Shape::Text(t) = s { Some(t.galley.text().to_string()) } else { None }).collect()
+    }
+
+    /// ⌘F with the script focused opens a find bar under the toolbar,
+    /// above the script, its field focused ("Find in this script"); not
+    /// with the script unfocused (the app's) or a dialog open. Typing
+    /// finds: "1 of 3", every match marked behind the script and the first
+    /// the current one; ↩ / ⇧↩ step round, the field keeping its focus;
+    /// Aa matches case; ⌘F again selects what was typed.
+    #[test]
+    fn cmd_f_finds_in_the_script() {
+        use crate::test_support::{find_count, find_marks, press, type_in};
+        use egui::Modifiers as M;
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut h = shell_harness(APPLES);
+        press(&mut h, M::COMMAND, Key::F);
+        assert!(h.query_by_role(Role::TextInput).is_none(), "⌘F with the script not focused is left to the app");
+        caret_after(&mut h, "");
+        h.state_mut().keys = false;
+        press(&mut h, M::COMMAND, Key::F);
+        assert!(h.query_by_role(Role::TextInput).is_none(), "nor with a dialog open");
+        h.state_mut().keys = true;
+        caret_after(&mut h, "");
+        press(&mut h, M::COMMAND, Key::F);
+        assert!(h.get_by_role(Role::TextInput).is_focused(), "⌘F focused the find field");
+        assert!(drawn(&h).iter().any(|t| t == "Find in this script"), "the field's hint: {:?}", drawn(&h));
+        let field = h.get_by_role(Role::TextInput).rect();
+        let new = h.get_by_label(&format!("{}  New", icon::FILE)).rect();
+        let script = h.ctx.read_response(script_id()).expect("the script drawn").rect;
+        assert!(new.bottom() <= field.top() && field.bottom() <= script.top(), "under the toolbar {new:?}, above the script {script:?}: {field:?}");
+        assert_eq!(find_count(&h), None, "nothing typed, nothing said");
+        type_in(&mut h, "apple");
+        assert_eq!(find_count(&h).as_deref(), Some("1 of 3"));
+        let (others, current) = find_marks(&h);
+        assert_eq!((others.len(), current.len()), (2, 1), "every match marked, the current one apart");
+        let c = current[0].0;
+        assert!(others.iter().all(|(o, _)| o.top() > c.top() || (o.top() == c.top() && o.left() > c.right())), "the first match is the current one");
+        assert!(others.iter().chain(&current).all(|(r, _)| r.top() >= script.top()), "the marks are on the script");
+        for (modifiers, want) in [(M::NONE, "2 of 3"), (M::NONE, "3 of 3"), (M::NONE, "1 of 3"), (M::SHIFT, "3 of 3")] {
+            press(&mut h, modifiers, Key::Enter);
+            assert_eq!(find_count(&h).as_deref(), Some(want), "after {modifiers:?} ↩");
+            assert!(h.get_by_role(Role::TextInput).is_focused(), "the field kept its focus");
+        }
+        assert_eq!(h.state().tab.editor.text, APPLES, "↩ went to the field, not the script");
+        h.get_by_label("Aa").click();
+        h.run_steps(2);
+        assert_eq!(find_count(&h).as_deref(), Some("1 of 2"), "matching case leaves \"Apple\" out");
+        // A click takes the focus: the bar gives it back to its field, so ⌘F, ↩ and Esc stay the bar's.
+        assert!(h.get_by_role(Role::TextInput).is_focused(), "Aa left the keys with the field");
+        h.get_by_label(icon::CARET_DOWN).click();
+        h.run_steps(2);
+        assert_eq!(find_count(&h).as_deref(), Some("2 of 2"));
+        assert!(h.get_by_role(Role::TextInput).is_focused(), "↓ left the keys with the field");
+        press(&mut h, M::COMMAND, Key::F);
+        assert!(h.get_by_role(Role::TextInput).is_focused());
+        type_in(&mut h, "pear");
+        assert_eq!(h.get_by_role(Role::TextInput).value().as_deref(), Some("pear"), "⌘F selected what was typed");
+        assert_eq!(find_count(&h).as_deref(), Some("No matches"));
+        assert_eq!(find_marks(&h), (vec![], vec![]));
+    }
+
+    /// Esc in the find field (or ✕) closes the bar only and gives the
+    /// script its focus with the current match selected: typing replaces
+    /// it. Esc pressed while typing in the script closes the bar too and
+    /// leaves the caret where it was.
+    #[test]
+    fn esc_closes_the_script_find_bar() {
+        use crate::test_support::{find_count, press, type_in};
+        use egui::Modifiers as M;
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut h = shell_harness(APPLES);
+        caret_after(&mut h, "");
+        press(&mut h, M::COMMAND, Key::F);
+        type_in(&mut h, "apple");
+        press(&mut h, M::NONE, Key::Enter);
+        assert_eq!(find_count(&h).as_deref(), Some("2 of 3"));
+        press(&mut h, M::NONE, Key::Escape);
+        assert!(h.query_by_role(Role::TextInput).is_none(), "Esc closed the find bar");
+        assert!(h.get_by_role(Role::MultilineTextInput).is_focused(), "the script has the focus");
+        type_in(&mut h, "Cherry");
+        assert_eq!(h.state().tab.editor.text, APPLES.replace("Apple", "Cherry"), "typing replaced the current match");
+
+        // Esc while typing in the script: the caret stays.
+        let mut h = shell_harness(APPLES);
+        caret_after(&mut h, "");
+        press(&mut h, M::COMMAND, Key::F);
+        type_in(&mut h, "apple");
+        caret_after(&mut h, "print(");
+        type_in(&mut h, "1, ");
+        press(&mut h, M::NONE, Key::Escape);
+        assert!(h.query_by_role(Role::TextInput).is_none(), "Esc closed the find bar");
+        assert!(h.get_by_role(Role::MultilineTextInput).is_focused(), "the script kept the focus");
+        type_in(&mut h, "2, ");
+        assert!(h.state().tab.editor.text.contains("print(1, 2, \"pineapple\")"), "the keystroke went to the caret: {}", h.state().tab.editor.text);
+
+        caret_after(&mut h, "");
+        press(&mut h, M::COMMAND, Key::F);
+        h.get_by_label(egui_phosphor::regular::X).click();
+        h.run_steps(2);
+        assert!(h.query_by_role(Role::TextInput).is_none(), "✕ closed the bar");
+    }
+
+    /// Editing the script with the bar open finds again, so the count
+    /// follows it; so does New (and Load file) replacing it. A search runs
+    /// only when the text, the needle or match case changes.
+    #[test]
+    fn script_find_follows_the_text() {
+        use crate::test_support::{find_count, find_marks, press, type_in};
+        use egui::Modifiers as M;
+        use egui_kittest::kittest::Queryable;
+        let searches = |h: &egui_kittest::Harness<'_, ShellProbe>| h.state().tab.editor.find().map_or(0, |f| f.searches);
+        let mut h = shell_harness(APPLES);
+        caret_after(&mut h, "");
+        press(&mut h, M::COMMAND, Key::F);
+        type_in(&mut h, "apple");
+        assert_eq!(find_count(&h).as_deref(), Some("1 of 3"));
+        let n = searches(&h);
+        assert!(n > 0);
+        h.run_steps(5);
+        assert_eq!(searches(&h), n, "nothing changed, nothing searched");
+        caret_after(&mut h, "pineapple\")");
+        assert_eq!(searches(&h), n, "the script's focus is no change");
+        type_in(&mut h, " // apple");
+        assert_eq!(find_count(&h).as_deref(), Some("1 of 4"), "the count follows the script");
+        assert_eq!(searches(&h), n + 1, "one search for the edit");
+        assert_eq!(find_marks(&h).0.len(), 3);
+        h.get_by_label("Aa").click();
+        h.run_steps(2);
+        assert_eq!(searches(&h), n + 2, "one for match case");
+        assert_eq!(find_count(&h).as_deref(), Some("1 of 3"));
+        h.state_mut().tab.editor.set_text("apple\napple".into());
+        h.run_steps(2);
+        assert_eq!(find_count(&h).as_deref(), Some("1 of 2"), "Load file: the count follows");
+        h.get_by_label(&format!("{}  New", icon::FILE)).click();
+        h.run_steps(2);
+        assert_eq!(find_count(&h).as_deref(), Some("No matches"), "New: the count follows");
+    }
+
+    /// With the bar open, autocomplete works in the script as before:
+    /// typing opens it, ↩ accepts. Esc with it open closes it, not the bar,
+    /// and the script keeps the focus: the next Esc closes the bar.
+    #[test]
+    fn autocomplete_works_with_the_find_bar_open() {
+        use crate::test_support::{find_count, press, type_in};
+        use egui::Modifiers as M;
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut h = shell_harness(APPLES);
+        caret_after(&mut h, "");
+        press(&mut h, M::COMMAND, Key::F);
+        type_in(&mut h, "getName");
+        assert_eq!(find_count(&h).as_deref(), Some("No matches"));
+        caret_after(&mut h, "pineapple\")\n");
+        type_in(&mut h, "db.getNa");
+        assert!(h.state().tab.editor.completing(), "suggestions opened");
+        press(&mut h, M::NONE, Key::Enter);
+        assert!(!h.state().tab.editor.completing());
+        assert!(h.state().tab.editor.text.ends_with("\ndb.getName"), "↩ accepted the suggestion: {:?}", h.state().tab.editor.text);
+        assert_eq!(find_count(&h).as_deref(), Some("1 of 1"), "the accepted text is found");
+        type_in(&mut h, "\ndb.getNa");
+        assert!(h.state().tab.editor.completing(), "suggestions opened");
+        press(&mut h, M::NONE, Key::Escape);
+        assert!(!h.state().tab.editor.completing(), "Esc closed the suggestions");
+        assert!(h.query_by_role(Role::TextInput).is_some(), "and not the find bar");
+        assert!(h.get_by_role(Role::MultilineTextInput).is_focused(), "the script kept the focus");
+        press(&mut h, M::NONE, Key::Escape);
+        assert!(h.query_by_role(Role::TextInput).is_none(), "the next Esc closed the find bar");
+        assert!(h.get_by_role(Role::MultilineTextInput).is_focused(), "the script still has the focus");
+    }
+
+    /// A script that replaces another (Load file, New) is found from its
+    /// first match, wherever the old one was scrolled to.
+    #[test]
+    fn a_replaced_script_is_found_from_its_first_match() {
+        use crate::test_support::{find_count, press, type_in};
+        use egui::Modifiers as M;
+        let mut script = String::from("print(\"zebra\")\n");
+        for i in 0..400 {
+            script.push_str(&format!("print({i})\n"));
+        }
+        script.push_str("print(\"zebra\")\n");
+        let mut h = shell_harness(&script);
+        caret_after(&mut h, "");
+        press(&mut h, M::COMMAND, Key::F);
+        type_in(&mut h, "zebra");
+        press(&mut h, M::NONE, Key::Enter);
+        h.run_steps(3);
+        assert_eq!(find_count(&h).as_deref(), Some("2 of 2"), "scrolled to the end");
+        h.state_mut().tab.editor.set_text("zebra\n".repeat(1000));
+        h.run_steps(3);
+        assert_eq!(find_count(&h).as_deref(), Some("1 of 1,000"), "Load file starts at the first match");
+    }
+
+    /// With the bar open the script keeps its colours and its error line's
+    /// mark: the matches are marked apart, behind the text.
+    #[test]
+    fn the_script_keeps_its_colours_and_error_mark_with_the_find_bar_open() {
+        use crate::test_support::{find_count, find_marks, flat_shapes, press, type_in};
+        use egui::Modifiers as M;
+        let mut h = shell_harness(APPLES);
+        h.state_mut().tab.editor.error_line = Some(2);
+        caret_after(&mut h, "");
+        press(&mut h, M::COMMAND, Key::F);
+        type_in(&mut h, "apple");
+        assert_eq!(find_count(&h).as_deref(), Some("1 of 3"));
+        assert_eq!(find_marks(&h).0.len(), 2, "the matches are marked");
+        let shapes = flat_shapes(&h);
+        let script = h.ctx.read_response(script_id()).expect("the script drawn").rect;
+        let line_2 = shapes.iter().find_map(|(_, s)| match s {
+            egui::Shape::Rect(r) if r.fill == crate::theme::ERROR.gamma_multiply(0.18) => Some(r.rect),
+            _ => None,
+        });
+        let line_2 = line_2.expect("the error line is still marked");
+        assert!(line_2.top() > script.top() + 5.0, "on the second line: {line_2:?}, the script at {script:?}");
+        let colours: std::collections::HashSet<_> = shapes
+            .iter()
+            .find_map(|(_, s)| match s {
+                egui::Shape::Text(t) if t.galley.text() == APPLES => Some(t.galley.job.sections.iter().map(|s| s.format.color).collect()),
+                _ => None,
+            })
+            .expect("the script drawn");
+        assert!(colours.contains(&crate::theme::STRING) && colours.contains(&crate::theme::FUNCTION), "the script keeps its colours: {colours:?}");
+    }
+
+    /// In a narrow tab the find bar fits: its field gives up width, and
+    /// nothing under it moves (the footer stays where it was, ✕ is on
+    /// screen). At 480 points it is one row; at 320 (about the narrowest a
+    /// shell tab gets) ✕ may go to a second.
+    #[test]
+    fn the_find_bar_fits_a_narrow_tab() {
+        use crate::test_support::{flat_shapes, press, type_in};
+        use egui::Modifiers as M;
+        use egui_kittest::kittest::Queryable;
+        for width in [480.0, 320.0] {
+            let mut h = shell_harness_sized(APPLES, egui::vec2(width, 700.0));
+            caret_after(&mut h, "");
+            let footer = |h: &egui_kittest::Harness<'_, ShellProbe>| {
+                flat_shapes(h).into_iter().find_map(|(_, s)| match s {
+                    egui::Shape::Text(t) if t.galley.text().starts_with("Lin ") => Some(t.galley.rect.translate(t.pos.to_vec2())),
+                    _ => None,
+                })
+            };
+            let before = footer(&h).expect("the footer drawn");
+            press(&mut h, M::COMMAND, Key::F);
+            type_in(&mut h, "apple");
+            let after = footer(&h).expect("the footer drawn");
+            assert!((after.right() - before.right()).abs() < 0.5, "{width}: the footer moved from {before:?} to {after:?}");
+            let close = h.get_by_label(egui_phosphor::regular::X).rect();
+            assert!(close.right() <= width, "{width}: ✕ off screen at {close:?}");
+            let field = h.get_by_role(egui::accesskit::Role::TextInput).rect();
+            assert!(field.width() < 280.0, "{width}: the field gave up width: {field:?}");
+            if width >= 480.0 {
+                // "No matches" is longer than "1 of 3": still one row.
+                press(&mut h, M::COMMAND, Key::A);
+                type_in(&mut h, "pear");
+                let close = h.get_by_label(egui_phosphor::regular::X).rect();
+                let field = h.get_by_role(egui::accesskit::Role::TextInput).rect();
+                assert!((close.center().y - field.center().y).abs() < 4.0, "{width}: one row: ✕ at {close:?}, the field at {field:?}");
+                assert!((footer(&h).expect("the footer drawn").right() - before.right()).abs() < 0.5, "{width}: the footer moved");
+            }
+        }
+    }
+
+    /// The current match is scrolled into view: in a long script, stepping
+    /// to a match at the end and round to the start shows each.
+    #[test]
+    fn the_current_match_is_scrolled_into_the_script() {
+        use crate::test_support::{find_count, find_marks, press, type_in};
+        use egui::Modifiers as M;
+        let mut script = String::from("print(\"zebra\")\n");
+        for i in 0..400 {
+            script.push_str(&format!("print({i})\n"));
+        }
+        script.push_str("print(\"zebra\")\n");
+        let mut h = shell_harness(&script);
+        caret_after(&mut h, "");
+        press(&mut h, M::COMMAND, Key::F);
+        type_in(&mut h, "zebra");
+        for (step, want) in [(false, "1 of 2"), (true, "2 of 2"), (true, "1 of 2")] {
+            if step {
+                press(&mut h, M::NONE, Key::Enter);
+            }
+            h.run_steps(3);
+            assert_eq!(find_count(&h).as_deref(), Some(want));
+            let (_, current) = find_marks(&h);
+            let [(rect, clip)] = current[..] else { panic!("{want}: the current match is on screen: {current:?}") };
+            assert!(clip.contains_rect(rect), "{want}: {rect:?} in view ({clip:?})");
+        }
     }
 }

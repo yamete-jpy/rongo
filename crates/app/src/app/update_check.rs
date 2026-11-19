@@ -98,6 +98,10 @@ impl RongoApp {
                 self.settings.skipped_version = Some(release.version);
                 self.save_skipped();
             }
+            Some(BannerAction::CopyBrew) => {
+                ui.ctx().copy_text(update::BREW_UPGRADE.into());
+                self.toast(format!("Copied: {}", update::BREW_UPGRADE), false);
+            }
             None => {}
         }
     }

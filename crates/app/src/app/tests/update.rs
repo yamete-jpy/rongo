@@ -230,6 +230,24 @@ fn open_download_page_opens_only_the_release_page() {
     assert!(toasts[0].contains("no browser") && toasts[0].contains(&page(newer(1))), "{toasts:?}");
 }
 
+/// The banner's Copy (macOS) puts the Homebrew command on the clipboard,
+/// `brew update` first so Homebrew sees the new release, and says so; the
+/// banner stays.
+#[test]
+fn copy_puts_the_homebrew_command_on_the_clipboard() {
+    assert_eq!(update::BREW_UPGRADE, "brew update && brew upgrade --cask rongo");
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let (hooks, _stub) = github(Ok(answer(newer(1))));
+    let (ctx, mut app) = app_with(TempDir::new(), hooks);
+    answered(&ctx, &mut app);
+    let copied = click_text(&ctx, &mut app, "Copy", |t| t.ends_with("  Copy"));
+    assert_eq!(copied, [update::BREW_UPGRADE]);
+    assert_eq!(toast_texts(&app), [format!("Copied: {}", update::BREW_UPGRADE)]);
+    assert!(banner_shown(&drawn_texts(&ctx, &mut app), newer(1)), "the banner stays");
+}
+
 /// Turned off in Settings, rongo never asks (nothing is written either);
 /// turning it off hides a banner already shown.
 #[test]

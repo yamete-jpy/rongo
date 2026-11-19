@@ -822,7 +822,7 @@ impl DocDialog {
             ui.heading(title);
             ui.weak("Shell syntax: ObjectId(\"…\"), ISODate(\"…\"), NumberLong(\"…\"), NumberDecimal(\"…\"), Double(5).");
             ui.add_space(4.0);
-            doc_find::bar(&mut self.find, ui, editor, &self.text, self.version);
+            doc_find::bar(&mut self.find, ui, editor, "Find in this document", doc_find::Keys::Dialog, &self.text, self.version);
             // The find bar's height comes off the editor's: the dialog keeps its size.
             let edit_h = window_h - if self.find.is_some() { doc_find::BAR_H } else { 0.0 };
             let layout = &mut self.layout;
@@ -831,7 +831,7 @@ impl DocDialog {
                 egui::ScrollArea::vertical().max_height(edit_h).min_scrolled_height(edit_h.min(300.0)).show(ui, |ui| {
                     let marks = ui.painter().add(egui::Shape::Noop);
                     // Where the selection began before this frame's typing: the text before it stays.
-                    let selected_from = self.find.as_ref().and_then(|_| egui::TextEdit::load_state(ui.ctx(), editor)?.cursor.char_range()).map(|r| r.as_sorted_char_range().start.0);
+                    let selected_from = doc_find::edit_from(&self.find, ui.ctx(), editor);
                     let edit = egui::TextEdit::multiline(&mut self.text)
                         .id(editor)
                         .code_editor()
@@ -844,11 +844,7 @@ impl DocDialog {
                         self.typed = true;
                         self.version += 1;
                         // Found again at once: the marks below are for this text.
-                        if let Some(f) = &mut self.find {
-                            let caret = edit.cursor_range.map(|r| r.primary.index.0);
-                            let at = selected_from.zip(caret).map(|(from, caret)| doc_find::Edit { start: from.min(caret), caret });
-                            f.update(ui.ctx(), &self.text, self.version, at);
-                        }
+                        doc_find::edited(&mut self.find, ui.ctx(), &self.text, self.version, selected_from, &edit);
                     }
                     doc_find::paint(&mut self.find, ui, marks, &edit);
                 });
@@ -914,7 +910,7 @@ impl ViewDocDialog {
             ui.heading(format!("{}  View Document", icon::FILE_TEXT));
             ui.add_space(4.0);
             // The text never changes: one version.
-            doc_find::bar(&mut self.find, ui, viewer, &self.text, 0);
+            doc_find::bar(&mut self.find, ui, viewer, "Find in this document", doc_find::Keys::Dialog, &self.text, 0);
             // The find bar's height comes off the text's: the dialog keeps its size.
             let view_h = 480.0 - if self.find.is_some() { doc_find::BAR_H } else { 0.0 };
             let layout = &mut self.layout;
@@ -980,6 +976,9 @@ pub enum Pending {
     /// Reset the master password (Settings → Reset…, or Forgot? at launch).
     /// The checkbox, there when there is Collection History, deletes it too.
     ResetVault,
+    /// Close these tabs (a tab menu's close, with scripts among them);
+    /// `focus` is shown if the active tab closes.
+    CloseTabs { ids: Vec<u64>, focus: Option<u64> },
 }
 
 pub struct Confirm {
@@ -1095,7 +1094,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::test_support::temp_vault;
+    use crate::test_support::{find_count, find_marks, flat_shapes, press, temp_vault, type_in};
 
     /// Editing a connection keeps its lock: the form carries `read_only`
     /// through (it used to build every profile unlocked), and its checkbox
@@ -2052,58 +2051,6 @@ mod tests {
     fn view_harness(doc: &Document) -> egui_kittest::Harness<'static, ViewProbe> {
         let probe = ViewProbe { dialog: ViewDocDialog::new(doc), closed: false };
         crate::test_support::harness(vec2(1000.0, 800.0), 3, probe, |ctx, p: &mut ViewProbe| p.closed |= p.dialog.show(ctx))
-    }
-
-    /// Every shape the last frame drew, `Shape::Vec`s opened, with the
-    /// clip it was drawn in.
-    fn flat_shapes<S>(h: &egui_kittest::Harness<'_, S>) -> Vec<(egui::Rect, egui::Shape)> {
-        fn open(clip: egui::Rect, s: &egui::Shape, out: &mut Vec<(egui::Rect, egui::Shape)>) {
-            match s {
-                egui::Shape::Vec(v) => v.iter().for_each(|s| open(clip, s, out)),
-                s => out.push((clip, s.clone())),
-            }
-        }
-        let mut out = Vec::new();
-        for c in &h.output().shapes {
-            open(c.clip_rect, &c.shape, &mut out);
-        }
-        out
-    }
-
-    /// What the find bar says: "n of m" or "No matches", if anything.
-    fn find_count<S>(h: &egui_kittest::Harness<'_, S>) -> Option<String> {
-        flat_shapes(h).into_iter().find_map(|(_, s)| match s {
-            egui::Shape::Text(t) if t.galley.text() == "No matches" || (t.galley.text().contains(" of ") && t.galley.text().starts_with(|c: char| c.is_ascii_digit())) => Some(t.galley.text().to_string()),
-            _ => None,
-        })
-    }
-
-    /// The find marks the last frame drew behind the text: the matches,
-    /// then the current one, each as (its rect, the clip it is drawn in).
-    type Marks = Vec<(egui::Rect, egui::Rect)>;
-    fn find_marks<S>(h: &egui_kittest::Harness<'_, S>) -> (Marks, Marks) {
-        let (mut others, mut current) = (Vec::new(), Vec::new());
-        for (clip, s) in flat_shapes(h) {
-            if let egui::Shape::Rect(r) = s {
-                if r.fill == theme::FIND_MATCH {
-                    others.push((r.rect, clip));
-                } else if r.fill == theme::FIND_CURRENT {
-                    current.push((r.rect, clip));
-                }
-            }
-        }
-        (others, current)
-    }
-
-    fn press<S>(h: &mut egui_kittest::Harness<'_, S>, modifiers: egui::Modifiers, key: Key) {
-        h.key_press_modifiers(modifiers, key);
-        h.run_steps(2);
-    }
-
-    /// Types `text` into the focused field.
-    fn type_in<S>(h: &mut egui_kittest::Harness<'_, S>, text: &str) {
-        h.event(egui::Event::Text(text.into()));
-        h.run_steps(2);
     }
 
     /// ⌘F in the document editor opens a find bar above the text with its

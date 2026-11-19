@@ -26,11 +26,14 @@ use support::*;
 
 mod history;
 mod history_tab;
+mod indexes;
 mod operations;
 mod paste;
 mod settings;
+mod shell_find;
 mod status;
 mod support;
+mod tab_menu;
 mod tree;
 mod ui;
 mod update;

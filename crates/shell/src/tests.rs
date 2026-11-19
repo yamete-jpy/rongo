@@ -12,15 +12,21 @@ struct Fixture {
     _rt: tokio::runtime::Runtime,
     shell: ShellHandle,
     conn: Conn,
+    db: &'static str,
 }
 
 impl Fixture {
+    /// A shell on the test data, in its main database.
     fn new() -> Self {
+        Self::on(MockStore::test_data(), rongo_core::mock::TEST_DB)
+    }
+
+    fn on(store: MockStore, db: &'static str) -> Self {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
-        let conn = Conn::mock(MockStore::demo(), false);
+        let conn = Conn::mock(store, false);
         let session = Session { conn: conn.clone(), rt: rt.handle().clone() };
         let shell = ShellHandle::spawn(session, Arc::new(|| {}));
-        Fixture { _rt: rt, shell, conn }
+        Fixture { _rt: rt, shell, conn, db }
     }
 
     /// Documents put straight into the demo server, as stored, not through a script.
@@ -40,7 +46,7 @@ impl Fixture {
 
     /// Run a script and collect everything it produced.
     fn run(&mut self, code: &str) -> (Vec<String>, Vec<ResultItem>, String, Option<ShellError>) {
-        let run = self.shell.run(code, "demo-games", 0);
+        let run = self.shell.run(code, self.db, 0);
         let (mut prints, mut results) = (Vec::new(), Vec::new());
         // Only a guard against a hang: a loaded machine can be slow.
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -57,6 +63,18 @@ impl Fixture {
             }
         }
     }
+}
+
+/// The script the demo (`--mock`) opens with runs on the demo's data: two
+/// finds left for the tab to page through and an aggregation's groups.
+#[test]
+fn the_demo_script_runs_on_the_demo() {
+    let mut f = Fixture::on(MockStore::demo(), rongo_core::mock::DEMO_DB);
+    let (prints, results, db, error) = f.run(rongo_core::mock::DEMO_SCRIPT);
+    assert_eq!((error, db.as_str()), (None, rongo_core::mock::DEMO_DB), "{prints:?}");
+    let [ResultItem::Find { spec: products, .. }, ResultItem::Find { spec: orders, .. }, ResultItem::Docs { docs: groups, .. }] = &results[..] else { panic!("{results:?}") };
+    assert_eq!((products.ns.coll.as_str(), orders.ns.coll.as_str()), ("products", "orders"));
+    assert_eq!(groups.len(), 4, "{groups:?}");
 }
 
 #[test]

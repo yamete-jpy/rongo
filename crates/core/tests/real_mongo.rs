@@ -177,6 +177,11 @@ fn collection_admin_and_transfer_against_a_real_server() {
     assert!(matches!(ev, Event::Written(ref w) if w.matched == 5 && w.modified == 5), "{ev:?}");
     let ev = send(Command::CreateIndex { ns: ns.clone(), keys: doc! { "i": 1 }, options: Some(doc! { "name": "i_1", "unique": true }) });
     assert!(matches!(ev, Event::Document(ref d) if d.get_str("createdIndex").ok() == Some("i_1")), "{ev:?}");
+    // The same again builds nothing, and says so; another spec under its name is refused.
+    let ev = send(Command::CreateIndex { ns: ns.clone(), keys: doc! { "i": 1 }, options: Some(doc! { "name": "i_1", "unique": true }) });
+    assert!(matches!(ev, Event::Document(ref d) if d.get_str("existingIndex").ok() == Some("i_1")), "{ev:?}");
+    let ev = send(Command::CreateIndex { ns: ns.clone(), keys: doc! { "i": 1 }, options: Some(doc! { "name": "i_1" }) });
+    assert!(matches!(ev, Event::Failed(CoreError::Server { code: 85 | 86, .. })), "{ev:?}");
 
     let ev = send(Command::SetValidator { ns: ns.clone(), validator: doc! { "i": { "$type": "int" } }, level: "moderate".into(), action: "warn".into() });
     assert!(matches!(ev, Event::Done), "{ev:?}");

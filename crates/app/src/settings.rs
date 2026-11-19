@@ -609,8 +609,12 @@ impl SettingsDialog {
     fn history_list(&self, ui: &mut Ui, view: &HistoryView, rows: &[(Uuid, Namespace, u64, u64)], action: &mut Option<SettingsAction>) {
         let width = ui.available_width();
         let row_h = 24.0;
-        let buttons = 112.0;
-        let cols = [0.24, 0.20, 0.24, 0.13, 0.19].map(|f| f * (width - buttons).max(120.0));
+        // Room for Open and Delete…, as wide as they draw: their text, a
+        // button's padding on both sides, the gap between them, and a little
+        // more before the Size column.
+        let button_w = |text: &str| egui::WidgetText::from(text).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Button).size().x + 2.0 * ui.spacing().button_padding.x;
+        let buttons = button_w("Open") + button_w("Delete…") + ui.spacing().item_spacing.x + 8.0;
+        let cols = [0.24, 0.19, 0.24, 0.12, 0.21].map(|f| f * (width - buttons).max(120.0));
         let (head, _) = ui.allocate_exact_size(vec2(width, row_h), Sense::hover());
         ui.painter().rect_filled(head, 0.0, theme::RAISED);
         let mut x = head.left();
@@ -966,6 +970,28 @@ mod tests {
         assert!(d.draft.check_updates && !d.unsaved());
         d.draft.check_updates = false;
         assert!(d.unsaved());
+    }
+
+    /// A history row's Open and Delete… are drawn whole, clear of the Size
+    /// column, and the size reads in full ("under 0.1 MB"): the buttons
+    /// once took more room than kept for them and were cut on the left.
+    #[test]
+    fn history_rows_show_their_buttons_and_size_whole() {
+        let mut files = no_history();
+        let ns = Namespace::new("shop", "orders");
+        files.set_scan(Scan { by_profile: [(Uuid::from_u128(0), 4096)].into(), colls: vec![(Uuid::from_u128(0), ns, 3, 4096)] });
+        let names = HashMap::from([(Uuid::from_u128(0), "Demo".to_string())]);
+        let view = HistoryView { files: &files, names: &names, in_use: &[] };
+        let mut d = SettingsDialog::new(&Settings::default());
+        let ctx = themed();
+        let texts = draw(&ctx, &mut d, &view, egui::vec2(1440.0, 900.0), 3);
+        let at = |want: &str| texts.iter().find(|d| d.text == want).unwrap_or_else(|| panic!("{want} is drawn: {:?}", texts.iter().map(|d| &d.text).collect::<Vec<_>>()));
+        let size = at(&mb(4096));
+        for button in ["Open", "Delete…"] {
+            let b = at(button);
+            assert!(b.clip.contains_rect(b.rect), "{button} is cut: {:?} in {:?}", b.rect, b.clip);
+            assert!(b.rect.left() > size.rect.right(), "{button} clear of the size: {:?} {:?}", b.rect, size.rect);
+        }
     }
 
     /// At 760×720 with 200 histories of long names, Settings fits the

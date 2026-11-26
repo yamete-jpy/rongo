@@ -10,7 +10,8 @@ use super::docs::Docs;
 /// One level of drilling into nested values.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Step {
-    /// The same field of every row (Step Into Column on objects).
+    /// The same field of every row (Step Into Column, on an object or an
+    /// array; a field named by a number is that element of an array).
     Field(String),
     /// The elements of one row's array field. `row` is among the rows of
     /// the level above, and moves with `doc` (see `follow_drill`).
@@ -39,15 +40,50 @@ pub(super) struct Row<'a> {
     pub(super) value: &'a Bson,
 }
 
+/// The column every drilled level starts with: the `_id` of the document
+/// each row came from. Fixed in first place, kept out of the level's
+/// column order and hidden set, never sorted by and never a field path.
+pub(super) const DOC_ID: &str = "{Document id}";
+
 pub(super) fn join(prefix: &str, field: &str) -> String {
     if prefix.is_empty() { field.to_string() } else { format!("{prefix}.{field}") }
 }
 
+/// The array index a field name stands for: a number written as MongoDB
+/// writes one in a path (`0`, `12`; not `01` or `+1`). The header sort
+/// reads paths the same way.
+pub(super) fn index(name: &str) -> Option<usize> {
+    let digits = !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit());
+    (digits && (name == "0" || !name.starts_with('0'))).then(|| name.parse().ok()).flatten()
+}
+
+/// What `name` is inside `v`: an object's field, or an array's element
+/// when `name` is its index.
+fn child<'a>(v: &'a Bson, name: &str) -> Option<&'a Bson> {
+    match v {
+        Bson::Document(d) => d.get(name),
+        Bson::Array(items) => items.get(index(name)?),
+        _ => None,
+    }
+}
+
+/// One step of a path as the column steps take it: it needs an object, or
+/// an array and an index (an array has nothing else), and a field or an
+/// element it lacks is null.
+fn step<'a>(v: &'a Bson, name: &str) -> Option<&'a Bson> {
+    match v {
+        Bson::Document(d) => Some(d.get(name).unwrap_or(&NULL)),
+        Bson::Array(items) => index(name).map(|i| items.get(i).unwrap_or(&NULL)),
+        _ => None,
+    }
+}
+
 /// The cell in column `col` of a row whose value is `row`: that field of
-/// it, or for "(value)" the value itself, unless it is a document (whose
-/// fields are columns of their own).
+/// it (an array's element, for a number), or for "(value)" the value
+/// itself, unless it is an object or an array (whose fields and elements
+/// are columns of their own).
 pub(super) fn cell_in<'a>(row: &'a Bson, col: &str) -> Option<&'a Bson> {
-    if col == "(value)" { (!matches!(row, Bson::Document(_))).then_some(row) } else { row.as_document().and_then(|d| d.get(col)) }
+    if col == "(value)" { (!matches!(row, Bson::Document(_) | Bson::Array(_))).then_some(row) } else { child(row, col) }
 }
 
 pub(super) fn compute_columns(resolved: &Rows) -> Vec<String> {
@@ -57,8 +93,15 @@ pub(super) fn compute_columns(resolved: &Rows) -> Vec<String> {
         Rows::Top(docs) => raw_columns(docs.raw()),
         Rows::Drilled { .. } => {
             let values = || (0..resolved.len()).filter_map(|i| resolved.get(i)).map(|r| r.value);
+            // The scalars, then the objects' fields, then the arrays'
+            // elements up to the longest array.
             let mut cols = format::columns(values().filter_map(Bson::as_document));
-            if values().any(|v| !matches!(v, Bson::Document(_))) {
+            let longest = values().filter_map(Bson::as_array).map(Vec::len).max().unwrap_or(0);
+            if longest > 0 {
+                let keys: std::collections::HashSet<String> = cols.iter().cloned().collect();
+                cols.extend((0..longest).map(|i| i.to_string()).filter(|i| !keys.contains(i)));
+            }
+            if values().any(|v| !matches!(v, Bson::Document(_) | Bson::Array(_))) {
                 cols.insert(0, "(value)".to_string());
             }
             cols
@@ -103,7 +146,9 @@ pub(super) enum Rows<'a> {
 /// One step from a value to a value inside it.
 #[derive(Clone, Debug)]
 enum Seg {
+    /// A field step's name (`step`: an index into an array).
     Key(String),
+    /// An element a row step drilled into.
     Index(usize),
 }
 
@@ -137,15 +182,15 @@ pub(super) struct Level {
     /// Fields stepped into after the base, in turn.
     fields: Vec<String>,
     /// For each row, its document's row (`Base::Docs`) or its element of
-    /// the array, among only those where every field step meets an object.
+    /// the array, among only those where every field step meets an object
+    /// or an array.
     pub(super) rows: Vec<usize>,
 }
 
-/// `v`, stepped into `fields` in turn as the column steps do: each step
-/// needs an object, and a field it lacks is null.
+/// `v`, stepped into `fields` in turn as the column steps do (`step`).
 fn walk_fields<'a>(mut v: &'a Bson, fields: &[String]) -> Option<&'a Bson> {
     for f in fields {
-        v = v.as_document()?.get(f).unwrap_or(&NULL);
+        v = step(v, f)?;
     }
     Some(v)
 }
@@ -154,7 +199,7 @@ fn walk_fields<'a>(mut v: &'a Bson, fields: &[String]) -> Option<&'a Bson> {
 fn walk<'a>(mut v: &'a Bson, at: &[Seg]) -> Option<&'a Bson> {
     for s in at {
         v = match s {
-            Seg::Key(k) => v.as_document()?.get(k).unwrap_or(&NULL),
+            Seg::Key(k) => step(v, k)?,
             Seg::Index(i) => v.as_array()?.get(*i)?,
         };
     }
@@ -181,7 +226,7 @@ impl Level {
                     Some(l) => l.row(docs, *row).map(|(o, v)| (o, v, l.path(*row), l.at(*row))),
                 };
                 let found = picked.and_then(|(origin, v, path, mut at)| {
-                    let inner = v.as_document()?.get(field)?;
+                    let inner = child(v, field)?;
                     at.push(Seg::Key(field.clone()));
                     let path = join(&path, field);
                     match inner {
@@ -287,6 +332,15 @@ impl<'a> Rows<'a> {
         match self {
             Rows::Top(d) => d.get(i).map(|value| Row { origin: i, value }),
             Rows::Drilled { docs, level, container } => level.row_in(docs, *container, i).map(|(origin, value)| Row { origin, value }),
+        }
+    }
+
+    /// `row`'s cell in column `col` (`cell_in`); at a drilled level, in
+    /// `DOC_ID`, the `_id` of its document.
+    pub(super) fn cell(&self, row: Row<'a>, col: &str) -> Option<&'a Bson> {
+        match self {
+            Rows::Drilled { docs, .. } if col == DOC_ID => docs.doc(row.origin)?.get("_id"),
+            _ => cell_in(row.value, col),
         }
     }
 

@@ -26,6 +26,7 @@ mod tabs;
 mod test_support;
 mod theme;
 mod tools;
+mod undo;
 mod unlock;
 mod update;
 mod vault_ui;

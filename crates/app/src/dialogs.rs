@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::doc_find::{self, DocFind};
 use crate::theme;
+use crate::undo::{self, History};
 use crate::vault_ui::{self, CatchUp};
 
 // ---------------------------------------------------------------- connection manager
@@ -777,6 +778,8 @@ pub struct DocDialog {
     find: Option<DocFind>,
     /// Something was typed: a click outside or Esc no longer closes it.
     typed: bool,
+    /// What ⌘Z undoes and ⇧⌘Z redoes.
+    history: History,
     pub error: Option<String>,
     pub saving: Option<RequestId>,
 }
@@ -790,7 +793,12 @@ impl DocDialog {
     pub fn edit(conn: ConnId, ns: Namespace, doc: &Document, view: Option<u64>) -> Self {
         let id = doc.get("_id").cloned().unwrap_or(Bson::Null);
         let text = format::doc_to_shell(doc, Style::Editable);
-        Self { conn, ns, mode: DocMode::Edit { id }, view, text, version: 0, layout: Default::default(), find: None, typed: false, error: None, saving: None }
+        Self::new(conn, ns, DocMode::Edit { id }, view, text)
+    }
+
+    fn new(conn: ConnId, ns: Namespace, mode: DocMode, view: Option<u64>, text: String) -> Self {
+        let history = History::new(&text);
+        Self { conn, ns, mode, view, text, version: 0, layout: Default::default(), find: None, typed: false, history, error: None, saving: None }
     }
 
     #[cfg(test)]
@@ -803,7 +811,7 @@ impl DocDialog {
             Some(d) => format::doc_to_shell(d, Style::Editable),
             None => "{\n    \n}".to_string(),
         };
-        Self { conn, ns, mode: DocMode::Insert, view, text, version: 0, layout: Default::default(), find: None, typed: false, error: None, saving: None }
+        Self::new(conn, ns, DocMode::Insert, view, text)
     }
 
     pub fn show(&mut self, ctx: &Context) -> Option<DocAction> {
@@ -823,6 +831,15 @@ impl DocDialog {
             ui.weak("Shell syntax: ObjectId(\"…\"), ISODate(\"…\"), NumberLong(\"…\"), NumberDecimal(\"…\"), Double(5).");
             ui.add_space(4.0);
             doc_find::bar(&mut self.find, ui, editor, "Find in this document", doc_find::Keys::Dialog, &self.text, self.version);
+            // ⌘Z, ⇧⌘Z / ⌘Y: the text as it was, seen as an edit.
+            let undone = self.history.keys(ui, editor, &mut self.text);
+            if let Some(u) = &undone {
+                self.typed = true;
+                self.version += 1;
+                if let Some(f) = &mut self.find {
+                    f.update(ui.ctx(), &self.text, self.version, Some(doc_find::Edit { start: u.start, caret: u.end }));
+                }
+            }
             // The find bar's height comes off the editor's: the dialog keeps its size.
             let edit_h = window_h - if self.find.is_some() { doc_find::BAR_H } else { 0.0 };
             let layout = &mut self.layout;
@@ -832,6 +849,7 @@ impl DocDialog {
                     let marks = ui.painter().add(egui::Shape::Noop);
                     // Where the selection began before this frame's typing: the text before it stays.
                     let selected_from = doc_find::edit_from(&self.find, ui.ctx(), editor);
+                    let before = self.history.before(ui.ctx(), editor);
                     let edit = egui::TextEdit::multiline(&mut self.text)
                         .id(editor)
                         .code_editor()
@@ -840,6 +858,10 @@ impl DocDialog {
                         .desired_rows(18)
                         .layouter(&mut layouter)
                         .show(ui);
+                    self.history.after(ui, &self.text, before, &edit);
+                    if let Some(u) = &undone {
+                        undo::show_caret(ui, &edit, u.sel.caret);
+                    }
                     if edit.response.changed() {
                         self.typed = true;
                         self.version += 1;
@@ -2298,6 +2320,117 @@ mod tests {
             });
             assert_eq!(copied.as_deref(), Some(want), "{needle}: the selection left on closing");
         }
+    }
+
+    /// The document editor on screen, driven a frame at a time with the
+    /// clock going on as each frame says, its text focused.
+    struct DocScreen {
+        ctx: Context,
+        dialog: DocDialog,
+        now: f64,
+    }
+
+    impl DocScreen {
+        fn editor() -> Id {
+            Id::new("doc-dialog").with("text")
+        }
+
+        fn new(dialog: DocDialog) -> Self {
+            let ctx = Context::default();
+            theme::install(&ctx);
+            let mut s = Self { ctx, dialog, now: 100.0 };
+            for _ in 0..3 {
+                s.frame(0.15, vec![]);
+            }
+            s.ctx.memory_mut(|m| m.request_focus(Self::editor()));
+            s.frame(0.15, vec![]);
+            s
+        }
+
+        fn frame(&mut self, dt: f64, events: Vec<egui::Event>) {
+            self.now += dt;
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1000.0, 800.0))), time: Some(self.now), events, ..Default::default() };
+            let dialog = &mut self.dialog;
+            let mut out = self.ctx.run_ui(input, |ui| _ = dialog.show(ui.ctx()));
+            out.textures_delta.clear();
+        }
+
+        /// Typed a character a frame, 0.15 s apart.
+        fn type_in(&mut self, s: &str) {
+            for c in s.chars() {
+                self.frame(0.15, vec![egui::Event::Text(c.to_string())]);
+            }
+        }
+
+        fn key(&mut self, key: Key, modifiers: egui::Modifiers) {
+            self.frame(0.15, vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }]);
+        }
+
+        fn sel(&self) -> crate::undo::Sel {
+            let r = egui::TextEdit::load_state(&self.ctx, Self::editor()).and_then(|s| s.cursor.char_range()).expect("the editor's selection");
+            crate::undo::Sel { anchor: r.secondary.index.0, caret: r.primary.index.0 }
+        }
+
+        fn caret_at(&mut self, chars: usize) {
+            let mut state = egui::TextEdit::load_state(&self.ctx, Self::editor()).unwrap_or_default();
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(chars))));
+            state.store(&self.ctx, Self::editor());
+            self.frame(0.15, vec![]);
+        }
+    }
+
+    /// ⌘Z in the document editor steps back a word at a time, the caret at
+    /// the end of what is left; ⇧⌘Z and ⌘Y step forward again, the caret at
+    /// the end of what each puts back. Undone back to nothing, the dialog
+    /// still counts as typed into (a click outside doesn't close it).
+    #[test]
+    fn cmd_z_undoes_the_document_a_word_at_a_time() {
+        use crate::undo::Sel;
+        use egui::Modifiers as M;
+        let conn = ConnectionProfile::mock().conn_id();
+        let mut s = DocScreen::new(DocDialog::insert(conn, Namespace::new("db", "c"), None, None));
+        assert_eq!(s.dialog.text(), "{\n    \n}");
+        s.caret_at(6);
+        s.type_in("name: \"Ann Lee\"");
+        assert_eq!(s.dialog.text(), "{\n    name: \"Ann Lee\"\n}");
+        for (want, caret) in [("{\n    name: \"Ann\n}", 16), ("{\n    name:\n}", 11), ("{\n    \n}", 6)] {
+            s.key(Key::Z, M::COMMAND);
+            assert_eq!(s.dialog.text(), want);
+            assert_eq!(s.sel(), Sel::at(caret), "the caret after undoing to {want:?}");
+        }
+        s.key(Key::Z, M::COMMAND);
+        assert_eq!(s.dialog.text(), "{\n    \n}", "nothing left to undo");
+        assert!(s.dialog.typed, "undone, the dialog still counts as typed into");
+        for (key, modifiers, want, caret) in [(Key::Z, M::COMMAND | M::SHIFT, "{\n    name:\n}", 11), (Key::Y, M::COMMAND, "{\n    name: \"Ann\n}", 16), (Key::Z, M::COMMAND | M::SHIFT, "{\n    name: \"Ann Lee\"\n}", 21)] {
+            s.key(key, modifiers);
+            assert_eq!(s.dialog.text(), want, "{key:?} {modifiers:?} redoes");
+            assert_eq!(s.sel(), Sel::at(caret), "the caret after redoing to {want:?}");
+        }
+    }
+
+    /// With the find bar open, ⌘Z in the document finds again in the text
+    /// put back: the count and the marks are for it. The dialog keeps its
+    /// work after it (a click outside doesn't close it).
+    #[test]
+    fn undo_in_the_document_finds_again() {
+        use egui::Modifiers as M;
+        let mut h = doc_harness(&apples());
+        let original = h.state().dialog.text().to_string();
+        press(&mut h, M::COMMAND, Key::F);
+        type_in(&mut h, "apple");
+        assert_eq!(find_count(&h).as_deref(), Some("1 of 3"));
+        caret_after(&mut h, "\"pineapple\"");
+        type_in(&mut h, " apple apple");
+        assert_eq!(find_count(&h).as_deref(), Some("1 of 5"));
+        press(&mut h, M::COMMAND, Key::Z);
+        assert_eq!(find_count(&h).as_deref(), Some("1 of 4"), "a word undone, found in the text put back");
+        press(&mut h, M::COMMAND, Key::Z);
+        assert_eq!(h.state().dialog.text(), original);
+        assert_eq!(find_count(&h).as_deref(), Some("1 of 3"), "the other word undone");
+        let (others, current) = find_marks(&h);
+        assert_eq!((others.len(), current.len()), (2, 1));
+        crate::test_support::click_outside(&mut h);
+        assert!(!h.state().closed, "a click outside keeps the work");
     }
 
     /// ⌘S still saves with the find bar open and its field focused.

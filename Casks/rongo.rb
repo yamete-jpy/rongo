@@ -1,6 +1,6 @@
 cask "rongo" do
-  version "0.1.7"
-  sha256 "7f4535c011d424254eec2a3270eeb09cca0ccdf8f86a1227884630de38ba5ed9"
+  version "0.1.8"
+  sha256 "6c0cc97c75ca225a08ec9ff37df91fb258d7ce13eed9abb0fe934d613341825d"
 
   url "https://github.com/yamete-jpy/rongo/releases/download/v#{version}/rongo-#{version}-arm64.dmg"
   name "rongo"
@@ -12,7 +12,10 @@ cask "rongo" do
 
   app "rongo.app"
 
-  zap trash: "~/Library/Application Support/dev.rongo.rongo"
+  zap trash: [
+    "~/Library/Application Support/dev.rongo.rongo",
+    "~/Library/Application Support/rongo",
+  ]
 
   caveats <<~EOS
     rongo is not notarized by Apple, so macOS blocks its first launch,

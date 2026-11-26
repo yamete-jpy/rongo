@@ -1,7 +1,9 @@
 //! The shell's code editor: a monospace `TextEdit` with JavaScript colouring,
 //! a line-number gutter, the current line highlighted, an error marker, an
-//! autocomplete popup, and a find bar (⌘F).
+//! autocomplete popup, a find bar (⌘F), and undo about a word at a time
+//! (⌘Z, ⇧⌘Z / ⌘Y).
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use egui::text::{CCursor, CCursorRange};
@@ -9,6 +11,7 @@ use egui::{Align2, Area, Frame, Galley, Id, Key, Modifiers, Order, Rect, Sense, 
 use rongo_shell::complete::{self, Completion, Kind};
 
 use crate::doc_find::{self, DocFind};
+use crate::undo::{self, History, Sel};
 use crate::{highlight, theme};
 
 pub struct CodeEditor {
@@ -28,6 +31,13 @@ pub struct CodeEditor {
     find: Option<DocFind>,
     /// Counts the edits of `text`: the find bar searches it again.
     version: u64,
+    /// What ⌘Z undoes and ⇧⌘Z redoes.
+    history: History,
+    /// The file the script was loaded from or saved to, if any: ⌘S saves
+    /// to it.
+    file: Option<PathBuf>,
+    /// Give the text the keyboard focus once it is drawn.
+    take_keys: bool,
 }
 
 /// The editor's text as laid out (coloured, wrapped at `wrap`), kept while
@@ -63,7 +73,39 @@ pub struct EditorOutput {
 
 impl CodeEditor {
     pub fn new(id: Id, text: impl Into<String>) -> Self {
-        Self { text: text.into(), id, completion: None, cursor: 0, selection: None, error_line: None, awaiting_fields: None, laid: None, find: None, version: 0 }
+        let text = text.into();
+        let history = History::new(&text);
+        Self { text, id, completion: None, cursor: 0, selection: None, error_line: None, awaiting_fields: None, laid: None, find: None, version: 0, history, file: None, take_keys: false }
+    }
+
+    /// The text takes the keyboard focus when it is next drawn (after New
+    /// or Load file, whose button or dialog took it: ⌘Z then undoes them
+    /// at once). Asked after the text is drawn, past egui's taking it away
+    /// for a click elsewhere in that frame.
+    pub fn take_keys(&mut self) {
+        self.take_keys = true;
+    }
+
+    /// The file the script was loaded from or saved to, if any.
+    pub fn file(&self) -> Option<&Path> {
+        self.file.as_deref()
+    }
+
+    /// The script was saved to `path`: ⌘S saves there from now on, also
+    /// after undoing or redoing back to this script.
+    pub fn saved_to(&mut self, path: PathBuf) {
+        if self.file.as_ref() != Some(&path) {
+            self.history.file_named(Some(path.clone()));
+            self.file = Some(path);
+        }
+    }
+
+    /// The selection as of the last frame.
+    fn sel(&self) -> Sel {
+        match self.selection {
+            Some((a, b)) if a != b => Sel { anchor: if self.cursor == a { b } else { a }, caret: self.cursor },
+            _ => Sel::at(self.cursor),
+        }
     }
 
     /// The find bar, drawn where it is called (above the text). ⌘F opens it
@@ -93,10 +135,15 @@ impl CodeEditor {
         self.completion.is_some()
     }
 
-    /// Replace the whole text (Load file, New). The old cursor and
-    /// selection don't belong to it: Run would run a slice of the new text.
-    pub fn set_text(&mut self, text: String) {
+    /// Replace the whole text, as a step ⌘Z undoes, file and all: Load file
+    /// (`file`, the file it was read from) or New (no file). The old cursor
+    /// and selection don't belong to it: Run would run a slice of the new
+    /// text.
+    pub fn set_text(&mut self, text: String, file: Option<PathBuf>) {
+        let before = self.sel();
         self.text = text;
+        let from = std::mem::replace(&mut self.file, file.clone());
+        self.history.replaced_file(&self.text, before, Sel::at(0), from, file);
         self.version += 1;
         if let Some(f) = &mut self.find {
             f.restart();
@@ -184,6 +231,20 @@ impl CodeEditor {
                 out.run = Some(if in_find { self.run_everything() } else { self.run_all() });
             }
         }
+        // ⌘Z, ⇧⌘Z / ⌘Y: the text as it was, seen as an edit, and its file.
+        let undone = self.history.keys(ui, self.id, &mut self.text);
+        if let Some(u) = &undone {
+            self.version += 1;
+            if let Some(f) = &mut self.find {
+                f.update(ui.ctx(), &self.text, self.version, Some(doc_find::Edit { start: u.start, caret: u.end }));
+            }
+            self.completion = None;
+            self.cursor = u.sel.caret;
+            self.selection = Some((u.sel.anchor.min(u.sel.caret), u.sel.anchor.max(u.sel.caret)));
+            if let Some(file) = &u.file {
+                self.file = file.clone();
+            }
+        }
         let mut accept = None;
         if has_focus && let Some(p) = &mut self.completion {
             if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
@@ -236,6 +297,7 @@ impl CodeEditor {
                 // The find bar's matches, over the line marks and behind the text.
                 let marks = ui.painter().add(Shape::Noop);
                 let edit_from = doc_find::edit_from(&self.find, ui.ctx(), self.id);
+                let before = self.history.before(ui.ctx(), self.id);
                 let output = TextEdit::multiline(&mut self.text)
                     .id(self.id)
                     .font(font.clone())
@@ -246,6 +308,10 @@ impl CodeEditor {
                     .desired_rows((ui.available_height() / row_height).max(4.0) as usize)
                     .layouter(&mut layouter)
                     .show(ui);
+                self.history.after(ui, &self.text, before, &output);
+                if let Some(u) = &undone {
+                    undo::show_caret(ui, &output, u.sel.caret);
+                }
 
                 if let Some(range) = output.cursor_range {
                     self.cursor = range.primary.index.0;
@@ -352,6 +418,9 @@ impl CodeEditor {
         // The suggestions opened or closed after the text was drawn: from
         // the next frame's Esc on, as they are now.
         ui.memory_mut(|m| m.set_focus_lock_filter(self.id, self.keys_kept()));
+        if std::mem::take(&mut self.take_keys) {
+            ui.memory_mut(|m| m.request_focus(self.id));
+        }
         out
     }
 
@@ -388,8 +457,10 @@ impl CodeEditor {
         if p.start_byte > cursor_byte {
             return;
         }
+        let before = self.sel();
         self.text.replace_range(p.start_byte..cursor_byte, &item.insert);
         let new_cursor = self.text[..p.start_byte + item.insert.len()].chars().count();
+        self.history.replaced(&self.text, before, Sel::at(new_cursor));
         self.version += 1;
         if let Some(f) = &mut self.find {
             let start = self.text[..p.start_byte].chars().count();
@@ -441,6 +512,7 @@ fn char_to_byte(s: &str, chars: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::undo::Sel;
 
     /// Typing opens the suggestions; ↓ moves to the next one, and the
     /// chosen one is drawn highlighted (it used to move invisibly).
@@ -483,7 +555,7 @@ mod tests {
         let mut e = CodeEditor::new(egui::Id::new("e"), "db.a.find()\ndb.b.find()");
         e.selection = Some((0, 11));
         assert_eq!(e.run_all().code, "db.a.find()");
-        e.set_text("print(1)\nprint(2)".into());
+        e.set_text("print(1)\nprint(2)".into(), None);
         assert_eq!(e.run_all().code, "print(1)\nprint(2)");
     }
 
@@ -767,6 +839,367 @@ mod tests {
         assert_eq!(editor("a\n\nb", 3).line_col(), (3, 1));
     }
 
+    /// The editor on screen with its find bar, driven a frame at a time,
+    /// the clock going on as each frame says; the script has the focus
+    /// unless something else took it.
+    struct Screen {
+        ctx: egui::Context,
+        e: CodeEditor,
+        now: f64,
+    }
+
+    impl Screen {
+        fn new(text: &str) -> Self {
+            let ctx = egui::Context::default();
+            crate::theme::install(&ctx);
+            let mut s = Self { ctx, e: CodeEditor::new(Id::new("ed"), text), now: 100.0 };
+            s.frame(0.15, vec![]);
+            s.ctx.memory_mut(|m| m.request_focus(Id::new("ed")));
+            s.frame(0.15, vec![]);
+            s
+        }
+
+        /// A frame `dt` seconds after the last, with `events`: the line
+        /// numbers it drew.
+        fn frame(&mut self, dt: f64, events: Vec<egui::Event>) -> Vec<usize> {
+            self.now += dt;
+            // egui's animations (scrolling to the caret) step by `predicted_dt`.
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 500.0))), time: Some(self.now), predicted_dt: dt as f32, events, ..Default::default() };
+            let e = &mut self.e;
+            let mut out = self.ctx.run_ui(input, |ui| {
+                e.find_bar(ui, true);
+                e.ui(ui, &Vec::new, &|_| None);
+            });
+            out.textures_delta.clear();
+            out.shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) => t.galley.text().parse().ok(),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Typed a character a frame, 0.15 s apart.
+        fn type_in(&mut self, s: &str) {
+            for c in s.chars() {
+                self.frame(0.15, vec![egui::Event::Text(c.to_string())]);
+            }
+        }
+
+        /// `key` pressed with `modifiers`, in a frame.
+        fn key(&mut self, key: Key, modifiers: Modifiers) {
+            self.frame(0.15, vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }]);
+        }
+
+        fn undo(&mut self) {
+            self.key(Key::Z, Modifiers::COMMAND);
+        }
+
+        /// The selection, as the text's state has it.
+        fn sel(&self) -> Sel {
+            let r = TextEdit::load_state(&self.ctx, self.e.id).and_then(|s| s.cursor.char_range()).expect("the script's selection");
+            Sel { anchor: r.secondary.index.0, caret: r.primary.index.0 }
+        }
+
+        /// The script's selection set to `anchor..caret`.
+        fn select(&mut self, anchor: usize, caret: usize) {
+            let mut state = TextEdit::load_state(&self.ctx, self.e.id).unwrap_or_default();
+            state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(anchor), CCursor::new(caret))));
+            state.store(&self.ctx, self.e.id);
+            self.frame(0.15, vec![]);
+        }
+
+        /// Whether the last frame left `key` in the input, for egui's
+        /// `TextEdit` to see (it wasn't taken first). This reads the last
+        /// pass's input: a discarded pass would leave it empty, so the
+        /// result that matters is checked as well
+        /// (`cmd_z_with_nothing_to_undo_leaves_the_script_alone`).
+        fn left_to_egui(&self, key: Key) -> bool {
+            self.ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { key: k, .. } if *k == key)))
+        }
+    }
+
+    /// ⌘Z in the script steps back a word at a time, the caret at the end
+    /// of what is left; ⇧⌘Z and ⌘Y step forward again, the caret at the end
+    /// of what each puts back (⇧⌘Z is redo, never undo). With nothing to
+    /// undo ⌘Z does nothing, and egui's own undo never sees it.
+    #[test]
+    fn cmd_z_undoes_the_script_a_word_at_a_time() {
+        let mut s = Screen::new("");
+        s.key(Key::F2, Modifiers::NONE);
+        assert!(s.left_to_egui(Key::F2), "a key nobody takes is left in the input");
+        s.type_in("db.a.find({ name: 1 })");
+        assert_eq!(s.e.text, "db.a.find({ name: 1 })");
+        let at_end = |t: &str| Sel::at(t.chars().count());
+        for want in ["db.a.find({ name: 1", "db.a.find({ name:", "db.a.find({", ""] {
+            s.undo();
+            assert_eq!(s.e.text, want);
+            assert_eq!((s.sel(), s.e.cursor), (at_end(want), want.chars().count()), "the caret after {want:?}");
+            assert!(!s.left_to_egui(Key::Z), "⌘Z was the history's");
+        }
+        s.undo();
+        assert_eq!(s.e.text, "", "nothing left to undo");
+        assert!(!s.left_to_egui(Key::Z), "⌘Z with nothing to undo still isn't egui's");
+        let redo = [(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT, "db.a.find({"), (Key::Y, Modifiers::COMMAND, "db.a.find({ name:"), (Key::Z, Modifiers::COMMAND | Modifiers::SHIFT, "db.a.find({ name: 1"), (Key::Y, Modifiers::COMMAND, "db.a.find({ name: 1 })")];
+        for (key, modifiers, want) in redo {
+            s.key(key, modifiers);
+            assert_eq!(s.e.text, want, "{key:?} {modifiers:?} redoes");
+            assert_eq!(s.sel(), at_end(want), "the caret after redoing {want:?}");
+            assert!(!s.left_to_egui(key));
+        }
+        s.key(Key::Y, Modifiers::COMMAND);
+        assert_eq!(s.e.text, "db.a.find({ name: 1 })", "nothing left to redo");
+    }
+
+    /// ⌘Z with nothing left to undo leaves the script as it is. egui's own
+    /// undo, had it seen the key, would bring back what it kept after the
+    /// pause: "x" (its undo point, the text having changed since).
+    #[test]
+    fn cmd_z_with_nothing_to_undo_leaves_the_script_alone() {
+        let mut s = Screen::new("");
+        s.type_in("x");
+        // Past egui's own second: it keeps "x" as its undo point.
+        s.frame(1.5, vec![]);
+        s.frame(1.5, vec![]);
+        s.undo();
+        assert_eq!(s.e.text, "");
+        s.undo();
+        assert_eq!(s.e.text, "", "nothing left to undo: the script stays as it is");
+        s.key(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT);
+        assert_eq!(s.e.text, "x", "and ⇧⌘Z still redoes");
+    }
+
+    /// Undo and redo pressed in one frame apply in the order pressed, and
+    /// one with nothing to do doesn't stop the next.
+    #[test]
+    fn undo_and_redo_in_one_frame_go_in_order() {
+        let z = |modifiers| egui::Event::Key { key: Key::Z, physical_key: None, pressed: true, repeat: false, modifiers };
+        let mut s = Screen::new("");
+        s.type_in("one two");
+        s.frame(0.15, vec![z(Modifiers::COMMAND | Modifiers::SHIFT), z(Modifiers::COMMAND)]);
+        assert_eq!(s.e.text, "one", "nothing to redo, then undo");
+        s.undo();
+        assert_eq!(s.e.text, "");
+        s.frame(0.15, vec![z(Modifiers::COMMAND), z(Modifiers::COMMAND | Modifiers::SHIFT)]);
+        assert_eq!(s.e.text, "one", "nothing to undo, then redo");
+        assert_eq!(s.sel(), Sel::at(3));
+    }
+
+    /// In the script a pause of a second begins a step, even in a word,
+    /// and so does ↩.
+    #[test]
+    fn a_pause_or_enter_begins_a_step_in_the_script() {
+        let mut s = Screen::new("");
+        s.type_in("db.coll");
+        s.frame(1.2, vec![egui::Event::Text("e".into())]);
+        s.type_in("ction()");
+        s.key(Key::Enter, Modifiers::NONE);
+        s.type_in("x()");
+        assert_eq!(s.e.text, "db.collection()\nx()");
+        for want in ["db.collection()", "db.coll", ""] {
+            s.undo();
+            assert_eq!(s.e.text, want);
+        }
+    }
+
+    /// A ⌫ run, a ⌦ run, typing after the caret moved, typing over a
+    /// selection and a paste are each a step of their own in the script.
+    #[test]
+    fn edits_of_the_script_are_steps_of_their_own() {
+        let mut s = Screen::new("");
+        s.type_in("print(12)");
+        for _ in 0..3 {
+            s.key(Key::Backspace, Modifiers::NONE);
+        }
+        s.type_in("x");
+        assert_eq!(s.e.text, "print(x");
+        s.select(0, 0);
+        for _ in 0..2 {
+            s.key(Key::Delete, Modifiers::NONE);
+        }
+        s.frame(0.15, vec![egui::Event::Paste("PR".into())]);
+        s.type_in("y");
+        assert_eq!(s.e.text, "PRyint(x");
+        // Typed over: the replacement and the rest of the word are one step,
+        // also when it begins as the selection did.
+        s.select(3, 6);
+        s.type_in("iW");
+        assert_eq!(s.e.text, "PRyiW(x");
+        let steps = ["PRyint(x", "PRint(x", "int(x", "print(x", "print(", "print(12)", ""];
+        for want in steps {
+            s.undo();
+            assert_eq!(s.e.text, want);
+        }
+        assert_eq!(s.sel(), Sel::at(0));
+        for want in steps.iter().rev().skip(1).chain(&["PRyiW(x"]) {
+            s.key(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT);
+            assert_eq!(s.e.text, *want);
+        }
+    }
+
+    /// An accepted suggestion is a step of its own; so are Load file and
+    /// New (`set_text`), so ⌘Z brings the script before them back.
+    #[test]
+    fn a_suggestion_load_file_and_new_are_steps_of_their_own() {
+        let mut s = Screen::new("");
+        s.type_in("db.getNa");
+        assert!(s.e.completing(), "suggestions opened");
+        s.key(Key::Enter, Modifiers::NONE);
+        assert_eq!(s.e.text, "db.getName");
+        s.type_in("()");
+        s.undo();
+        assert_eq!(s.e.text, "db.getName", "what was typed after it undone");
+        s.undo();
+        assert_eq!(s.e.text, "db.getNa", "the suggestion undone");
+        s.key(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT);
+        assert_eq!(s.e.text, "db.getName");
+        s.e.set_text("print(\"loaded\")".into(), None);
+        s.frame(0.15, vec![]);
+        s.undo();
+        assert_eq!(s.e.text, "db.getName", "Load file undone");
+        s.e.set_text(String::new(), None);
+        s.frame(0.15, vec![]);
+        s.undo();
+        assert_eq!(s.e.text, "db.getName", "New undone");
+        assert_eq!(s.sel(), Sel::at(10), "the caret back where it was");
+        s.key(Key::Y, Modifiers::COMMAND);
+        assert_eq!(s.e.text, "", "New redone");
+    }
+
+    /// Undoing Load file or New puts the script's file back as it was
+    /// before (none, or the file loaded earlier), and redoing puts theirs
+    /// back; a script saved under a new name in between keeps that name on
+    /// both sides of it.
+    #[test]
+    fn undo_puts_the_scripts_file_back() {
+        let (a, b, p, q) = (PathBuf::from("/tmp/a.js"), PathBuf::from("/tmp/b.js"), PathBuf::from("/tmp/p.js"), PathBuf::from("/tmp/q.js"));
+        let mut s = Screen::new("");
+        let file = |s: &Screen| s.e.file().map(Path::to_path_buf);
+        s.e.set_text("print(\"a\")".into(), Some(a.clone()));
+        s.frame(0.15, vec![]);
+        s.e.set_text("print(\"b\")".into(), Some(b.clone()));
+        s.frame(0.15, vec![]);
+        s.undo();
+        assert_eq!((s.e.text.as_str(), file(&s)), ("print(\"a\")", Some(a.clone())), "Load file undone: the file before");
+        s.key(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT);
+        assert_eq!(file(&s), Some(b.clone()), "Load file redone: its file");
+        s.undo();
+        s.undo();
+        assert_eq!((s.e.text.as_str(), file(&s)), ("", None), "the first Load file undone: no file");
+        s.key(Key::Y, Modifiers::COMMAND);
+        s.key(Key::Y, Modifiers::COMMAND);
+        assert_eq!(file(&s), Some(b.clone()));
+
+        // New, typed into and saved as p, then Load file: p on both sides of New.
+        s.e.set_text(String::new(), None);
+        s.frame(0.15, vec![]);
+        s.type_in("x");
+        s.e.saved_to(p.clone());
+        s.e.set_text("print(\"a\")".into(), Some(a.clone()));
+        s.frame(0.15, vec![]);
+        s.undo();
+        assert_eq!((s.e.text.as_str(), file(&s)), ("x", Some(p.clone())));
+        s.undo();
+        s.undo();
+        assert_eq!((s.e.text.as_str(), file(&s)), ("print(\"b\")", Some(b.clone())), "New undone: its file back");
+        s.key(Key::Y, Modifiers::COMMAND);
+        assert_eq!((s.e.text.as_str(), file(&s)), ("", Some(p.clone())), "New redone: the name it was saved under");
+        s.key(Key::Y, Modifiers::COMMAND);
+        s.key(Key::Y, Modifiers::COMMAND);
+        assert_eq!(file(&s), Some(a.clone()));
+
+        // Saved under a new name after Load file was undone: that name when it is undone again.
+        s.e.set_text(String::new(), None);
+        s.frame(0.15, vec![]);
+        s.e.set_text("print(\"b\")".into(), Some(b.clone()));
+        s.frame(0.15, vec![]);
+        s.undo();
+        assert_eq!(file(&s), None);
+        s.e.saved_to(q.clone());
+        s.key(Key::Y, Modifiers::COMMAND);
+        assert_eq!(file(&s), Some(b));
+        s.undo();
+        assert_eq!(file(&s), Some(q), "the name it was saved under");
+    }
+
+    /// Thai typed into the script (several characters to a cell) and
+    /// undone gives back exactly the script before.
+    #[test]
+    fn thai_typed_into_the_script_undoes_cleanly() {
+        let before = "db.users.find({ name: \"\" })";
+        let mut s = Screen::new(before);
+        s.select(23, 23);
+        s.type_in("สมชาย ใจดี");
+        assert_eq!(s.e.text, "db.users.find({ name: \"สมชาย ใจดี\" })");
+        s.undo();
+        assert_eq!(s.e.text, "db.users.find({ name: \"สมชาย\" })");
+        s.undo();
+        assert_eq!(s.e.text, before);
+    }
+
+    /// With the find bar open, ⌘Z in the script finds again in the text
+    /// put back; ⌘Z in the bar's field is the field's, never the script's.
+    #[test]
+    fn undo_with_the_find_bar_open() {
+        let mut s = Screen::new("apple\n");
+        s.e.find = Some(DocFind::typed("apple"));
+        s.select(6, 6);
+        s.type_in("x apple");
+        assert_eq!(s.e.find().unwrap().matches(), [0..5, 8..13]);
+        s.undo();
+        assert_eq!(s.e.text, "apple\nx");
+        assert_eq!(s.e.find().unwrap().matches().len(), 1, "found in the text put back");
+        s.ctx.memory_mut(|m| m.request_focus(doc_find::field_id(s.e.id)));
+        s.frame(0.15, vec![]);
+        s.undo();
+        assert!(s.ctx.memory(|m| m.has_focus(doc_find::field_id(s.e.id))), "the find field has the focus");
+        assert!(s.left_to_egui(Key::Z), "⌘Z was left to the field");
+        s.undo();
+        assert_eq!(s.e.text, "apple\nx", "⌘Z in the find field left the script alone");
+        assert_eq!(s.e.find().unwrap().needle(), "apple");
+    }
+
+    /// ⌘Z and ⇧⌘Z scroll the caret into view, as typing does.
+    #[test]
+    fn undo_and_redo_show_the_caret() {
+        let script: String = (1..=400).map(|i| format!("print({i})\n")).collect();
+        let mut s = Screen::new(&script);
+        let end = script.chars().count();
+        s.select(end, end);
+        s.type_in("x");
+        // Scrolling is animated: a few frames to get there.
+        let settled = |s: &mut Screen| (0..4).map(|_| s.frame(0.15, vec![])).last().unwrap();
+        assert!(settled(&mut s).contains(&401), "typing showed the caret");
+        // ⌘↑: the caret to the start, which egui scrolls to.
+        s.key(Key::ArrowUp, Modifiers::COMMAND);
+        let numbers = settled(&mut s);
+        assert!(numbers.contains(&1) && !numbers.contains(&401), "scrolled to the top: {numbers:?}");
+        s.undo();
+        let numbers = settled(&mut s);
+        assert_eq!(s.e.text, script);
+        assert!(numbers.contains(&401), "the caret's line in view after ⌘Z: {numbers:?}");
+        s.key(Key::ArrowUp, Modifiers::COMMAND);
+        assert!(settled(&mut s).contains(&1), "scrolled to the top again");
+        s.key(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT);
+        let numbers = settled(&mut s);
+        assert!(s.e.text.ends_with("\nx") && numbers.contains(&401), "the caret's line in view after ⇧⌘Z: {numbers:?}");
+    }
+
+    /// egui's own undo, fed every frame but never given the keys, keeps
+    /// one copy of the script instead of up to a hundred.
+    #[test]
+    fn egui_keeps_no_copies_of_the_script() {
+        let mut s = Screen::new("");
+        for word in ["one ", "two ", "three ", "four "] {
+            s.type_in(word);
+            s.frame(1.5, vec![]);
+            s.frame(1.5, vec![]);
+        }
+        let undoer = TextEdit::load_state(&s.ctx, s.e.id).expect("the script's state").undoer();
+        assert!(format!("{undoer:?}").contains("undo count: 1,"), "{undoer:?}");
+    }
+
     /// What a frame of the editor costs with a 5,000-line script: idle (the
     /// cursor blinking, the pointer moving), and typing a character a frame.
     /// Run with `cargo test -p rongo --release -- --ignored --nocapture report_editor_frame_time`.
@@ -809,5 +1242,45 @@ mod tests {
         let idle = best(&mut e, &mut frame, false);
         let typing = best(&mut e, &mut frame, true);
         eprintln!("editor, {lines} lines: {idle:.2} ms/frame idle, {typing:.2} ms/frame typing");
+
+        // Of typing, the undo history's own work: the script compared before
+        // and after each character, and its copy brought up to date.
+        let mut text = e.text.clone();
+        let mut h = History::new(&text);
+        let mut at = text.len() / 2;
+        while !text.is_char_boundary(at) {
+            at -= 1;
+        }
+        let mut caret = text[..at].chars().count();
+        let mut now = 0.0;
+        let history = (0..5)
+            .map(|_| {
+                let mut spent = std::time::Duration::ZERO;
+                for k in 0..10 {
+                    text.insert(at, if k % 2 == 0 { 'x' } else { 'y' });
+                    (at, caret, now) = (at + 1, caret + 1, now + 0.1);
+                    let t = Instant::now();
+                    h.edited(&text, Sel::at(caret - 1), Sel::at(caret), undo::How::Typed, now);
+                    spent += t.elapsed();
+                }
+                spent.as_secs_f64() * 100.0
+            })
+            .fold(f64::INFINITY, f64::min);
+
+        // ⌘Z a frame, a word undone each.
+        for _ in 0..25 {
+            frame(&mut e, vec![egui::Event::Text(" ab".into())]);
+        }
+        let z = egui::Event::Key { key: Key::Z, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND };
+        let undoing = (0..2)
+            .map(|_| {
+                let t = Instant::now();
+                for _ in 0..10 {
+                    frame(&mut e, vec![z.clone()]);
+                }
+                t.elapsed().as_secs_f64() * 100.0
+            })
+            .fold(f64::INFINITY, f64::min);
+        eprintln!("of typing, the undo history {history:.3} ms/character; undoing {undoing:.2} ms/frame");
     }
 }

@@ -101,15 +101,21 @@ impl ResultView {
     }
 
     /// ⏎ and ⇧⏎ step into the selected cell (of the anchor row, `current_row`).
+    /// The cell's column is looked for only once one is pressed: outside the
+    /// Table view the level's columns may have to be worked out from the
+    /// whole page (`selected_column`), which no frame should do.
     fn step_keys(&mut self, ui: &mut Ui) {
         let key = |ui: &mut Ui, m: Modifiers, k: Key| ui.input_mut(|i| i.consume_key(m, k));
-        let row = self.current_row();
-        if let (Some(row), Some(col)) = (row, self.selection.selected_col.clone()) {
-            if key(ui, Modifiers::SHIFT, Key::Enter) {
-                self.step_into(row, &col, true);
-            } else if key(ui, Modifiers::NONE, Key::Enter) {
-                self.step_into(row, &col, false);
-            }
+        let (Some(row), Some(_)) = (self.current_row(), &self.selection.selected_col) else { return };
+        let cell = if key(ui, Modifiers::SHIFT, Key::Enter) {
+            true
+        } else if key(ui, Modifiers::NONE, Key::Enter) {
+            false
+        } else {
+            return;
+        };
+        if let Some(col) = self.selected_column().map(str::to_string) {
+            self.step_into(row, &col, cell);
         }
     }
 }

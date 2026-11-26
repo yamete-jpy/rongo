@@ -181,6 +181,12 @@ impl DocFind {
         &self.needle
     }
 
+    /// Tests: the matches found, as character ranges.
+    #[cfg(test)]
+    pub fn matches(&self) -> &[Range<usize>] {
+        &self.matches
+    }
+
     /// The text was replaced by another (Load file, New): the next search
     /// starts over, at its first match. (Where the old text was scrolled to
     /// says nothing about the new one.)

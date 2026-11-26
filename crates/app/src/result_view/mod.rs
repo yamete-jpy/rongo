@@ -25,14 +25,14 @@ use crate::net::{Net, Origin, ViewReq};
 use crate::theme;
 
 use docs::{Docs, MAX_PARSED, Places, raw_id};
-use drill::{DocKey, Level, Rows, Step, compute_columns, join};
+use drill::{DocKey, Level, Rows, Step, cell_in, compute_columns, join};
 use find::Find;
 use json_text::Build;
 pub(crate) use json_text::TextLines;
 pub(crate) use json_view::line_view;
 pub use menus::LOCKED;
 use sort::{LocalSort, SortKey, SortKeys, lookup, lookup_raw, page_order, sort_keys, sort_order};
-use table::RowDrag;
+use table::{RowDrag, Window};
 pub use toolbar::thousands;
 use tree::TreeHeights;
 
@@ -219,6 +219,15 @@ struct Columns {
     /// Each column's width as last drawn, so a column keeps its width when
     /// it moves (the table's own widths go by position).
     widths: HashMap<String, f32>,
+    /// The columns laid out last frame (`Window`), for the columns as they
+    /// were then (their hash): another window starts the table's widths
+    /// again from `widths`.
+    window: Option<(u64, Window)>,
+    /// The frame (`cumulative_frame_nr`) a column was last seen being
+    /// resized on: the frame right after it, the window stays as it was.
+    /// A frame number rather than a flag, so a drag cut short (the view
+    /// switched, another tab) holds nothing when the table is next drawn.
+    resized: Option<u64>,
     /// The header being dragged.
     dragging: Option<String>,
 }
@@ -821,16 +830,17 @@ impl ResultView {
         self.selection.anchor.filter(|a| self.selection.selected.contains(a)).or_else(|| self.selection.selected.first().copied())
     }
 
-    /// Path and value of the selected cell (the last one clicked), if any.
+    /// Path and value of the selected cell (the last one clicked), if any:
+    /// a field's (`DOC_ID` is the document's `_id`, not a field of the row).
     fn selected_field(&self) -> Option<(String, Bson)> {
-        let col = self.selection.selected_col.as_deref()?;
+        let col = self.selected_column().filter(|c| !self.is_doc_id(c))?;
         let row = self.current_row()?;
         let rows = self.resolved();
         let r = rows.get(row)?;
         let (path, value) = if col == "(value)" {
             (rows.path(row), r.value.clone())
         } else {
-            (join(&rows.path(row), col), r.value.as_document()?.get(col)?.clone())
+            (join(&rows.path(row), col), cell_in(r.value, col)?.clone())
         };
         (!path.is_empty() && path != "_id").then_some((path, value))
     }
@@ -917,20 +927,26 @@ impl ResultView {
         actions.into_iter().map(|a| (self.id, a)).collect()
     }
 
-    /// Step Into Column (`cell = false`) or Step Into Cell (`cell = true`).
+    /// Step Into Column (`cell = false`: the same field of every row, an
+    /// object's fields or an array's elements as columns) or Step Into Cell
+    /// (`cell = true`: this row's value, an array's elements as rows or an
+    /// object as one row).
     fn step_into(&mut self, row: usize, col: &str, cell: bool) -> bool {
+        if col == "(value)" || self.is_doc_id(col) {
+            return false;
+        }
         // Whether the value is an object or an array (else nothing to step into).
         let (array, origin) = match self.resolved().get(row) {
-            Some(r) => match r.value.as_document().and_then(|d| d.get(col)) {
+            Some(r) => match cell_in(r.value, col) {
                 Some(Bson::Document(_)) => (false, r.origin),
                 Some(Bson::Array(_)) => (true, r.origin),
                 _ => return false,
             },
             None => return false,
         };
-        let step = match (array, cell) {
-            (false, false) => Step::Field(col.to_string()),
-            (array, _) => {
+        let step = match cell {
+            false => Step::Field(col.to_string()),
+            true => {
                 let Some(doc) = self.doc_key(origin) else { return false };
                 let field = col.to_string();
                 if array { Step::Elements { row, doc, field } } else { Step::Cell { row, doc, field } }
@@ -1049,6 +1065,20 @@ impl ResultView {
     #[cfg(test)]
     pub fn selected_rows(&self) -> Vec<usize> {
         self.selection.selected.iter().copied().collect()
+    }
+
+    /// Step Into Column on row `row`'s `col`, as a double-click does, then
+    /// select `then` on that row at the new level (for the README's
+    /// screenshots).
+    #[cfg(test)]
+    pub fn step_into_and_select(&mut self, row: usize, col: &str, then: &str) -> bool {
+        if !self.step_into(row, col, false) {
+            return false;
+        }
+        self.selection.selected = BTreeSet::from([row]);
+        self.selection.anchor = Some(row);
+        self.selection.selected_col = Some(then.to_string());
+        true
     }
 }
 

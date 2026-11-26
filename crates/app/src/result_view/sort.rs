@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use rongo_core::bson::{Bson, Decimal128, Document, RawBson, RawBsonRef, RawDocument, RawDocumentBuf};
 
+use super::drill::index;
+
 /// A sort made here, from a column header.
 pub(super) struct LocalSort {
     pub(super) path: String,
@@ -24,14 +26,15 @@ pub(super) struct SortKeys {
     pub(super) keys: Arc<[SortKey]>,
 }
 
-/// The value at a dotted path; a number steps into an array.
+/// The value at a dotted path; an index (`drill::index`) steps into an
+/// array.
 pub(super) fn lookup<'a>(doc: &'a Document, path: &str) -> Option<&'a Bson> {
     let mut parts = path.split('.');
     let mut v = doc.get(parts.next()?)?;
     for p in parts {
         v = match v {
             Bson::Document(d) => d.get(p)?,
-            Bson::Array(a) => a.get(p.parse::<usize>().ok()?)?,
+            Bson::Array(a) => a.get(index(p)?)?,
             _ => return None,
         };
     }
@@ -46,7 +49,7 @@ pub(super) fn lookup_raw<'a>(doc: &'a RawDocument, path: &str) -> Option<RawBson
     for p in parts {
         v = match v {
             RawBsonRef::Document(d) => d.get(p).ok()??,
-            RawBsonRef::Array(a) => a.get(p.parse::<usize>().ok()?).ok()??,
+            RawBsonRef::Array(a) => a.get(index(p)?).ok()??,
             _ => return None,
         };
     }
@@ -565,6 +568,11 @@ mod tests {
             assert_eq!(SortKey::of(lookup_raw(&raw, path)), SortKey::of_bson(lookup(&d, path)), "{path}");
         }
         assert_eq!(SortKey::of(lookup_raw(&raw, "a.b.1.c")), SortKey::Str("x".into()));
+        // An index is written as MongoDB writes one, as the Table view
+        // reads it: `01` and `+1` are no index.
+        for path in ["arr.01", "arr.+1", "a.b.+0"] {
+            assert!(lookup_raw(&raw, path).is_none() && lookup(&d, path).is_none(), "{path}");
+        }
     }
 
     /// A column mixing doubles and decimals sorts the way pairs compare:

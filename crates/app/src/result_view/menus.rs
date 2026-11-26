@@ -6,7 +6,7 @@ use rongo_core::bson::{Bson, Document, doc};
 use rongo_core::format::{self, Style};
 use rongo_core::transfer;
 
-use super::drill::{Row, Rows, cell_in, compute_columns, join};
+use super::drill::{Row, Rows, compute_columns, join};
 use super::{ResultView, Source, ViewAction};
 use crate::net::Net;
 use crate::{shortcut, theme};
@@ -69,10 +69,10 @@ impl ResultView {
     /// its selected cell, if any), or what makes sense with no row.
     pub(super) fn background_menu(&mut self, ui: &mut Ui, net: &mut Net, rows: &Rows, actions: &mut Vec<ViewAction>) {
         if let Some(i) = self.current_row()
-            && let Some(Row { origin, value }) = rows.get(i)
+            && let Some(row @ Row { origin, .. }) = rows.get(i)
         {
-            let col = self.selection.selected_col.clone();
-            let cell = col.as_deref().and_then(|c| cell_in(value, c));
+            let col = self.selected_column().map(str::to_string);
+            let cell = col.as_deref().and_then(|c| rows.cell(row, c));
             self.cell_menu(ui, net, CellCtx { row: i, origin, col: col.as_deref(), path: &rows.path(i), cell }, actions);
             return;
         }
@@ -117,7 +117,8 @@ impl ResultView {
         let doc = self.rows.doc(origin).cloned();
         let id = doc.as_ref().and_then(|d| d.get("_id")).cloned();
         let can = self.editable().is_some();
-        let field_path = col.map(|c| if c == "(value)" { path_prefix.to_string() } else { join(path_prefix, c) }).filter(|p| !p.is_empty());
+        // `DOC_ID` is the document's `_id`, not a field of the row's value.
+        let field_path = col.filter(|c| !self.is_doc_id(c)).map(|c| if c == "(value)" { path_prefix.to_string() } else { join(path_prefix, c) }).filter(|p| !p.is_empty());
         let can_write = can && id.is_some();
         let locked = self.read_only;
         let m = CellMenu { doc, id, field_path, can, can_write, locked };
@@ -134,13 +135,13 @@ impl ResultView {
             ui.close();
         }
         ui.separator();
-        let can_step = |v: Option<&Bson>| matches!(v, Some(Bson::Document(_) | Bson::Array(_)));
         if let Some(c) = col.filter(|c| *c != "(value)") {
-            if ui.add_enabled(can_step(cell), egui::Button::new(format!("{}  Step Into Column", icon::TABLE)).shortcut_text(shortcut::label("↩"))).clicked() {
+            let can_step = !self.is_doc_id(c) && matches!(cell, Some(Bson::Document(_) | Bson::Array(_)));
+            if ui.add_enabled(can_step, egui::Button::new(format!("{}  Step Into Column", icon::TABLE)).shortcut_text(shortcut::label("↩"))).clicked() {
                 self.step_into(row, c, false);
                 ui.close();
             }
-            if ui.add_enabled(can_step(cell), egui::Button::new(format!("{}  Step Into Cell", icon::TABLE)).shortcut_text(shortcut::label("⇧↩"))).clicked() {
+            if ui.add_enabled(can_step, egui::Button::new(format!("{}  Step Into Cell", icon::TABLE)).shortcut_text(shortcut::label("⇧↩"))).clicked() {
                 self.step_into(row, c, true);
                 ui.close();
             }
@@ -239,9 +240,10 @@ impl ResultView {
     }
 
     /// The cell menu's Column submenu for column `c`: sorting, hiding and
-    /// the column order.
+    /// the column order. `DOC_ID` is neither sorted by nor hidden.
     fn column_menu(&mut self, ui: &mut Ui, c: &str, actions: &mut Vec<ViewAction>) {
-        let sort_path = self.shared_prefix().filter(|_| c != "(value)").map(|p| join(&p, c));
+        let fixed = self.is_doc_id(c);
+        let sort_path = self.shared_prefix().filter(|_| c != "(value)" && !fixed).map(|p| join(&p, c));
         let can_sort = sort_path.is_some();
         // A header click sorts the page on screen; for a query, the
         // menu sorts the whole collection, on the server.
@@ -261,8 +263,12 @@ impl ResultView {
             }
         }
         ui.separator();
-        if ui.button("Hide Column").clicked() {
+        if ui.add_enabled(!fixed, egui::Button::new("Hide Column")).clicked() {
             self.hidden_mut().insert(c.to_string());
+            // The selected cell was there: it is no longer on screen.
+            if self.selection.selected_col.as_deref() == Some(c) {
+                self.selection.selected_col = None;
+            }
             ui.close();
         }
         if ui.add_enabled(!self.hidden().is_empty(), egui::Button::new("Show All Columns")).clicked() {
@@ -353,15 +359,13 @@ impl ResultView {
     }
 
     /// The selected rows as delimited text, in the columns the table shows
-    /// (drill level, column order, hidden columns applied), one line per row
-    /// in table order; `header` puts the column names first. Cells are
-    /// written as in the CSV export.
+    /// (drill level, `DOC_ID` first, column order, hidden columns applied),
+    /// one line per row in table order; `header` puts the column names
+    /// first. Cells are written as in the CSV export.
     pub(super) fn selection_text(&self, sep: char, header: bool) -> String {
         let rows = self.resolved();
         let all = self.cols.cache.clone().unwrap_or_else(|| compute_columns(&rows));
-        let mut columns = self.ordered(all);
-        let hidden = self.hidden();
-        columns.retain(|c| !hidden.contains(c));
+        let columns = self.shown_columns(all);
         let mut lines = Vec::new();
         if header {
             // Field names come from the data too: defuse them as the export does.
@@ -370,7 +374,7 @@ impl ResultView {
         }
         for i in &self.selection.selected {
             let Some(row) = rows.get(*i) else { continue };
-            let cells: Vec<String> = columns.iter().map(|c| transfer::csv_value(cell_in(row.value, c))).collect();
+            let cells: Vec<String> = columns.iter().map(|c| transfer::csv_value(rows.cell(row, c))).collect();
             lines.push(transfer::delimited_line(cells.iter().map(String::as_str), sep));
         }
         lines.join("\n")

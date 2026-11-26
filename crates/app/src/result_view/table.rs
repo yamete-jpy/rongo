@@ -1,6 +1,6 @@
 //! The Table view: one row per document (or value at the drill level), its columns per drill level.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use egui::{Align, Align2, Layout, Modifiers, RichText, Sense, Ui, pos2, vec2};
 use egui_extras::{Column, TableBody, TableBuilder, TableRow};
@@ -8,13 +8,16 @@ use egui_phosphor::regular as icon;
 use rongo_core::bson::Bson;
 use rongo_core::format;
 
-use super::drill::{Row, Rows, Step, cell_in, join};
+use super::drill::{DOC_ID, Row, Rows, Step, compute_columns, join};
 use super::menus::CellCtx;
 use super::{ResultView, ViewAction};
 use crate::net::Net;
 use crate::theme;
 
 static NO_COLUMNS: BTreeSet<String> = BTreeSet::new();
+
+/// No column is narrower.
+const MIN_WIDTH: f32 = 40.0;
 
 /// Selecting with a dashed box, dragged from a row or from the empty space
 /// under them: every row the box touches, on top of `kept` (the selection
@@ -47,6 +50,54 @@ struct TableFrame {
     row_drag_start: Option<(usize, String)>,
     row_spans: Vec<(usize, egui::Rangef)>,
     body_view: egui::Rect,
+    /// Whether a spacer stands for the columns before and after those laid
+    /// out (`Window`).
+    spacers: (bool, bool),
+    /// The first column after those laid out, where a header dropped past
+    /// the last one drawn goes.
+    after: Option<String>,
+}
+
+/// Which of the table's columns are laid out in a frame: `lo..hi`, those
+/// in view and one more each side. egui_extras lays out every column it
+/// is given, in view or not, and an array of 1,000 elements stepped into
+/// is 1,000 columns: the columns before and after the window are given to
+/// it as one spacer each, as wide as they are together.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Window {
+    pub(super) lo: usize,
+    pub(super) hi: usize,
+    /// The spacers' widths (0: none).
+    pub(super) left: f32,
+    pub(super) right: f32,
+}
+
+impl Window {
+    /// The window over columns of these `widths`, `gap` apart, for the
+    /// part `view` of the table (measured from its left edge).
+    pub(super) fn of(widths: &[f32], gap: f32, view: egui::Rangef) -> Window {
+        let n = widths.len();
+        let (mut first, mut end) = (None, n);
+        let mut x = 0.0;
+        for (k, w) in widths.iter().enumerate() {
+            if x > view.max {
+                end = k;
+                break;
+            }
+            if first.is_none() && x + w >= view.min {
+                first = Some(k);
+            }
+            x += w + gap;
+        }
+        let hi = (end + 1).min(n);
+        Window::between(widths, gap, first.unwrap_or(n).saturating_sub(1).min(hi), hi)
+    }
+
+    /// The window `lo..hi` (`lo <= hi <= widths.len()`) over these columns.
+    pub(super) fn between(widths: &[f32], gap: f32, lo: usize, hi: usize) -> Window {
+        let span = |ws: &[f32]| if ws.is_empty() { 0.0 } else { ws.iter().sum::<f32>() + gap * (ws.len() - 1) as f32 };
+        Window { lo, hi, left: span(&widths[..lo]), right: span(&widths[hi..]) }
+    }
 }
 
 impl ResultView {
@@ -76,9 +127,57 @@ impl ResultView {
     /// `cols` in the order the user dragged them into at this drill level.
     pub(super) fn ordered(&self, mut cols: Vec<String>) -> Vec<String> {
         if let Some(order) = self.cols.order.get(&self.order_key()) {
-            cols.sort_by_key(|c| order.iter().position(|o| o == c).unwrap_or(usize::MAX));
+            let at: HashMap<&str, usize> = order.iter().enumerate().map(|(i, c)| (c.as_str(), i)).collect();
+            cols.sort_by_key(|c| at.get(c.as_str()).copied().unwrap_or(usize::MAX));
         }
         cols
+    }
+
+    /// The columns the table shows, left to right: `all` (the level's) in
+    /// the order dragged into, less the hidden ones, after `DOC_ID` at a
+    /// drilled level (where a field of that name gives way to it).
+    pub(super) fn shown_columns(&self, all: Vec<String>) -> Vec<String> {
+        let mut columns = self.ordered(all);
+        let hidden = self.hidden();
+        let drilled = !self.drill.is_empty();
+        columns.retain(|c| !(hidden.contains(c) || drilled && c == DOC_ID));
+        if drilled {
+            columns.insert(0, DOC_ID.to_string());
+        }
+        columns
+    }
+
+    /// The selected cell's column, while the table shows it: not once it
+    /// is hidden, or gone from the level (a document read again without
+    /// the field). The columns are worked out if they haven't been yet.
+    pub(super) fn selected_column(&self) -> Option<&str> {
+        let c = self.selection.selected_col.as_deref()?;
+        if self.is_doc_id(c) {
+            return Some(c);
+        }
+        if self.hidden().contains(c) {
+            return None;
+        }
+        let at_level = match &self.cols.cache {
+            Some(cols) => cols.iter().any(|x| x == c),
+            None => compute_columns(&self.resolved()).iter().any(|x| x == c),
+        };
+        at_level.then_some(c)
+    }
+
+    /// Whether column `c` is the drilled level's `DOC_ID`.
+    pub(super) fn is_doc_id(&self, c: &str) -> bool {
+        !self.drill.is_empty() && c == DOC_ID
+    }
+
+    /// Column `c`'s width: as last drawn, else its own to start with.
+    fn column_width(&self, c: &str) -> f32 {
+        let start = match c {
+            "_id" => 210.0,
+            _ if self.is_doc_id(c) => 140.0,
+            _ => 160.0,
+        };
+        self.cols.widths.get(c).copied().unwrap_or(start).max(MIN_WIDTH)
     }
 
     /// Move column `from` to just before `before` (`None`: to the end).
@@ -148,23 +247,12 @@ impl ResultView {
         let data = self.rows.clone();
         let rows = Rows::new(&data, self.level());
         let all = self.columns(&rows);
-        let mut columns = self.ordered(all);
-        let hidden = self.hidden();
-        columns.retain(|c| !hidden.contains(c));
+        let columns = self.shown_columns(all);
         let modifiers = ui.input(|i| i.modifiers);
         let depth = self.drill.len();
         // The selection is read where it is used, not copied: after ⌘A it is
         // every row, and a copy per frame grew with the page.
-        // Each column's field path, when it can be sorted, and its sort.
         let prefix = self.shared_prefix();
-        let sorts: Vec<_> = columns
-            .iter()
-            .map(|c| {
-                let path = prefix.as_ref().filter(|_| c != "(value)").map(|p| join(p, c));
-                let dir = path.as_deref().and_then(|p| self.sorted_by(p));
-                (path, dir)
-            })
-            .collect();
         let header_sorted = self.local_sort.is_some();
         // The space under the last row answers a right-click too. Added
         // before the table, so rows and headers drawn over it come first.
@@ -182,6 +270,8 @@ impl ResultView {
             row_drag_start: None,
             row_spans: Vec::new(),
             body_view: egui::Rect::NOTHING,
+            spacers: (false, false),
+            after: None,
         };
         // The table keeps widths by position: a new order starts a new
         // table, with each column at the width it had.
@@ -193,8 +283,48 @@ impl ResultView {
         };
 
         egui::ScrollArea::horizontal().id_salt((self.id, "hscroll", depth)).auto_shrink([false, false]).show(ui, |ui| {
+            // The columns in view, from where each starts (`Window`).
+            let gap = ui.spacing().item_spacing.x;
+            let start = ui.available_rect_before_wrap().left();
+            let view = ui.clip_rect().x_range();
+            let widths: Vec<f32> = columns.iter().map(|c| self.column_width(c)).collect();
+            let mut window = Window::of(&widths, gap, egui::Rangef::new(view.min - start, view.max - start));
+            // egui_extras names a column's resize handle by its place among
+            // the columns it is given. While one is dragged, the columns
+            // before the window stay as they were: one coming into view on
+            // the left (the view slides as a narrowed column shrinks the
+            // table) would hand the drag to the column beside it. Only the
+            // columns after it follow the view. On the frame after, the
+            // window stays as it was, so the column's last width is drawn
+            // and kept (`cols.widths`) before another window starts the
+            // table again from it.
+            let salt = (self.id, "table", depth, order_salt);
+            let table_id = ui.id().with(egui::IdSalt::new(salt));
+            let last = self.cols.window.filter(|(s, _)| *s == order_salt).map(|(_, w)| w);
+            let handle = |i: usize| table_id.with("resize_column").with(i);
+            let resizing = last.is_some_and(|w| ui.ctx().dragged_id().is_some_and(|d| (0..w.hi - w.lo + 3).any(|i| d == handle(i))));
+            let frame_nr = ui.ctx().cumulative_frame_nr();
+            match last {
+                Some(w) if resizing => window = Window::between(&widths, gap, w.lo, window.hi.max(w.lo)),
+                Some(w) if self.cols.resized.is_some_and(|f| f + 1 == frame_nr) => window = w,
+                _ => {}
+            }
+            if resizing {
+                self.cols.resized = Some(frame_nr);
+            }
+            let shown = &columns[window.lo..window.hi];
+            frame.after = columns.get(window.hi).cloned();
+            // Each column's field path, when it can be sorted, and its sort.
+            let sorts: Vec<_> = shown
+                .iter()
+                .map(|c| {
+                    let path = prefix.as_ref().filter(|_| c != "(value)" && !self.is_doc_id(c)).map(|p| join(p, c));
+                    let dir = path.as_deref().and_then(|p| self.sorted_by(p));
+                    (path, dir)
+                })
+                .collect();
             let mut table = TableBuilder::new(ui)
-                .id_salt((self.id, "table", depth, order_salt))
+                .id_salt(salt)
                 .striped(true)
                 .resizable(true)
                 // Clicks and drags, but not keyboard focus: egui remembers every
@@ -205,30 +335,48 @@ impl ResultView {
                 .cell_layout(Layout::left_to_right(Align::Center))
                 .auto_shrink([false, false])
                 .min_scrolled_height(0.0);
-            for c in &columns {
-                let w = self.cols.widths.get(c).copied().unwrap_or(if c == "_id" { 210.0 } else { 160.0 });
-                table = table.column(Column::initial(w).at_least(40.0).clip(true).resizable(true));
+            // Its widths go by position too: with other columns laid out, it
+            // starts again from each one's own width. (A resize drag goes on:
+            // the window then changes only on its right, after the column.)
+            if self.cols.window != Some((order_salt, window)) {
+                table.reset();
+                self.cols.window = Some((order_salt, window));
+            }
+            frame.spacers = (window.left > 0.0, window.right > 0.0);
+            if frame.spacers.0 {
+                table = table.column(Column::exact(window.left).resizable(false));
+            }
+            for w in &widths[window.lo..window.hi] {
+                table = table.column(Column::initial(*w).at_least(MIN_WIDTH).clip(true).resizable(true));
+            }
+            if frame.spacers.1 {
+                table = table.column(Column::exact(window.right).resizable(false));
             }
             table = table.column(Column::remainder().at_least(20.0));
-            table.header(24.0, |mut header| table_header(&mut header, &columns, &sorts, header_sorted, &mut frame)).body(|body| self.table_body(body, net, &rows, &columns, &mut frame, actions));
+            table.header(24.0, |mut header| table_header(&mut header, shown, &sorts, header_sorted, &mut frame)).body(|body| self.table_body(body, net, &rows, shown, &mut frame, actions));
         });
         self.apply_table_input(ui, net, &rows, frame, actions);
     }
 
     /// The table's rows (only those in view are drawn), with their clicks,
-    /// drags and right-click menus.
+    /// drags and right-click menus: `columns` are those laid out, between
+    /// the spacers that are there (`TableFrame::spacers`).
     fn table_body(&mut self, mut body: TableBody<'_>, net: &mut Net, rows: &Rows, columns: &[String], frame: &mut TableFrame, actions: &mut Vec<ViewAction>) {
+        let spacers = frame.spacers;
         frame.body_view = body.ui_mut().clip_rect();
         if self.selection.row_drag.is_some() {
             scroll_near_edges(body.ui_mut());
         }
         body.rows(22.0, rows.len(), |mut row| {
             let i = row.index();
-            let Some(Row { origin, value }) = rows.get(i) else { return };
+            let Some(r @ Row { origin, .. }) = rows.get(i) else { return };
             let is_selected = self.selection.selected.contains(&i);
             row.set_selected(is_selected);
+            if spacers.0 {
+                row.col(|_| {});
+            }
             for c in columns {
-                let cell = cell_in(value, c);
+                let cell = rows.cell(r, c);
                 let outline = is_selected && self.selection.selected_col.as_deref() == Some(c);
                 let (_, resp) = row.col(|ui| {
                     if let Some(v) = cell {
@@ -258,6 +406,9 @@ impl ResultView {
                     self.cell_menu(ui, net, CellCtx { row: i, origin, col: Some(c), path: &rows.path(i), cell }, actions);
                 });
             }
+            if spacers.1 {
+                row.col(|_| {});
+            }
             let (_, resp) = row.col(|_| {});
             if resp.drag_started_by(egui::PointerButton::Primary) {
                 frame.row_drag_start = Some((i, String::new()));
@@ -273,7 +424,7 @@ impl ResultView {
     /// frame (sorting, column widths and moves, menus under the rows,
     /// clicks, the drag box, double-clicks).
     fn apply_table_input(&mut self, ui: &Ui, net: &mut Net, rows: &Rows, frame: TableFrame, actions: &mut Vec<ViewAction>) {
-        let TableFrame { modifiers, depth, background, clicked, double, header_click, header_rects, drag_started, drag_stopped, mut row_drag_start, row_spans, body_view } = frame;
+        let TableFrame { modifiers, depth, background, clicked, double, header_click, header_rects, drag_started, drag_stopped, mut row_drag_start, row_spans, body_view, after, .. } = frame;
         if let Some((path, dir)) = header_click {
             self.sort_by(path, dir);
         }
@@ -296,18 +447,19 @@ impl ResultView {
             self.header_rects = header_rects.clone();
         }
         if let Some(from) = self.cols.dragging.clone() {
-            // Drop before the first header whose middle is right of the pointer.
+            // Drop before the first header whose middle is right of the
+            // pointer (past the last one laid out, the next column); never
+            // before `DOC_ID`, which stays first.
             let x = ui.ctx().pointer_latest_pos().map(|p| p.x);
-            let before = x.and_then(|x| header_rects.iter().find(|(_, r)| r.center().x > x)).map(|(c, _)| c.clone());
+            let movable = || header_rects.iter().filter(|(c, _)| !self.is_doc_id(c));
+            let before = x.and_then(|x| movable().find(|(_, r)| r.center().x > x)).map(|(c, _)| c.clone()).or(after);
             if drag_stopped || !ui.input(|i| i.pointer.any_down()) {
                 self.cols.dragging = None;
                 self.move_column(&from, before.as_deref());
             } else if let Some(first) = header_rects.first().map(|(_, r)| *r) {
-                // Where it would land: a line between two headers.
-                let line_x = match &before {
-                    Some(b) => header_rects.iter().find(|(c, _)| c == b).map(|(_, r)| r.left()),
-                    None => header_rects.last().map(|(_, r)| r.right()),
-                };
+                // Where it would land: a line between two headers, or
+                // after the last one (before a column not laid out).
+                let line_x = before.as_ref().and_then(|b| header_rects.iter().find(|(c, _)| c == b)).map(|(_, r)| r.left()).or_else(|| header_rects.last().map(|(_, r)| r.right()));
                 if let Some(lx) = line_x {
                     let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new((self.id, "col-drop"))));
                     painter.line_segment([pos2(lx, first.top()), pos2(lx, first.bottom())], egui::Stroke::new(2.0, theme::ACCENT));
@@ -357,11 +509,18 @@ impl ResultView {
 }
 
 /// The header row: each column's name and sort arrow; a click sorts by it
-/// (ascending, descending, then unsorted), a drag moves it.
+/// (ascending, descending, then unsorted), a drag moves it. A drilled
+/// level's `DOC_ID` does neither. `columns` are those laid out, between
+/// the spacers that are there (`TableFrame::spacers`).
 fn table_header(header: &mut TableRow<'_, '_>, columns: &[String], sorts: &[(Option<String>, Option<i32>)], header_sorted: bool, frame: &mut TableFrame) {
+    let spacers = frame.spacers;
+    if spacers.0 {
+        header.col(|_| {});
+    }
     for (c, (path, dir)) in columns.iter().zip(sorts) {
         let mut resp = None;
         let mut rect = egui::Rect::NOTHING;
+        let fixed = frame.depth > 0 && c == DOC_ID;
         header.col(|ui| {
             // The whole cell, at the column's width (what
             // `col` returns is only the part used).
@@ -372,8 +531,12 @@ fn table_header(header: &mut TableRow<'_, '_>, columns: &[String], sorts: &[(Opt
             }
             // Click sorts, drag moves the column. (The column
             // resize handles are added later, so they win at
-            // the edges.)
-            resp = Some(ui.interact(ui.max_rect(), ui.id().with(("header", c)), Sense::click_and_drag()));
+            // the edges.) No keyboard focus, as with the cells:
+            // egui keeps every focusable id until the arrow keys
+            // move focus, and a header's id goes by its place.
+            if !fixed {
+                resp = Some(ui.interact(ui.max_rect(), ui.id().with(("header", c)), Sense::CLICK | Sense::DRAG));
+            }
         });
         frame.header_rects.push((c.clone(), rect));
         let Some(resp) = resp else { continue };
@@ -398,6 +561,9 @@ fn table_header(header: &mut TableRow<'_, '_>, columns: &[String], sorts: &[(Opt
             };
             frame.header_click = Some((p.clone(), next));
         }
+    }
+    if spacers.1 {
+        header.col(|_| {});
     }
     header.col(|_| {});
 }

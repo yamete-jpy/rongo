@@ -1,6 +1,6 @@
 //! Around the rows: the toolbar (paging, document buttons, view mode), the drill breadcrumb and the status bar.
 
-use egui::{Align, Layout, RichText, Ui};
+use egui::{Align, Layout, RichText, Sense, Ui, vec2};
 use egui_phosphor::regular as icon;
 use rongo_core::Command;
 
@@ -192,35 +192,74 @@ impl ResultView {
         });
     }
 
-    pub(super) fn breadcrumb(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            let root = RichText::new(&self.title).strong();
-            if self.drill.is_empty() {
-                ui.label(root);
-            } else if ui.link(root).on_hover_text("Back to the top level (Esc steps out one level)").clicked() {
-                self.set_drill(Vec::new());
+    /// The breadcrumb's parts, as Studio 3T's: the title, each drill step,
+    /// then the field of the selected cell (the Table view's, when it is a
+    /// field's: not `(value)` or `DOC_ID`). The title is always strong, and
+    /// otherwise the last part is.
+    fn crumbs(&self) -> Vec<Crumb> {
+        let n = self.drill.len();
+        let mut crumbs = vec![Crumb { text: self.title.clone(), back_to: (n > 0).then_some(0), strong: true }];
+        for (i, step) in self.drill.iter().enumerate() {
+            let text = match step {
+                Step::Field(f) => f.clone(),
+                Step::Elements { row, field, .. } => format!("{field} [row {}]", row + 1),
+                Step::Cell { row, field, .. } => format!("{field} (row {})", row + 1),
+            };
+            // The current level's step is where you are: no link.
+            crumbs.push(Crumb { text, back_to: (i + 1 < n).then_some(i + 1), strong: i + 1 == n });
+        }
+        let field = (self.mode == Mode::Table && self.current_row().is_some()).then(|| self.selected_column()).flatten().filter(|c| *c != "(value)" && !self.is_doc_id(c));
+        if let Some(c) = field {
+            if n > 0
+                && let Some(last) = crumbs.last_mut()
+            {
+                last.strong = false;
             }
-            let mut cut = None;
-            let n = self.drill.len();
-            for (i, step) in self.drill.iter().enumerate() {
-                ui.label(RichText::new(icon::CARET_RIGHT).color(theme::MUTED));
-                let label = match step {
-                    Step::Field(f) => f.clone(),
-                    Step::Elements { row, field, .. } => format!("{field} [row {}]", row + 1),
-                    Step::Cell { row, field, .. } => format!("{field} (row {})", row + 1),
-                };
-                if i + 1 == n {
-                    ui.label(RichText::new(label).strong());
-                } else if ui.link(label).clicked() {
-                    cut = Some(i + 1);
+            crumbs.push(Crumb { text: c.to_string(), back_to: None, strong: true });
+        }
+        crumbs
+    }
+
+    /// The breadcrumb: `crumbs`, with carets between them. Its row has a
+    /// fixed height and the view's width: a long path or field name is cut
+    /// short there, never widening the view (which would push the status
+    /// bar's right-hand items off screen) nor moving the rows down.
+    pub(super) fn breadcrumb(&mut self, ui: &mut Ui) {
+        // The level's columns, which the Table view works out next anyway:
+        // the selected cell's field is named only while it is one of them.
+        if self.mode == Mode::Table && self.cols.cache.is_none() {
+            let data = self.rows.clone();
+            let rows = super::drill::Rows::new(&data, self.level());
+            self.columns(&rows);
+        }
+        let height = ui.spacing().interact_size.y.max(ui.text_style_height(&egui::TextStyle::Body));
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+        let mut row = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Center)));
+        row.set_clip_rect(rect.intersect(ui.clip_rect()));
+        let mut cut = None;
+        for (i, crumb) in self.crumbs().into_iter().enumerate() {
+            if i > 0 {
+                row.add(egui::Label::new(RichText::new(icon::CARET_RIGHT).color(theme::MUTED)).wrap_mode(egui::TextWrapMode::Extend));
+            }
+            let text = if crumb.strong { RichText::new(crumb.text).strong() } else { RichText::new(crumb.text) };
+            match crumb.back_to {
+                Some(depth) => {
+                    let link = row.link(text);
+                    let link = if depth == 0 { link.on_hover_text("Back to the top level (Esc steps out one level)") } else { link };
+                    if link.clicked() {
+                        cut = Some(depth);
+                    }
+                }
+                None => {
+                    row.add(egui::Label::new(text).truncate());
                 }
             }
-            if let Some(c) = cut {
-                let mut d = self.drill.clone();
-                d.truncate(c);
-                self.set_drill(d);
-            }
-        });
+        }
+        if let Some(c) = cut {
+            let mut d = self.drill.clone();
+            d.truncate(c);
+            self.set_drill(d);
+        }
     }
 
     pub(super) fn status_bar(&mut self, ui: &mut Ui, net: &mut Net) {
@@ -310,6 +349,14 @@ impl ResultView {
             }
         });
     }
+}
+
+/// One part of the breadcrumb.
+struct Crumb {
+    text: String,
+    /// The drill depth a click on it steps back out to (a link), if any.
+    back_to: Option<usize>,
+    strong: bool,
 }
 
 /// The row each toolbar group (paging, document buttons, view mode) goes

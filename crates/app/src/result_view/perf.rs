@@ -171,13 +171,14 @@ impl Harness {
         (actions, drawn)
     }
 
-    /// A primary click at `at`.
-    fn click(&mut self, v: &mut ResultView, at: egui::Pos2) {
-        self.frame(v, vec![Event::PointerMoved(at)]);
+    /// A primary click at `at`; returns the actions it made.
+    fn click(&mut self, v: &mut ResultView, at: egui::Pos2) -> Vec<(u64, ViewAction)> {
+        let mut actions = self.frame(v, vec![Event::PointerMoved(at)]).0;
         let button = |pressed| Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
-        self.frame(v, vec![button(true)]);
-        self.frame(v, vec![button(false)]);
-        self.frame(v, vec![]);
+        actions.extend(self.frame(v, vec![button(true)]).0);
+        actions.extend(self.frame(v, vec![button(false)]).0);
+        actions.extend(self.frame(v, vec![]).0);
+        actions
     }
 
     /// A right click at `at`; returns the texts drawn once its menu is open.
@@ -190,15 +191,75 @@ impl Harness {
         self.frame(v, vec![]).1
     }
 
-    /// A click on the drawn text `label` (a menu item).
-    fn click_text(&mut self, v: &mut ResultView, texts: &Texts, label: &str) {
+    /// A click on the drawn text `label` (a menu item); returns the actions it made.
+    fn click_text(&mut self, v: &mut ResultView, texts: &Texts, label: &str) -> Vec<(u64, ViewAction)> {
         let at = texts.iter().find(|(t, _)| t.contains(label)).unwrap_or_else(|| panic!("{label} drawn")).1;
-        self.click(v, at);
+        self.click(v, at)
+    }
+
+    /// Right-click at `at` (and open the submenu `sub`): how opaque the
+    /// item `item` is drawn (a disabled one is fainter than an enabled one
+    /// drawn after as many frames). The menu closes.
+    fn item_alpha(&mut self, v: &mut ResultView, at: egui::Pos2, sub: Option<&str>, item: &str) -> u8 {
+        let texts = self.right_click(v, at);
+        if let Some(sub) = sub {
+            let sub_at = texts.iter().find(|(t, _)| t.ends_with(sub)).unwrap_or_else(|| panic!("{sub} in the menu: {texts:?}")).1;
+            self.frame(v, vec![Event::PointerMoved(sub_at)]);
+            self.frame(v, vec![]);
+        }
+        let (_, out) = self.run(v, Some(egui::vec2(1400.0, 900.0)), Vec::new());
+        let alpha = out.shapes.iter().find_map(|s| match &s.shape {
+            egui::Shape::Text(t) if t.galley.text().contains(item) => Some(t.fallback_color.a()),
+            _ => None,
+        });
+        egui::Popup::close_all(&self.ctx);
+        self.frame(v, vec![]);
+        alpha.unwrap_or_else(|| panic!("{item} drawn"))
+    }
+
+    /// Right-click at `at`, open the menu's submenu `sub` and click its
+    /// item `item`; returns the actions it made.
+    fn menu_item(&mut self, v: &mut ResultView, at: egui::Pos2, sub: &str, item: &str) -> Vec<(u64, ViewAction)> {
+        let texts = self.right_click(v, at);
+        let sub_at = texts.iter().find(|(t, _)| t.ends_with(sub)).unwrap_or_else(|| panic!("{sub} in the menu: {texts:?}")).1;
+        self.frame(v, vec![Event::PointerMoved(sub_at)]);
+        self.frame(v, vec![]);
+        let (_, texts) = self.frame(v, vec![]);
+        let actions = self.click_text(v, &texts, item);
+        // A menu a disabled item left open closes.
+        egui::Popup::close_all(&self.ctx);
+        self.frame(v, vec![]);
+        actions
     }
 
     fn key(&mut self, v: &mut ResultView, key: Key, modifiers: Modifiers) {
         self.frame(v, vec![Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }]);
         self.frame(v, vec![]);
+    }
+
+    /// A primary double-click at `at`.
+    fn double_click(&mut self, v: &mut ResultView, at: egui::Pos2) {
+        self.frame(v, vec![Event::PointerMoved(at)]);
+        let button = |pressed| Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        for pressed in [true, false, true, false] {
+            self.frame(v, vec![button(pressed)]);
+        }
+        self.frame(v, vec![]);
+    }
+
+    /// A click on the cell in column `col` on the row where `row_text` is
+    /// drawn now.
+    fn click_cell(&mut self, v: &mut ResultView, row_text: &str, col: &str) {
+        let (_, drawn) = self.frame(v, vec![]);
+        let at = cell_at(v, &drawn, row_text, col);
+        self.click(v, at);
+    }
+
+    /// Where the drawn text `t` is (its first, settled frame).
+    fn find(&mut self, v: &mut ResultView, t: &str) -> egui::Pos2 {
+        self.frame(v, vec![]);
+        let (_, texts) = self.frame(v, vec![]);
+        texts.iter().find(|(s, _)| s == t).map(|(_, p)| *p).unwrap_or_else(|| panic!("{t:?} is drawn: {texts:?}"))
     }
 }
 
@@ -369,7 +430,7 @@ fn tagged_page() -> Vec<Document> {
 fn a_drill_follows_its_document_when_the_page_comes_again() {
     let page = tagged_page();
     let mut v = find_view(raw_page(&page));
-    assert!(v.step_into(3, "tags", false));
+    assert!(v.step_into(3, "tags", true));
     assert_eq!(level_texts(&v), ["\"t3a\"", "\"t3b\""]);
     let mut again = page.clone();
     again.reverse();
@@ -387,7 +448,7 @@ fn a_drill_follows_its_document_when_a_refresh_resorts() {
     let mut v = find_view(raw_page(&tagged_page()));
     // Sorted by name: a(1) b(3) c(0) d(4) e(2). Into b's tags, on row 1.
     v.sort_by("name".into(), Some(1));
-    assert!(v.step_into(1, "tags", false));
+    assert!(v.step_into(1, "tags", true));
     assert_eq!(level_texts(&v), ["\"t3a\"", "\"t3b\""]);
     // Document 1 ("a") comes back from the server as "z": b moves up to row 0.
     v.refresh_doc(&mut h.net(), 0);
@@ -601,12 +662,422 @@ fn a_static_drill_steps_out_when_its_document_leaves_the_page() {
     let mut v = ResultView::new(1, "t", Source::Static { docs, truncated: false });
     v.paging.page_size = 3;
     h.frame(&mut v, vec![]);
-    assert!(v.step_into(1, "tags", false));
+    assert!(v.step_into(1, "tags", true));
     v.fetch(&mut h.net());
     assert_eq!(level_texts(&v), ["\"t1a\"", "\"t1b\""], "Refresh View: the same page");
     v.paging.offset = 3;
     v.fetch(&mut h.net());
     assert!(v.drill.is_empty(), "the next page: {:?} shows {:?}", v.drill, level_texts(&v));
+}
+
+/// Documents like a game catalogue's: `gameName` an object of names by
+/// language, `gameType` an array of one or two types.
+fn games() -> Vec<Document> {
+    vec![
+        doc! { "_id": 1, "gameCategory": "SLOT", "gameName": { "en": "Dragon", "th": "มังกร" }, "gameType": ["POKER"] },
+        doc! { "_id": 2, "gameCategory": "SLOT", "gameName": { "en": "Wheel", "cn": "轮盘" }, "gameType": ["LUCKY", "WHEEL"] },
+        doc! { "_id": 3, "gameCategory": "CARD", "gameName": { "en": "Cards" }, "gameType": ["CARD"] },
+    ]
+}
+
+/// The header cells drawn last frame, left to right.
+fn headers(v: &ResultView) -> Vec<String> {
+    v.header_rects.iter().map(|(c, _)| c.clone()).collect()
+}
+
+/// A double-click on an array cell, or ↩ on it, steps into the column as
+/// Studio 3T does: a row per document of the page, the elements in
+/// columns 0, 1, … up to the longest array, a shorter array's missing
+/// element left empty. ⇧↩ steps into that one row's elements instead,
+/// as rows.
+#[test]
+fn an_array_cell_steps_into_its_column() {
+    for how in ["double-click", "↩", "Step Into Column", "⇧↩"] {
+        let mut h = Harness::new();
+        let mut v = find_view(raw_page(&games()));
+        let at = h.find(&mut v, "[ 2 elements ]");
+        match how {
+            "double-click" => h.double_click(&mut v, at),
+            "↩" => {
+                h.click(&mut v, at);
+                h.key(&mut v, Key::Enter, Modifiers::NONE);
+            }
+            "Step Into Column" => {
+                let texts = h.right_click(&mut v, at);
+                h.click_text(&mut v, &texts, "Step Into Column");
+            }
+            _ => {
+                h.click(&mut v, at);
+                h.key(&mut v, Key::Enter, Modifiers::SHIFT);
+            }
+        }
+        h.frame(&mut v, vec![]);
+        let (_, texts) = h.frame(&mut v, vec![]);
+        let drawn = |t: &str| texts.iter().any(|(s, _)| s == t);
+        if how == "⇧↩" {
+            assert!(matches!(v.drill.as_slice(), [Step::Elements { row: 1, .. }]), "{how}: {:?}", v.drill);
+            assert_eq!(level_texts(&v), ["\"LUCKY\"", "\"WHEEL\""], "{how}: that row's elements, as rows");
+            assert!(!drawn("POKER"), "{how}");
+            continue;
+        }
+        assert_eq!(v.drill, [Step::Field("gameType".into())], "{how}");
+        assert_eq!(v.resolved().len(), 3, "{how}: a row per document");
+        assert_eq!(headers(&v), ["{Document id}", "0", "1"], "{how}: a column per index");
+        for t in ["POKER", "LUCKY", "WHEEL", "CARD"] {
+            assert!(drawn(t), "{how}: {t} drawn");
+        }
+        // Row by row, the element under column 1: only the second has one.
+        let y = |t: &str| texts.iter().find(|(s, _)| s == t).unwrap().1.y;
+        let x1 = texts.iter().find(|(s, _)| s == "WHEEL").unwrap().1.x;
+        let in_col1 = |row_y: f32| texts.iter().any(|(_, p)| (p.y - row_y).abs() < 2.0 && (p.x - x1).abs() < 40.0);
+        assert!(!in_col1(y("POKER")) && in_col1(y("LUCKY")) && !in_col1(y("CARD")), "{how}: a shorter array's index 1 is empty");
+    }
+}
+
+/// Each row's cell in column `col` at the drill level, as text.
+fn column_texts(v: &ResultView, col: &str) -> Vec<String> {
+    let rows = v.resolved();
+    (0..rows.len()).filter_map(|i| rows.get(i)).map(|r| cell_in(r.value, col).map_or("-".to_string(), format::cell_text)).collect()
+}
+
+/// In an array stepped into as a column, a click on an index column's
+/// header sorts the documents by that element (`gameType.0`), as a field
+/// column's sorts by the field: ascending, then descending.
+#[test]
+fn an_index_column_header_sorts_by_that_element() {
+    let mut h = Harness::new();
+    let mut v = find_view(raw_page(&games()));
+    v.set_drill(vec![Step::Field("gameType".into())]);
+    h.find(&mut v, "POKER");
+    let at = v.header_rects.iter().find(|(c, _)| c == "0").map(|(_, r)| r.center()).expect("column 0 drawn");
+    h.click(&mut v, at);
+    assert_eq!(v.sorted_by("gameType.0"), Some(1));
+    assert_eq!(column_texts(&v, "0"), ["CARD", "LUCKY", "POKER"]);
+    assert_eq!(column_texts(&v, "1"), ["-", "WHEEL", "-"], "each row's elements move with it");
+    let (_, texts) = h.frame(&mut v, vec![]);
+    assert!(texts.iter().any(|(t, p)| t == icon::CARET_UP && (p.y - at.y).abs() < 6.0), "the header shows the sort");
+    h.click(&mut v, at);
+    assert_eq!(v.sorted_by("gameType.0"), Some(-1));
+    assert_eq!(column_texts(&v, "0"), ["POKER", "LUCKY", "CARD"]);
+}
+
+const DOC_ID: &str = "{Document id}";
+
+/// The table's cell in column `col` on the row where `row_text` is drawn.
+fn cell_at(v: &ResultView, texts: &Texts, row_text: &str, col: &str) -> egui::Pos2 {
+    let y = texts.iter().find(|(t, _)| t == row_text).unwrap_or_else(|| panic!("{row_text} drawn: {texts:?}")).1.y;
+    let x = v.header_rects.iter().find(|(c, _)| c == col).unwrap_or_else(|| panic!("column {col} drawn")).1.center().x;
+    pos2(x, y)
+}
+
+/// The texts drawn in that cell.
+fn drawn_in(v: &ResultView, texts: &Texts, row_text: &str, col: &str) -> Vec<String> {
+    let y = cell_at(v, texts, row_text, col).y;
+    let r = v.header_rects.iter().find(|(c, _)| c == col).unwrap().1;
+    texts.iter().filter(|(_, p)| (p.y - y).abs() < 2.0 && r.x_range().contains(p.x)).map(|(t, _)| t.clone()).collect()
+}
+
+/// Every drilled level starts with a `{Document id}` column: each row's
+/// own document's `_id`, also after a header sort and on one row's
+/// elements (Step Into Cell). Not at the top level. It starts narrower
+/// than the other columns.
+#[test]
+fn every_drilled_level_starts_with_the_document_id() {
+    let mut h = Harness::new();
+    let mut v = find_view(raw_page(&games()));
+    h.find(&mut v, "SLOT");
+    assert_eq!(headers(&v), ["_id", "gameCategory", "gameName", "gameType"], "none at the top level");
+    v.set_drill(vec![Step::Field("gameName".into())]);
+    h.find(&mut v, "Dragon");
+    let (_, texts) = h.frame(&mut v, vec![]);
+    assert_eq!(headers(&v), [DOC_ID, "en", "th", "cn"]);
+    let width = v.header_rects[0].1.width();
+    assert!((120.0..=160.0).contains(&width), "a modest width: {width}");
+    for (name, id) in [("Dragon", "1"), ("Wheel", "2"), ("Cards", "3")] {
+        assert!(drawn_in(&v, &texts, name, DOC_ID).contains(&id.to_string()), "{name}'s row: {:?}", drawn_in(&v, &texts, name, DOC_ID));
+    }
+    // Sorted by en, descending: Wheel, Dragon, Cards.
+    v.sort_by("gameName.en".into(), Some(-1));
+    h.frame(&mut v, vec![]);
+    let (_, texts) = h.frame(&mut v, vec![]);
+    let y = |t: &str| texts.iter().find(|(s, _)| s == t).unwrap().1.y;
+    assert!(y("Wheel") < y("Dragon") && y("Dragon") < y("Cards"));
+    for (name, id) in [("Dragon", "1"), ("Wheel", "2"), ("Cards", "3")] {
+        assert!(drawn_in(&v, &texts, name, DOC_ID).contains(&id.to_string()), "sorted, {name}'s row: {:?}", drawn_in(&v, &texts, name, DOC_ID));
+    }
+    // One row's elements: both rows are document 2's.
+    v.set_drill(Vec::new());
+    let row = (0..3).find(|&r| v.rows.doc(r).and_then(|d| d.get("_id")) == Some(&Bson::Int32(2))).unwrap();
+    assert!(v.step_into(row, "gameType", true));
+    h.find(&mut v, "LUCKY");
+    let (_, texts) = h.frame(&mut v, vec![]);
+    assert_eq!(headers(&v), [DOC_ID, "(value)"]);
+    for name in ["LUCKY", "WHEEL"] {
+        assert!(drawn_in(&v, &texts, name, DOC_ID).contains(&"2".to_string()), "{name}'s row: {:?}", drawn_in(&v, &texts, name, DOC_ID));
+    }
+}
+
+/// `{Document id}` stays first: a click on its header sorts nothing, it
+/// can't be dragged, and a column dropped before it lands after it. Its
+/// cell selects the row, but Hide Column, the sorts, the Field items and
+/// Step Into do nothing there; Copy › Copy Value copies the `_id`. The
+/// cell beside it edits its own path.
+#[test]
+fn the_document_id_column_stays_first_and_unchanged() {
+    let mut h = Harness::new();
+    let mut v = find_view(raw_page(&games()));
+    v.set_drill(vec![Step::Field("gameName".into())]);
+    h.find(&mut v, "Dragon");
+    let head = |v: &ResultView, c: &str| v.header_rects.iter().find(|(n, _)| n == c).map(|(_, r)| r.center()).unwrap();
+    let at = head(&v, DOC_ID);
+    h.click(&mut v, at);
+    assert!(v.local_sort.is_none(), "its header doesn't sort");
+    let button = |pos, pressed| Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+    let drag = |h: &mut Harness, v: &mut ResultView, from: egui::Pos2, to: egui::Pos2| {
+        h.frame(v, vec![Event::PointerMoved(from)]);
+        h.frame(v, vec![button(from, true)]);
+        for k in 1..=6 {
+            h.frame(v, vec![Event::PointerMoved(from + (to - from) * (k as f32 / 6.0))]);
+        }
+        h.frame(v, vec![button(to, false)]);
+        h.frame(v, vec![]);
+        h.frame(v, vec![]);
+    };
+    let (from, past) = (head(&v, DOC_ID), head(&v, "cn") + vec2(60.0, 0.0));
+    drag(&mut h, &mut v, from, past);
+    assert_eq!(headers(&v), [DOC_ID, "en", "th", "cn"], "it can't be moved");
+    let (from, before) = (head(&v, "cn"), head(&v, DOC_ID) - vec2(30.0, 0.0));
+    drag(&mut h, &mut v, from, before);
+    assert_eq!(headers(&v), [DOC_ID, "cn", "en", "th"], "dropped before it, a column lands after it");
+    assert!(v.local_sort.is_none());
+
+    let (_, texts) = h.frame(&mut v, vec![]);
+    let cell = cell_at(&v, &texts, "Wheel", DOC_ID);
+    h.click(&mut v, cell);
+    assert_eq!((v.selected_rows(), v.selection.selected_col.as_deref()), (vec![1], Some(DOC_ID)), "its cell selects the row");
+    assert_eq!(v.selected_field(), None, "⌘U has no field to fill in");
+    for (sub, item) in [("Column", "Hide Column"), ("Column", "Sort Collection Ascending"), ("Field", "Edit Value"), ("Field", "Set to null"), ("Field", "Remove Field")] {
+        let acts = h.menu_item(&mut v, cell, sub, item);
+        assert!(acts.is_empty(), "{item} acted ({} actions)", acts.len());
+    }
+    assert!(v.hidden().is_empty() && v.local_sort.is_none(), "nothing hidden or sorted");
+    assert!(matches!(&v.source, Source::Find { spec, .. } if spec.sort.is_none()), "nor the query sorted");
+    let texts = h.right_click(&mut v, cell);
+    h.click_text(&mut v, &texts, "Step Into Column");
+    egui::Popup::close_all(&h.ctx);
+    h.key(&mut v, Key::Enter, Modifiers::NONE);
+    h.key(&mut v, Key::Enter, Modifiers::SHIFT);
+    assert_eq!(v.drill, [Step::Field("gameName".into())], "nothing to step into");
+    h.copied = None;
+    h.menu_item(&mut v, cell, "Copy", "Copy Value");
+    assert_eq!(h.copied.as_deref(), Some("2"), "Copy Value: the _id");
+
+    let en = cell_at(&v, &texts, "Wheel", "en");
+    let acts = h.menu_item(&mut v, en, "Field", "Edit Value");
+    assert!(
+        matches!(acts.as_slice(), [(_, ViewAction::EditValue { id: Bson::Int32(2), path, value: Bson::String(s), .. })] if path == "gameName.en" && s == "Wheel"),
+        "the cell beside it: {} actions",
+        acts.len()
+    );
+
+    // A compound `_id` is an object: still nothing to step into there,
+    // and the items are off, as the Field items are.
+    let mut v = find_view(raw_page(&[doc! { "_id": { "a": 1 }, "o": { "x": "y", "z": { "w": 1 } } }]));
+    v.set_drill(vec![Step::Field("o".into())]);
+    h.find(&mut v, "y");
+    let (_, texts) = h.frame(&mut v, vec![]);
+    let cell = cell_at(&v, &texts, "{ 1 field }", DOC_ID);
+    let beside = cell_at(&v, &texts, "y", "z");
+    for (sub, item) in [(None, "Step Into Column"), (None, "Step Into Cell"), (Some("  Field"), "Edit Value"), (Some("  Field"), "Set to null"), (Some("  Field"), "Remove Field"), (Some("  Column"), "Hide Column"), (Some("  Column"), "Sort Collection Ascending")] {
+        let (off, on) = (h.item_alpha(&mut v, cell, sub, item), h.item_alpha(&mut v, beside, sub, item));
+        assert!(off < on, "{item}: off on {{Document id}} ({off}), on beside it ({on})");
+    }
+    let texts = h.right_click(&mut v, cell);
+    h.click_text(&mut v, &texts, "Step Into Column");
+    let texts = h.right_click(&mut v, cell);
+    h.click_text(&mut v, &texts, "Step Into Cell");
+    egui::Popup::close_all(&h.ctx);
+    h.click(&mut v, cell);
+    h.key(&mut v, Key::Enter, Modifiers::NONE);
+    h.key(&mut v, Key::Enter, Modifiers::SHIFT);
+    assert_eq!(v.drill, [Step::Field("o".into())], "a compound _id isn't stepped into");
+}
+
+/// A text as drawn: its own colour, or the widget's where it has none.
+fn drawn_color(t: &egui::epaint::TextShape) -> Color32 {
+    match t.galley.job.sections.first().map(|s| s.format.color) {
+        Some(c) if c != Color32::PLACEHOLDER => c,
+        _ => t.fallback_color,
+    }
+}
+
+/// The breadcrumb as drawn last frame (the row of the view's title): its
+/// parts left to right, the carets between them left out, each with its
+/// colour and where it is.
+fn crumbs_drawn(out: &egui::FullOutput, title: &str) -> Vec<(String, Color32, egui::Rect)> {
+    let texts: Vec<&egui::epaint::TextShape> = out.shapes.iter().filter_map(|s| match &s.shape {
+        egui::Shape::Text(t) => Some(t),
+        _ => None,
+    }).collect();
+    let y = texts.iter().find(|t| t.galley.text() == title).unwrap_or_else(|| panic!("the title {title} drawn")).pos.y;
+    let mut row: Vec<_> = texts.iter().filter(|t| (t.pos.y - y).abs() < 3.0 && t.galley.text() != icon::CARET_RIGHT).map(|t| (t.galley.text().to_string(), drawn_color(t), t.galley.rect.translate(t.pos.to_vec2()))).collect();
+    row.sort_by(|a, b| a.2.left().total_cmp(&b.2.left()));
+    row
+}
+
+/// The breadcrumb names the selected cell's field after the drill steps,
+/// as Studio 3T's does: `games > gameName` with that cell selected at
+/// the top level, `games > gameName > en` once stepped in and `en`
+/// clicked. The last part is the strong one; the field is plain text and
+/// the current level's step is still no link, while earlier parts step
+/// back out. Nothing is added with no cell selected, for `(value)` or
+/// `{Document id}`, or outside the Table view. Step Into Cell's labels
+/// stay.
+#[test]
+fn the_breadcrumb_names_the_selected_field() {
+    let mut h = Harness::new();
+    let mut v = find_view(raw_page(&games()));
+    v.title = "games".into();
+    let strong = h.ctx.global_style().visuals.strong_text_color();
+    let crumbs = |h: &mut Harness, v: &mut ResultView| {
+        h.frame(v, vec![]);
+        let (_, out) = h.run(v, Some(egui::vec2(1400.0, 900.0)), Vec::new());
+        crumbs_drawn(&out, "games")
+    };
+    let texts = |c: &[(String, Color32, egui::Rect)]| c.iter().map(|(t, ..)| t.clone()).collect::<Vec<_>>().join(" > ");
+    let is_strong = |c: &[(String, Color32, egui::Rect)], i: usize| c[i].1 == strong;
+    assert_eq!(texts(&crumbs(&mut h, &mut v)), "games", "nothing selected");
+
+    h.click_cell(&mut v, "{ 1 field }", "gameName");
+    let c = crumbs(&mut h, &mut v);
+    assert_eq!(texts(&c), "games > gameName");
+    assert!(is_strong(&c, 1), "the field is the last, strong part");
+    h.click(&mut v, c[1].2.center());
+    assert!(v.drill.is_empty(), "the field is no link");
+
+    h.key(&mut v, Key::Enter, Modifiers::NONE);
+    let c = crumbs(&mut h, &mut v);
+    assert_eq!(texts(&c), "games > gameName", "stepped in, nothing selected yet");
+    assert!(is_strong(&c, 1));
+    h.click_cell(&mut v, "Cards", "en");
+    let c = crumbs(&mut h, &mut v);
+    assert_eq!(texts(&c), "games > gameName > en");
+    assert!(is_strong(&c, 2) && !is_strong(&c, 1), "the field is strong, the step before it not");
+    for i in [1, 2] {
+        h.click(&mut v, c[i].2.center());
+        assert_eq!(v.drill, [Step::Field("gameName".into())], "{}: no link", c[i].0);
+    }
+    h.click_cell(&mut v, "Cards", DOC_ID);
+    assert_eq!(texts(&crumbs(&mut h, &mut v)), "games > gameName", "{{Document id}} is no field");
+    v.selection.selected_col = Some("en".into());
+    v.mode = Mode::Tree;
+    assert_eq!(texts(&crumbs(&mut h, &mut v)), "games > gameName", "the Tree view has no selected cell");
+    v.mode = Mode::Table;
+    let c = crumbs(&mut h, &mut v);
+    assert_eq!(texts(&c), "games > gameName > en");
+    h.click(&mut v, c[0].2.center());
+    assert!(v.drill.is_empty(), "the title steps back out");
+
+    // Step Into Cell's labels, on an array and on an object.
+    let (_, drawn) = h.frame(&mut v, vec![]);
+    let at = cell_at(&v, &drawn, "[ 2 elements ]", "gameType");
+    h.click(&mut v, at);
+    assert_eq!(texts(&crumbs(&mut h, &mut v)), "games > gameType");
+    h.key(&mut v, Key::Enter, Modifiers::SHIFT);
+    assert_eq!(texts(&crumbs(&mut h, &mut v)), "games > gameType [row 2]");
+    h.click_cell(&mut v, "WHEEL", "(value)");
+    assert_eq!(texts(&crumbs(&mut h, &mut v)), "games > gameType [row 2]", "(value) is no field");
+    v.set_drill(Vec::new());
+    h.click_cell(&mut v, "{ 1 field }", "gameName");
+    h.key(&mut v, Key::Enter, Modifiers::SHIFT);
+    h.click_cell(&mut v, "Cards", "en");
+    let c = crumbs(&mut h, &mut v);
+    assert_eq!(texts(&c), "games > gameName (row 3) > en");
+    // A page turn (or a sort) clears the selection, and the field goes.
+    v.selection.clear();
+    assert_eq!(texts(&crumbs(&mut h, &mut v)), "games > gameName (row 3)");
+}
+
+/// The selected cell's column, once the table no longer shows it (hidden,
+/// or gone from the level when its only document was read again without
+/// the field), is no longer named by the breadcrumb nor filled in by ⌘U.
+/// Hide Column on the selected cell's column forgets it.
+#[test]
+fn a_selected_column_no_longer_shown_is_let_go() {
+    let mut h = Harness::new();
+    let mut v = find_view(raw_page(&games()));
+    v.title = "games".into();
+    v.set_drill(vec![Step::Field("gameName".into())]);
+    h.find(&mut v, "Wheel");
+    let crumbs = |h: &mut Harness, v: &mut ResultView| {
+        h.frame(v, vec![]);
+        let (_, out) = h.run(v, Some(egui::vec2(1400.0, 900.0)), Vec::new());
+        crumbs_drawn(&out, "games").iter().map(|(t, ..)| t.clone()).collect::<Vec<_>>().join(" > ")
+    };
+    h.click_cell(&mut v, "Wheel", "en");
+    assert_eq!(crumbs(&mut h, &mut v), "games > gameName > en");
+    assert!(v.selected_field().is_some());
+    v.hidden_mut().insert("en".into());
+    assert_eq!(crumbs(&mut h, &mut v), "games > gameName", "hidden");
+    assert_eq!(v.selected_field(), None, "⌘U fills in no hidden field");
+    v.hidden_mut().clear();
+    assert_eq!(crumbs(&mut h, &mut v), "games > gameName > en", "shown again");
+
+    let cell = {
+        let (_, drawn) = h.frame(&mut v, vec![]);
+        cell_at(&v, &drawn, "Wheel", "en")
+    };
+    h.menu_item(&mut v, cell, "  Column", "Hide Column");
+    assert_eq!(v.selection.selected_col, None, "Hide Column forgot it");
+    assert_eq!(crumbs(&mut h, &mut v), "games > gameName");
+    v.hidden_mut().clear();
+
+    // Wheel is read again without its Chinese name: the cn column goes.
+    h.click_cell(&mut v, "Wheel", "cn");
+    assert_eq!(crumbs(&mut h, &mut v), "games > gameName > cn");
+    v.refresh_id(Bson::Int32(2));
+    h.frame(&mut v, vec![]);
+    let req = v.refreshing.last().expect("Wheel is read again").0;
+    v.on_doc(req, Bson::Int32(2), raw_page(&[doc! { "_id": 2, "gameCategory": "SLOT", "gameName": { "en": "Wheel" }, "gameType": ["LUCKY", "WHEEL"] }]));
+    assert_eq!(crumbs(&mut h, &mut v), "games > gameName", "cn is gone from the level");
+    assert_eq!(v.selected_field(), None);
+}
+
+/// The breadcrumb stays one row of the same height whatever it names: a
+/// long field name is cut short inside the view, and it never widens the
+/// view, which would push the status bar's right-hand items off screen.
+#[test]
+fn a_long_breadcrumb_stays_one_row_inside_the_view() {
+    let mut h = Harness::new();
+    let long = "a_very_long_field_name_".repeat(20);
+    let mut o = Document::new();
+    o.insert(long.clone(), "x");
+    let mut v = find_view(raw_page(&[doc! { "_id": 1, "o": o }]));
+    v.title = "games".into();
+    let size = egui::vec2(700.0, 600.0);
+    v.set_drill(vec![Step::Field("o".into())]);
+    let frame = |h: &mut Harness, v: &mut ResultView| {
+        h.run(v, Some(size), Vec::new());
+        h.run(v, Some(size), Vec::new()).1
+    };
+    let header_y = |v: &ResultView| v.header_rects.first().map(|(_, r)| r.top()).expect("the header drawn");
+    let out = frame(&mut h, &mut v);
+    let before = header_y(&v);
+    let crumb_h = crumbs_drawn(&out, "games")[0].2.height();
+    v.click_row(0, Modifiers::NONE);
+    v.selection.selected_col = Some(long.clone());
+    let out = frame(&mut h, &mut v);
+    let c = crumbs_drawn(&out, "games");
+    assert_eq!(c.len(), 3, "{c:?}");
+    assert_eq!(c[2].0, long, "the field");
+    assert!(c.iter().all(|(_, _, r)| r.right() <= size.x + 0.5 && (r.height() - crumb_h).abs() < 0.5), "one row inside the view, the field cut short: {c:?}");
+    assert_eq!(header_y(&v), before, "the rows don't move");
+    let count = out.shapes.iter().find_map(|s| match &s.shape {
+        egui::Shape::Text(t) if t.galley.text().ends_with("Count Documents") => Some(t.galley.rect.translate(t.pos.to_vec2())),
+        _ => None,
+    });
+    let count = count.expect("the status bar's Count Documents");
+    assert!(count.right() <= size.x, "the status bar's right-hand item is on screen: {count:?}");
 }
 
 /// A header sort on a static result (or a Collection History preview)
@@ -1091,6 +1562,28 @@ fn tab_skips_the_table_cells() {
         }
     }
     assert!(stops > 0, "Tab moves between the toolbar's controls");
+}
+
+/// Tab never stops on a header cell either: headers take clicks and drags
+/// but no keyboard focus, so egui keeps none of their ids, which change
+/// as other columns are laid out (a long array scrolled sideways).
+#[test]
+fn tab_skips_the_header_cells() {
+    let mut h = Harness::new();
+    let ctx = h.ctx.clone();
+    let mut v = long_arrays(30);
+    h.frame(&mut v, vec![]);
+    h.frame(&mut v, vec![]);
+    let row = v.header_rects[0].1.y_range();
+    let tab = Event::Key { key: egui::Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE };
+    for _ in 0..40 {
+        h.frame(&mut v, vec![tab.clone()]);
+        if let Some(r) = ctx.memory(|m| m.focused()).and_then(|id| ctx.read_response(id)).map(|r| r.rect) {
+            // A header is the header row's height. (A resize handle runs the
+            // table's height; it may take focus.)
+            assert!(!(r.height() < 30.0 && row.contains(r.center().y)), "Tab stopped on a header at {r:?}");
+        }
+    }
 }
 
 /// Dragging a header moves its column: it lands where the blue line
@@ -1965,7 +2458,7 @@ fn a_drill_made_again_shows_its_document_as_re_read() {
         }
         let row = (0..3).find(|&r| v.rows.doc(r).and_then(|d| d.get("_id")) == Some(&Bson::Int32(1))).unwrap();
         v.mode = Mode::Tree;
-        assert!(v.step_into(row, "items", false));
+        assert!(v.step_into(row, "items", true));
         assert_eq!(v.resolved().len(), 3);
         h.frame(&mut v, vec![]);
         for n in [5, 1] {
@@ -1975,7 +2468,7 @@ fn a_drill_made_again_shows_its_document_as_re_read() {
             h.frame(&mut v, vec![]);
             let req = v.refreshing.last().expect("the document is read again").0;
             v.on_doc(req, Bson::Int32(1), raw_page(&[with(n)]));
-            assert!(v.step_into(row, "items", false));
+            assert!(v.step_into(row, "items", true));
             let rows = v.resolved();
             assert_eq!(rows.len(), n as usize, "sorted={sorted}: the array as it is now");
             assert!((0..rows.len()).all(|i| rows.get(i).is_some()), "sorted={sorted}: every row has its element");
@@ -2010,7 +2503,7 @@ fn an_open_drill_shows_its_document_as_re_read() {
         }
         let row = (0..3).find(|&r| v.rows.doc(r).and_then(|d| d.get("_id")) == Some(&Bson::Int32(1))).unwrap();
         v.mode = Mode::Tree;
-        assert!(v.step_into(row, "items", false));
+        assert!(v.step_into(row, "items", true));
         h.frame(&mut v, vec![]);
         for n in [5, 1] {
             reread(&mut h, &mut v, with(n));
@@ -2059,7 +2552,7 @@ fn drilled_frame_cost_does_not_grow_with_row_count() {
             let items: Vec<Bson> = (0..n).map(|i| Bson::Document(doc! { "i": i as i64 })).collect();
             let mut v = find_view(vec![RawDocumentBuf::try_from(&doc! { "_id": 1, "items": items }).unwrap()]);
             v.mode = mode;
-            assert!(v.step_into(0, "items", false));
+            assert!(v.step_into(0, "items", true));
             v.selection.selected = BTreeSet::from([3]);
             view_frame_ms(&mut v)
         };
@@ -2067,6 +2560,429 @@ fn drilled_frame_cost_does_not_grow_with_row_count() {
         assert!(big < small * 3.0 + 5.0, "{}, a column: {big:.1} ms with 50k rows vs {small:.1} ms with 500", mode.label());
         let (small, big) = (array(500), array(50_000));
         assert!(big < small * 3.0 + 5.0, "{}, an array: {big:.1} ms with 50k rows vs {small:.1} ms with 500", mode.label());
+    }
+}
+
+/// A query's page of 50 documents, each with an array of `n` numbers in
+/// `items`, stepped into as a column (`n` index columns), row 3 selected.
+fn long_arrays(n: usize) -> ResultView {
+    let docs: Vec<Document> = (0..50).map(|d| doc! { "_id": d as i32, "items": (0..n).map(|i| Bson::Int64((d * n + i) as i64)).collect::<Vec<_>>() }).collect();
+    let mut v = find_view(raw_page(&docs));
+    assert!(v.step_into(0, "items", false));
+    v.selection.selected = BTreeSet::from([3]);
+    v
+}
+
+/// The header cells and the body's texts the last frame drew.
+fn laid_out(h: &mut Harness, v: &mut ResultView) -> (usize, usize) {
+    let (_, texts) = h.frame(v, vec![]);
+    let body = v.header_rects.first().map_or(0.0, |(_, r)| r.bottom());
+    (v.header_rects.len(), texts.iter().filter(|(_, p)| p.y > body).count())
+}
+
+/// An array of 1,000 elements stepped into as a column is 1,000 columns,
+/// of which a screen shows a few: a frame lays out only the columns in
+/// view (egui_extras lays out every column it is given), so it costs
+/// about what one with arrays of 10 does, scrolled to the left or the
+/// right.
+#[test]
+fn a_long_array_stepped_into_lays_out_only_the_columns_in_view() {
+    let (mut small, mut big) = (long_arrays(10), long_arrays(1_000));
+    let mut h = Harness::new();
+    let (heads, texts) = laid_out(&mut h, &mut big);
+    assert!(heads < 20, "{heads} header cells laid out for 1,000 columns");
+    assert!(texts < 1_000, "{texts} texts drawn in the body");
+    let (small_ms, big_ms) = (view_frame_ms(&mut small), view_frame_ms(&mut big));
+    assert!(big_ms < small_ms * 3.0 + 5.0, "{big_ms:.1} ms a frame with 1,000 columns vs {small_ms:.1} ms with 10");
+    // Scrolled to the far right: the last columns, as costly.
+    let scroll = Event::MouseWheel { unit: egui::MouseWheelUnit::Page, delta: vec2(-1000.0, 0.0), phase: egui::TouchPhase::Move, modifiers: Modifiers::NONE };
+    h.frame(&mut big, vec![Event::PointerMoved(pos2(700.0, 400.0)), scroll]);
+    let (heads, _) = laid_out(&mut h, &mut big);
+    let shown: Vec<String> = big.header_rects.iter().map(|(c, _)| c.clone()).collect();
+    assert!(heads < 20 && shown.contains(&"999".to_string()), "the last columns: {shown:?}");
+    // Timed on the harness scrolled there (a new one would start at the left).
+    let right_ms = frames_ms(&mut h, &mut big);
+    assert_eq!(big.header_rects.last().map(|(c, _)| c.as_str()), Some("999"), "timed at the right end");
+    assert!(right_ms < small_ms * 3.0 + 5.0, "{right_ms:.1} ms a frame scrolled right vs {small_ms:.1} ms");
+}
+
+/// Scroll the table sideways by `dx` points (negative: to the right) and
+/// let it settle.
+fn scroll_x(h: &mut Harness, v: &mut ResultView, dx: f32) {
+    let wheel = Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(dx, 0.0), phase: egui::TouchPhase::Move, modifiers: Modifiers::NONE };
+    h.frame(v, vec![Event::PointerMoved(pos2(700.0, 400.0)), wheel]);
+    for _ in 0..30 {
+        h.frame(v, vec![]);
+    }
+}
+
+/// Laid out only where they are in view, the columns are still where they
+/// belong: wherever the table is scrolled, the headers drawn cover the
+/// view, a click selects the column drawn there and its cell is that
+/// row's own element, and scrolled all the way the last column ends the
+/// table.
+#[test]
+fn columns_laid_out_in_view_are_where_they_belong() {
+    let mut h = Harness::new();
+    let mut v = long_arrays(200);
+    h.frame(&mut v, vec![]);
+    let (_, out) = h.run(&mut v, Some(vec2(1400.0, 900.0)), Vec::new());
+    let head_row = v.header_rects[0].1.y_range();
+    // The view: from the table's left to where the header texts are cut.
+    let left = v.header_rects[0].1.left();
+    let right = out.shapes.iter().filter(|s| matches!(&s.shape, egui::Shape::Text(t) if head_row.contains(t.pos.y + t.galley.rect.center().y))).map(|s| s.clip_rect.right()).fold(f32::MIN, f32::max);
+    assert!(right > left + 600.0, "the view: {left}..{right}");
+    for step in 0..8 {
+        scroll_x(&mut h, &mut v, -1234.0);
+        let heads = v.header_rects.clone();
+        let (from, to) = (heads.first().unwrap().1.left(), heads.last().unwrap().1.right());
+        assert!(from <= left + 0.5 && to >= right - 0.5, "step {step}: the headers drawn ({from}..{to}) cover the view ({left}..{right})");
+        assert!(heads.len() < 20, "step {step}: {} headers laid out", heads.len());
+        let x = (left + right) / 2.0;
+        let (col, rect) = heads.iter().find(|(_, r)| r.x_range().contains(x)).cloned().expect("a column in the middle");
+        assert_ne!(col, DOC_ID, "step {step}: scrolled past it");
+        h.click(&mut v, pos2(x, rect.bottom() + 22.0 * 3.5));
+        let row = *v.selection.selected.first().expect("a row clicked");
+        let k: usize = col.parse().unwrap();
+        assert_eq!(v.selection.selected_col.as_deref(), Some(col.as_str()), "step {step}");
+        assert_eq!(v.selected_field(), Some((format!("items.{k}"), Bson::Int64((row * 200 + k) as i64))), "step {step}: row {row}'s element {k}");
+    }
+    scroll_x(&mut h, &mut v, -100_000.0);
+    let (last, rect) = v.header_rects.last().cloned().unwrap();
+    assert_eq!(last, "199");
+    assert!(rect.right() <= right && rect.right() > right - 60.0, "the last column ends the table: {rect:?} in ..{right}");
+    scroll_x(&mut h, &mut v, 100_000.0);
+    assert_eq!(v.header_rects[0].0, DOC_ID);
+    assert!((v.header_rects[0].1.left() - left).abs() < 0.5, "back at the left");
+}
+
+/// Widening a column so far that the columns after it leave the view
+/// (fewer are laid out, mid-drag) goes on to the end of the drag, and the
+/// column keeps its new width.
+#[test]
+fn a_column_widened_past_the_view_keeps_its_width() {
+    let mut h = Harness::new();
+    let mut v = long_arrays(200);
+    h.frame(&mut v, vec![]);
+    h.frame(&mut v, vec![]);
+    let before = v.header_rects.len();
+    let cell = v.header_rects.iter().find(|(c, _)| c == "2").unwrap().1;
+    let width = cell.width();
+    let edge = pos2(cell.right() + 2.0, cell.center().y);
+    let button = |pos, pressed| Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+    h.frame(&mut v, vec![Event::PointerMoved(edge)]);
+    h.frame(&mut v, vec![button(edge, true)]);
+    let mut fewer = false;
+    for k in 1..=12 {
+        h.frame(&mut v, vec![Event::PointerMoved(edge + vec2(50.0 * k as f32, 0.0))]);
+        fewer |= v.header_rects.len() < before;
+    }
+    h.frame(&mut v, vec![button(edge + vec2(600.0, 0.0), false)]);
+    h.frame(&mut v, vec![]);
+    h.frame(&mut v, vec![]);
+    assert!(fewer, "columns left the view during the drag");
+    let now = v.header_rects.iter().find(|(c, _)| c == "2").unwrap().1.width();
+    assert!((now - (width + 600.0)).abs() < 2.0, "widened by the whole drag: {width} -> {now}");
+    assert_eq!(v.cols.widths["2"], now, "and remembered");
+}
+
+/// Scrolling sideways through an array of 1,000 elements stepped into
+/// doesn't keep adding memory once every column has been in view. Each
+/// column's width as drawn (`cols.widths`) is kept the first time it is
+/// drawn; headers and cells take no keyboard focus, so egui keeps none of
+/// their ids (which go by their place among the columns laid out); and
+/// another window resets the table's own widths rather than keeping a set
+/// per window. Release only, as `scrolling_does_not_keep_adding_memory`.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "egui records every id in debug builds; run with --release")]
+fn scrolling_sideways_does_not_keep_adding_memory() {
+    let mut h = Harness::new();
+    let mut v = long_arrays(1_000);
+    let mut scroll = |v: &mut ResultView, dx: f32| {
+        let wheel = Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(dx, 0.0), phase: egui::TouchPhase::Move, modifiers: Modifiers::NONE };
+        h.frame(v, vec![Event::PointerMoved(pos2(700.0, 400.0)), wheel]);
+    };
+    // Across the whole table and back, every column drawn once.
+    for dx in [-170.0, 170.0] {
+        for _ in 0..1_000 {
+            scroll(&mut v, dx);
+        }
+    }
+    let before = crate::heap::live();
+    // Again, stopping at new places.
+    for dx in [-130.0, 130.0] {
+        for _ in 0..1_300 {
+            scroll(&mut v, dx);
+        }
+    }
+    let grown = crate::heap::live() - before;
+    assert!(grown < 100 * 1024, "scrolling sideways added {} KiB", grown / 1024);
+}
+
+/// Drags the right edge of column `col`'s header by `dx` points, a tenth
+/// at a time, and lets go.
+fn resize_column(h: &mut Harness, v: &mut ResultView, col: &str, dx: f32) {
+    let gap = h.ctx.global_style().spacing.item_spacing.x;
+    let cell = v.header_rects.iter().find(|(c, _)| c == col).unwrap_or_else(|| panic!("column {col} laid out")).1;
+    // egui_extras' handle is half a gap right of the cell.
+    let edge = pos2(cell.right() + gap / 2.0, cell.center().y);
+    let button = |pos, pressed| Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+    h.frame(v, vec![Event::PointerMoved(edge)]);
+    h.frame(v, vec![button(edge, true)]);
+    for k in 1..=10 {
+        h.frame(v, vec![Event::PointerMoved(edge + vec2(dx * k as f32 / 10.0, 0.0))]);
+    }
+    h.frame(v, vec![button(edge + vec2(dx, 0.0), false)]);
+    for _ in 0..5 {
+        h.frame(v, vec![]);
+    }
+}
+
+/// Narrowing a column while the table is scrolled to its right end
+/// shrinks the table, and the view slides left over the columns: only the
+/// column dragged changes width, at the top level and drilled in.
+/// (egui_extras names a resize handle by its place among the columns it
+/// is given, so a column coming into view on the left once handed the
+/// drag to the column beside it, and both were narrowed.)
+#[test]
+fn narrowing_a_column_at_the_right_end_changes_only_that_column() {
+    let fields: Vec<Document> = (0..30)
+        .map(|i| {
+            let mut d = doc! { "_id": i };
+            for k in 0..15 {
+                d.insert(format!("field{k:02}"), format!("v{i}.{k}"));
+            }
+            d
+        })
+        .collect();
+    let cases = [("drilled", "195"), ("drilled", "196"), ("drilled", "194"), ("top", "field12"), ("top", "field11")];
+    for (level, col) in cases {
+        let mut h = Harness::new();
+        let mut v = if level == "top" { find_view(raw_page(&fields)) } else { long_arrays(200) };
+        h.frame(&mut v, vec![]);
+        scroll_x(&mut h, &mut v, -100_000.0);
+        let before = v.cols.widths.clone();
+        let width = before[col];
+        resize_column(&mut h, &mut v, col, -120.0);
+        let changed: Vec<_> = before.iter().filter(|(c, w)| v.cols.widths.get(*c).is_some_and(|now| (now - **w).abs() > 0.5)).map(|(c, _)| c.clone()).collect();
+        assert_eq!(changed, [col.to_string()], "{level} {col}: only it changed");
+        assert_eq!(v.cols.widths[col], (width - 120.0).max(40.0), "{level} {col}");
+    }
+}
+
+/// Only a resize drag holds the columns before the window still: with the
+/// button held for anything else, here the horizontal scroll bar dragged
+/// to the left, the columns laid out follow the view, so none of it is
+/// left blank while the button is down.
+#[test]
+fn only_a_resize_holds_the_columns_laid_out() {
+    let mut h = Harness::new();
+    let mut v = long_arrays(200);
+    h.frame(&mut v, vec![]);
+    h.frame(&mut v, vec![]);
+    let left = v.header_rects[0].1.left();
+    scroll_x(&mut h, &mut v, -100_000.0);
+    let lo = v.cols.window.unwrap().1.lo;
+    // The scroll bar runs along the table's foot; scrolled all the way
+    // right, its handle is at the right end.
+    let (_, out) = h.run(&mut v, Some(vec2(1400.0, 900.0)), vec![Event::PointerMoved(pos2(1380.0, 850.0))]);
+    let bar = out.shapes.iter().filter_map(|s| match &s.shape {
+        egui::Shape::Rect(r) if r.rect.top() > 700.0 && r.rect.height() < 20.0 && r.rect.width() < 200.0 && r.rect.right() > 1390.0 => Some(r.rect),
+        _ => None,
+    }).next().expect("the scroll bar's handle");
+    let at = bar.center();
+    let button = |pos, pressed| Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+    h.frame(&mut v, vec![Event::PointerMoved(at)]);
+    h.frame(&mut v, vec![button(at, true)]);
+    for k in 1..=10 {
+        h.frame(&mut v, vec![Event::PointerMoved(at - vec2(30.0 * k as f32, 0.0))]);
+    }
+    h.frame(&mut v, vec![]);
+    assert!(h.ctx.dragged_id().is_some(), "still held");
+    assert!(v.cols.window.unwrap().1.lo + 10 < lo, "the columns laid out moved left with the view: {lo} -> {}", v.cols.window.unwrap().1.lo);
+    let first = v.header_rects[0].1;
+    assert!(first.left() <= left + 0.5, "and cover it: {first:?} from {left}");
+    h.frame(&mut v, vec![button(at - vec2(300.0, 0.0), false)]);
+}
+
+/// A resize cut short (the view switched to the Tree view mid-drag)
+/// leaves nothing behind: back in the Table view, in a wider window, the
+/// first frame lays out the columns now in view, not those of the drag.
+#[test]
+fn a_resize_cut_short_leaves_nothing_behind() {
+    let mut h = Harness::new();
+    let mut v = long_arrays(200);
+    h.frame(&mut v, vec![]);
+    h.frame(&mut v, vec![]);
+    let gap = h.ctx.global_style().spacing.item_spacing.x;
+    let cell = v.header_rects.iter().find(|(c, _)| c == "2").unwrap().1;
+    let edge = pos2(cell.right() + gap / 2.0, cell.center().y);
+    let button = |pos, pressed| Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+    h.frame(&mut v, vec![Event::PointerMoved(edge)]);
+    h.frame(&mut v, vec![button(edge, true)]);
+    for k in 1..=3 {
+        h.frame(&mut v, vec![Event::PointerMoved(edge + vec2(10.0 * k as f32, 0.0))]);
+    }
+    v.mode = Mode::Tree;
+    h.frame(&mut v, vec![button(edge + vec2(30.0, 0.0), false)]);
+    h.frame(&mut v, vec![]);
+    v.mode = Mode::Table;
+    let wide = vec2(2_600.0, 900.0);
+    h.run(&mut v, Some(wide), Vec::new());
+    let end = v.header_rects.last().unwrap().1.right();
+    assert!(end >= wide.x - 20.0, "the first frame back covers the wider view: headers end at {end}");
+}
+
+/// A resize drag's last move is kept, also when the columns laid out
+/// change on the frame it is let go (the column was widened past the
+/// view): the column ends where the pointer was let go.
+#[test]
+fn a_resize_keeps_its_last_move() {
+    let docs: Vec<Document> = (0..3).map(|d| doc! { "_id": d, "items": (0..40).map(|i| Bson::Int32(d * 40 + i)).collect::<Vec<_>>() }).collect();
+    // Widen column 2 by 2 points a frame for `moves` frames, then let go:
+    // its width before and after, and the moves after which the columns
+    // laid out changed.
+    let drag = |moves: usize| {
+        let mut h = Harness::new();
+        let mut v = find_view(raw_page(&docs));
+        assert!(v.step_into(0, "items", false));
+        h.frame(&mut v, vec![]);
+        h.frame(&mut v, vec![]);
+        let gap = h.ctx.global_style().spacing.item_spacing.x;
+        let cell = v.header_rects.iter().find(|(c, _)| c == "2").unwrap().1;
+        let edge = pos2(cell.right() + gap / 2.0, cell.center().y);
+        let button = |pos, pressed| Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        h.frame(&mut v, vec![Event::PointerMoved(edge)]);
+        h.frame(&mut v, vec![button(edge, true)]);
+        let mut changes = Vec::new();
+        let mut last = v.cols.window;
+        for k in 1..=moves {
+            h.frame(&mut v, vec![Event::PointerMoved(edge + vec2(2.0 * k as f32, 0.0))]);
+            if v.cols.window != last {
+                changes.push(k);
+                last = v.cols.window;
+            }
+        }
+        h.frame(&mut v, vec![button(edge + vec2(2.0 * moves as f32, 0.0), false)]);
+        for _ in 0..3 {
+            h.frame(&mut v, vec![]);
+        }
+        (cell.width(), v.header_rects.iter().find(|(c, _)| c == "2").unwrap().1.width(), changes)
+    };
+    let (_, _, changes) = drag(150);
+    // Let go just when the columns laid out change.
+    let at = *changes.iter().find(|&&k| k > 2).expect("columns leave the view as the column widens");
+    let (start, end, _) = drag(at - 1);
+    assert!((end - (start + 2.0 * (at - 1) as f32)).abs() < 0.5, "let go after {} moves: {start} -> {end}", at - 1);
+}
+
+/// Scrolled to the right end (a spacer before the columns laid out), a
+/// header dragged between two others lands between them and keeps its
+/// width.
+#[test]
+fn a_header_dragged_while_scrolled_right_lands_where_dropped() {
+    let mut h = Harness::new();
+    let mut v = long_arrays(200);
+    h.frame(&mut v, vec![]);
+    scroll_x(&mut h, &mut v, -100_000.0);
+    assert!(v.cols.window.unwrap().1.left > 0.0, "a spacer before the columns laid out");
+    let head = |v: &ResultView, c: &str| v.header_rects.iter().find(|(n, _)| n == c).map(|(_, r)| r.center()).unwrap_or_else(|| panic!("{c} laid out"));
+    let (from, to) = (head(&v, "195"), pos2((head(&v, "197").x + head(&v, "198").x) / 2.0, head(&v, "195").y));
+    let width = v.cols.widths["195"];
+    let button = |pos, pressed| Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+    h.frame(&mut v, vec![Event::PointerMoved(from)]);
+    h.frame(&mut v, vec![button(from, true)]);
+    for k in 1..=6 {
+        h.frame(&mut v, vec![Event::PointerMoved(from + (to - from) * (k as f32 / 6.0))]);
+    }
+    h.frame(&mut v, vec![button(to, false)]);
+    for _ in 0..3 {
+        h.frame(&mut v, vec![]);
+    }
+    let order = v.ordered(v.cols.cache.clone().unwrap());
+    let at = order.iter().position(|c| c == "195").unwrap();
+    assert_eq!(order[at - 3..at + 2], ["194", "196", "197", "195", "198"]);
+    let shown: Vec<&str> = v.header_rects.iter().map(|(c, _)| c.as_str()).collect();
+    assert!(shown.windows(3).any(|w| w == ["197", "195", "198"]), "drawn there: {shown:?}");
+    assert!((v.cols.widths["195"] - width).abs() < 0.5, "its width kept");
+    assert!(v.local_sort.is_none());
+}
+
+/// A header dragged past the last column laid out lands after it, before
+/// the first one that isn't, not at the far end of the table.
+#[test]
+fn a_header_dropped_past_the_columns_laid_out_lands_after_them() {
+    let mut h = Harness::new();
+    let mut v = long_arrays(200);
+    h.frame(&mut v, vec![]);
+    h.frame(&mut v, vec![]);
+    let last = v.header_rects.last().unwrap().0.clone();
+    let from = v.header_rects.iter().find(|(c, _)| c == "3").unwrap().1.center();
+    let to = pos2(2_400.0, from.y);
+    let button = |pos, pressed| Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+    h.frame(&mut v, vec![Event::PointerMoved(from)]);
+    h.frame(&mut v, vec![button(from, true)]);
+    for k in 1..=6 {
+        h.frame(&mut v, vec![Event::PointerMoved(from + (to - from) * (k as f32 / 6.0))]);
+    }
+    // Where it will land shows as ever: the blue line at that column's
+    // right edge, and the dragged column's name by the pointer.
+    let edge = v.header_rects.last().unwrap().1.right();
+    let (_, out) = h.run(&mut v, Some(vec2(1400.0, 900.0)), Vec::new());
+    let line = out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::LineSegment { points, stroke } if stroke.color == theme::ACCENT && stroke.width == 2.0 && (points[0].x - edge).abs() < 0.5));
+    assert!(line, "the drop line at {edge}");
+    let name = out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == "3" && t.pos.x > to.x));
+    assert!(name, "the dragged column's name by the pointer");
+    h.frame(&mut v, vec![button(to, false)]);
+    h.frame(&mut v, vec![]);
+    let order = v.ordered(v.cols.cache.clone().unwrap());
+    let at = |c: &str| order.iter().position(|o| o == c).unwrap();
+    assert_eq!(at("3"), at(&last) + 1, "after {last}, the last laid out: {:?}", &order[..at(&last) + 3]);
+    assert_ne!(order.last().map(String::as_str), Some("3"), "not at the far end");
+}
+
+/// Frames of a page of 50 documents whose arrays (of 10, 1,000 and 10,000
+/// elements) are stepped into as columns, scrolled to the left and to the
+/// right. Run with
+/// `cargo test -p rongo --release -- --ignored --nocapture report_long_array_frame_times`.
+#[test]
+#[ignore = "timing; run explicitly in release mode"]
+fn report_long_array_frame_times() {
+    for n in [10, 1_000, 10_000] {
+        let mut v = long_arrays(n);
+        let mut h = Harness::new();
+        let left = frames_ms(&mut h, &mut v);
+        let scroll = Event::MouseWheel { unit: egui::MouseWheelUnit::Page, delta: vec2(-100_000.0, 0.0), phase: egui::TouchPhase::Move, modifiers: Modifiers::NONE };
+        h.frame(&mut v, vec![Event::PointerMoved(pos2(700.0, 400.0)), scroll]);
+        // On the same harness: scrolled to the right end.
+        let right = frames_ms(&mut h, &mut v);
+        let (heads, texts) = laid_out(&mut h, &mut v);
+        let end = v.header_rects.last().map(|(c, _)| c.clone()).unwrap_or_default();
+        eprintln!("{n:>6} elements a document, stepped into: {left:.2} ms/frame at the left, {right:.2} ms/frame at the right ({heads} header cells, the last {end}, {texts} body texts)");
+    }
+}
+
+/// A selected cell's column left over from the Table view costs the Tree
+/// and JSON views nothing a frame: a cell clicked in the Table view, the
+/// view switched, the page fetched again (which forgets the level's
+/// columns) and a document clicked. ↩ and ⇧↩ look for the column only
+/// when pressed, so a frame with 20,000 rows costs about what one with
+/// 500 does.
+#[test]
+fn a_left_over_selected_column_costs_no_frame_time() {
+    for mode in [Mode::Tree, Mode::Json] {
+        let ms = |n: usize| {
+            let mut h = Harness::new();
+            let mut v = big_view(n);
+            h.frame(&mut v, vec![]);
+            v.click_row(3, Modifiers::NONE);
+            v.selection.selected_col = Some("name".into());
+            v.mode = mode;
+            v.rows_changed();
+            frames_ms(&mut h, &mut v)
+        };
+        let (small, big) = (ms(500), ms(20_000));
+        assert!(big < small * 3.0 + 5.0, "{}: {big:.1} ms a frame with 20,000 rows vs {small:.1} ms with 500", mode.label());
     }
 }
 
@@ -2085,7 +3001,11 @@ fn frame_cost_does_not_grow_with_row_count() {
 /// Milliseconds per frame for `v` as it is, after its first frames (and
 /// its JSON text, in the JSON view): the fastest of five rounds of ten.
 fn view_frame_ms(v: &mut ResultView) -> f64 {
-    let mut h = Harness::new();
+    frames_ms(&mut Harness::new(), v)
+}
+
+/// `view_frame_ms` on `h`, so drawn as `h` left it (scrolled, say).
+fn frames_ms(h: &mut Harness, v: &mut ResultView) -> f64 {
     h.frame(v, vec![]);
     h.frame(v, vec![]);
     let end = Instant::now() + std::time::Duration::from_secs(120);
@@ -2146,7 +3066,7 @@ fn report_drilled_and_tree_frame_times() {
         let items: Vec<Bson> = (0..n).map(|i| Bson::Document(doc! { "i": i as i64, "name": format!("item {i}") })).collect();
         let mut v = find_view(vec![RawDocumentBuf::try_from(&doc! { "_id": 1, "items": items }).unwrap()]);
         v.mode = mode;
-        assert!(v.step_into(0, "items", false));
+        assert!(v.step_into(0, "items", true));
         v.selection.selected = BTreeSet::from([3]);
         let ms = view_frame_ms(&mut v);
         assert_eq!(v.resolved().len(), n);

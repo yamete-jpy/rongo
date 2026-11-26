@@ -257,7 +257,6 @@ pub struct ShellTab {
     /// 0 is the raw output; n is `results[n - 1]`.
     active: usize,
     status: Option<Result<u64, ShellError>>,
-    file: Option<std::path::PathBuf>,
     /// Run the whole script as soon as the connection is ready (demo tab).
     pub run_when_ready: bool,
     /// Height of the editor area, changed by dragging the handle below it.
@@ -279,7 +278,6 @@ impl ShellTab {
             results: Vec::new(),
             active: 0,
             status: None,
-            file: None,
             run_when_ready: false,
             split: 260.0,
             requested_fields: Default::default(),
@@ -490,37 +488,43 @@ impl ShellTab {
             }
             ui.separator();
             if ui.button(format!("{}  New", icon::FILE)).clicked() {
-                self.editor.set_text(String::new());
-                self.file = None;
+                self.editor.set_text(String::new(), None);
+                self.editor.take_keys();
             }
             if ui.button(format!("{}  Load file", icon::FOLDER_OPEN)).clicked()
                 && let Some(path) = rfd::FileDialog::new().add_filter("JavaScript", &["js", "mongodb"]).pick_file()
             {
-                match std::fs::read_to_string(&path) {
-                    Ok(text) => {
-                        self.editor.set_text(text);
-                        self.file = Some(path);
-                    }
-                    Err(e) => self.raw.set(&format!("could not read {}: {e}", path.display())),
-                }
+                self.load(path);
             }
             // ⌘S belongs to a dialog on top (the document editor saves with it).
             let save = ui.button(format!("{}  Save file", icon::FLOPPY_DISK)).clicked()
                 || (net.keys_enabled && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)));
             if save {
-                let path = self.file.clone().or_else(|| rfd::FileDialog::new().add_filter("JavaScript", &["js"]).set_file_name("script.js").save_file());
+                let path = self.editor.file().map(std::path::Path::to_path_buf).or_else(|| rfd::FileDialog::new().add_filter("JavaScript", &["js"]).set_file_name("script.js").save_file());
                 if let Some(path) = path {
                     match std::fs::write(&path, &self.editor.text) {
-                        Ok(()) => self.file = Some(path),
+                        Ok(()) => self.editor.saved_to(path),
                         Err(e) => self.raw.set(&format!("could not save {}: {e}", path.display())),
                     }
                 }
             }
-            if let Some(f) = &self.file {
+            if let Some(f) = self.editor.file() {
                 ui.weak(f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
             }
         });
         run
+    }
+
+    /// Load file: the script replaced by the file at `path` (a step ⌘Z
+    /// undoes at once: the script gets the keys), which ⌘S then saves to.
+    fn load(&mut self, path: std::path::PathBuf) {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                self.editor.set_text(text, Some(path));
+                self.editor.take_keys();
+            }
+            Err(e) => self.raw.set(&format!("could not read {}: {e}", path.display())),
+        }
     }
 
     /// The editor, with its find bar (⌘F) over it, and its footer, and
@@ -1148,7 +1152,7 @@ mod tests {
         h.run_steps(2);
         assert_eq!(searches(&h), n + 2, "one for match case");
         assert_eq!(find_count(&h).as_deref(), Some("1 of 3"));
-        h.state_mut().tab.editor.set_text("apple\napple".into());
+        h.state_mut().tab.editor.set_text("apple\napple".into(), None);
         h.run_steps(2);
         assert_eq!(find_count(&h).as_deref(), Some("1 of 2"), "Load file: the count follows");
         h.get_by_label(&format!("{}  New", icon::FILE)).click();
@@ -1188,6 +1192,124 @@ mod tests {
         assert!(h.get_by_role(Role::MultilineTextInput).is_focused(), "the script still has the focus");
     }
 
+    /// New empties the script as a step of its own, and so does Load file:
+    /// after what was typed into the new script, ⌘Z brings the script
+    /// before back; ⇧⌘Z replaces it again.
+    #[test]
+    fn new_and_load_file_can_be_undone() {
+        use crate::test_support::{press, type_in};
+        use egui::Modifiers as M;
+        use egui_kittest::kittest::Queryable;
+        let mut h = shell_harness(APPLES);
+        h.get_by_label(&format!("{}  New", icon::FILE)).click();
+        h.run_steps(2);
+        assert_eq!(h.state().tab.editor.text, "");
+        caret_after(&mut h, "");
+        type_in(&mut h, "x");
+        press(&mut h, M::COMMAND, Key::Z);
+        assert_eq!(h.state().tab.editor.text, "", "⌘Z undid the typing");
+        press(&mut h, M::COMMAND, Key::Z);
+        assert_eq!(h.state().tab.editor.text, APPLES, "⌘Z after New");
+        h.state_mut().tab.editor.set_text("print(1)\n".into(), None);
+        h.run_steps(2);
+        press(&mut h, M::COMMAND, Key::Z);
+        assert_eq!(h.state().tab.editor.text, APPLES, "⌘Z after Load file");
+        press(&mut h, M::COMMAND | M::SHIFT, Key::Z);
+        assert_eq!(h.state().tab.editor.text, "print(1)\n", "⇧⌘Z loads it again");
+    }
+
+    /// Undoing Load file puts the tab's file back as it was (none, or the
+    /// file loaded before), so ⌘S never saves the old script over the file
+    /// just loaded; redoing loads its file again, and the toolbar names
+    /// whichever it is. Undoing New brings the file back too.
+    #[test]
+    fn undoing_load_file_or_new_puts_the_file_back() {
+        use crate::test_support::{TempDir, press};
+        use egui::Modifiers as M;
+        use egui_kittest::kittest::Queryable;
+        let dir = TempDir::new();
+        let (a, b) = (dir.0.join("a.js"), dir.0.join("b.js"));
+        std::fs::write(&a, "print(\"a\")\n").unwrap();
+        std::fs::write(&b, "print(\"b\")\n").unwrap();
+        let mut h = shell_harness("");
+        let file = |h: &egui_kittest::Harness<'_, ShellProbe>| h.state().tab.editor.file().map(std::path::Path::to_path_buf);
+        h.state_mut().tab.load(a.clone());
+        h.run_steps(2);
+        h.state_mut().tab.load(b.clone());
+        h.run_steps(2);
+        assert_eq!(file(&h), Some(b.clone()));
+        caret_after(&mut h, "");
+        press(&mut h, M::COMMAND, Key::Z);
+        assert_eq!((h.state().tab.editor.text.as_str(), file(&h)), ("print(\"a\")\n", Some(a.clone())), "the file loaded before");
+        assert!(drawn(&h).iter().any(|t| t == "a.js"), "the toolbar names it");
+        press(&mut h, M::COMMAND | M::SHIFT, Key::Z);
+        assert_eq!((h.state().tab.editor.text.as_str(), file(&h)), ("print(\"b\")\n", Some(b.clone())), "redone: the loaded file again");
+        press(&mut h, M::COMMAND, Key::Z);
+        // ⌘S saves the script on screen to its own file, not the one loaded after it.
+        // Typed where the caret was when b.js was loaded: a.js's end.
+        type_in_script(&mut h, "edited");
+        press(&mut h, M::COMMAND, Key::S);
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "print(\"a\")\nedited");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "print(\"b\")\n", "the loaded file is left alone");
+        press(&mut h, M::COMMAND, Key::Z);
+        press(&mut h, M::COMMAND, Key::Z);
+        assert_eq!((h.state().tab.editor.text.as_str(), file(&h)), ("", None), "before any Load file: no file");
+
+        // New, then ⌘Z: the file comes back.
+        h.state_mut().tab.load(b.clone());
+        h.run_steps(2);
+        h.get_by_label(&format!("{}  New", icon::FILE)).click();
+        h.run_steps(2);
+        assert_eq!(file(&h), None);
+        caret_after(&mut h, "");
+        press(&mut h, M::COMMAND, Key::Z);
+        assert_eq!((h.state().tab.editor.text.as_str(), file(&h)), ("print(\"b\")\n", Some(b.clone())), "New undone: the file back");
+        assert!(drawn(&h).iter().any(|t| t == "b.js"), "the toolbar names it");
+    }
+
+    /// ⌘Z right after New or Load file undoes it, without a click back into
+    /// the script first: a click on New takes the keyboard from the script,
+    /// and Load file's dialog leaves it elsewhere, so both give it back.
+    #[test]
+    fn cmd_z_right_after_new_or_load_file_undoes_it() {
+        use crate::test_support::{TempDir, press};
+        use egui::Modifiers as M;
+        use egui_kittest::kittest::Queryable;
+        let mut h = shell_harness(APPLES);
+        caret_after(&mut h, "");
+        // A pointer click on New, as the mouse makes it.
+        let at = h.get_by_label(&format!("{}  New", icon::FILE)).rect().center();
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: M::NONE };
+        h.event(egui::Event::PointerMoved(at));
+        h.run_steps(1);
+        h.event(button(true));
+        h.run_steps(1);
+        h.event(button(false));
+        h.run_steps(2);
+        assert_eq!(h.state().tab.editor.text, "", "New");
+        press(&mut h, M::COMMAND, Key::Z);
+        assert_eq!(h.state().tab.editor.text, APPLES, "⌘Z at once after New");
+
+        let dir = TempDir::new();
+        let b = dir.0.join("b.js");
+        std::fs::write(&b, "print(\"b\")\n").unwrap();
+        h.ctx.memory_mut(|m| m.surrender_focus(script_id()));
+        h.run_steps(1);
+        h.state_mut().tab.load(b);
+        h.run_steps(2);
+        assert_eq!(h.state().tab.editor.text, "print(\"b\")\n", "Load file");
+        press(&mut h, M::COMMAND, Key::Z);
+        assert_eq!(h.state().tab.editor.text, APPLES, "⌘Z at once after Load file");
+    }
+
+    /// Types `text` into the script at its caret (focusing it first).
+    fn type_in_script(h: &mut egui_kittest::Harness<'_, ShellProbe>, text: &str) {
+        use egui_kittest::kittest::Queryable;
+        h.get_by_role(egui::accesskit::Role::MultilineTextInput).focus();
+        h.run_steps(2);
+        crate::test_support::type_in(h, text);
+    }
+
     /// A script that replaces another (Load file, New) is found from its
     /// first match, wherever the old one was scrolled to.
     #[test]
@@ -1206,7 +1328,7 @@ mod tests {
         press(&mut h, M::NONE, Key::Enter);
         h.run_steps(3);
         assert_eq!(find_count(&h).as_deref(), Some("2 of 2"), "scrolled to the end");
-        h.state_mut().tab.editor.set_text("zebra\n".repeat(1000));
+        h.state_mut().tab.editor.set_text("zebra\n".repeat(1000), None);
         h.run_steps(3);
         assert_eq!(find_count(&h).as_deref(), Some("1 of 1,000"), "Load file starts at the first match");
     }

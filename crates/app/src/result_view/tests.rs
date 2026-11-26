@@ -48,15 +48,138 @@ fn drilling_tracks_paths() {
     assert_eq!(paths(&v), [(0, "cfg.deep".to_string())]);
 }
 
+/// Step Into Column is the same field of every row, an object's or an
+/// array's (Studio 3T's); Step Into Cell is one row's value: an array's
+/// elements as rows, or an object as one row.
 #[test]
 fn step_into_picks_the_right_step() {
     let mut v = view(vec![doc! { "o": { "a": 1 }, "arr": [1, 2], "s": "x" }]);
     assert!(!v.step_into(0, "s", false));
     assert!(v.step_into(0, "arr", false));
+    assert_eq!(v.drill, [Step::Field("arr".into())]);
+    v.set_drill(Vec::new());
+    assert!(v.step_into(0, "arr", true));
     assert_eq!(v.drill, [Step::Elements { row: 0, doc: DocKey { place: 0, id: None }, field: "arr".into() }]);
+    v.set_drill(Vec::new());
+    assert!(v.step_into(0, "o", false));
+    assert_eq!(v.drill, [Step::Field("o".into())]);
     v.set_drill(Vec::new());
     assert!(v.step_into(0, "o", true));
     assert_eq!(v.drill, [Step::Cell { row: 0, doc: DocKey { place: 0, id: None }, field: "o".into() }]);
+}
+
+/// The cells of a drill level's row `i`, column by column (`None`: empty).
+fn level_cells(v: &ResultView, i: usize) -> Vec<(String, Option<Bson>)> {
+    let rows = v.resolved();
+    let row = rows.get(i).expect("the row");
+    compute_columns(&rows).into_iter().map(|c| {
+        let cell = cell_in(row.value, &c).cloned();
+        (c, cell)
+    }).collect()
+}
+
+/// Stepped into as a column, an array is a row per document, its
+/// elements in columns 0, 1, … up to the longest array; a shorter
+/// array's missing index is an empty cell. The rows' path is the
+/// array's, so a cell's is `gameType.1`.
+#[test]
+fn an_array_column_steps_in_as_index_columns() {
+    let s = |t: &str| Some(Bson::String(t.into()));
+    let mut v = view(vec![
+        doc! { "_id": 1, "gameType": ["POKER"] },
+        doc! { "_id": 2, "gameType": ["LUCKY", "WHEEL"] },
+        doc! { "_id": 3, "gameType": [] },
+    ]);
+    assert!(v.step_into(0, "gameType", false));
+    assert_eq!(v.resolved().len(), 3, "a row per document");
+    assert_eq!(compute_columns(&v.resolved()), ["0", "1"]);
+    assert_eq!(level_cells(&v, 0), [("0".to_string(), s("POKER")), ("1".to_string(), None)]);
+    assert_eq!(level_cells(&v, 1), [("0".to_string(), s("LUCKY")), ("1".to_string(), s("WHEEL"))]);
+    assert_eq!(level_cells(&v, 2), [("0".to_string(), None), ("1".to_string(), None)]);
+    assert_eq!(paths(&v), [(0, "gameType".to_string()), (1, "gameType".to_string()), (2, "gameType".to_string())]);
+    v.selection.selected = BTreeSet::from([1]);
+    v.selection.anchor = Some(1);
+    v.selection.selected_col = Some("1".into());
+    assert_eq!(v.selected_field(), Some(("gameType.1".to_string(), Bson::String("WHEEL".into()))));
+}
+
+/// Values of several kinds at one level: `(value)` (the scalars) first,
+/// then the objects' keys in the order first seen, then the arrays'
+/// indices in order. A key that reads as an index is one column.
+#[test]
+fn mixed_values_give_value_keys_then_indices() {
+    let mut v = view(vec![doc! { "x": [1, 2, 3] }, doc! { "x": 5 }, doc! { "x": { "b": 1, "a": 2 } }, doc! { "x": { "c": 1, "0": "zero" } }]);
+    v.drill = vec![Step::Field("x".into())];
+    assert_eq!(compute_columns(&v.resolved()), ["(value)", "b", "a", "c", "0", "1", "2"]);
+    assert_eq!(level_cells(&v, 0)[0], ("(value)".to_string(), None), "an array is not a value of its own");
+    assert_eq!(level_cells(&v, 1)[0], ("(value)".to_string(), Some(Bson::Int32(5))));
+    assert_eq!(level_cells(&v, 3)[4], ("0".to_string(), Some(Bson::String("zero".into()))), "the object's own \"0\"");
+    assert_eq!(level_cells(&v, 0)[4], ("0".to_string(), Some(Bson::Int32(1))), "the array's element 0");
+}
+
+/// An element stepped into as a column (`items`, then `0`) shows that
+/// element's fields for every document: its rows' path is `items.0`, a
+/// cell's `items.0.name`. A document whose array has no such element has
+/// a null row, as a missing field does. Step Into Cell works inside one
+/// too.
+#[test]
+fn an_element_column_steps_in_to_its_fields() {
+    let mut v = view(vec![
+        doc! { "_id": 1, "items": [{ "name": "a", "qty": 1, "meta": { "k": 1 } }, { "name": "b" }] },
+        doc! { "_id": 2, "items": [{ "name": "c", "price": 3 }] },
+        doc! { "_id": 3, "items": [] },
+    ]);
+    assert!(v.step_into(0, "items", false));
+    assert_eq!(compute_columns(&v.resolved()), ["0", "1"]);
+    assert!(v.step_into(0, "0", false), "an element that is an object steps in");
+    assert_eq!(v.drill, [Step::Field("items".into()), Step::Field("0".into())]);
+    assert_eq!(compute_columns(&v.resolved()), ["(value)", "name", "qty", "meta", "price"]);
+    assert_eq!(paths(&v), [(0, "items.0".to_string()), (1, "items.0".to_string()), (2, "items.0".to_string())]);
+    assert_eq!(v.resolved().get(2).map(|r| r.value.clone()), Some(Bson::Null), "no element 0");
+    v.selection.selected = BTreeSet::from([1]);
+    v.selection.anchor = Some(1);
+    v.selection.selected_col = Some("name".into());
+    assert_eq!(v.selected_field(), Some(("items.0.name".to_string(), Bson::String("c".into()))));
+    assert_eq!(v.shared_prefix().as_deref(), Some("items.0"), "the header sort's paths");
+
+    // Step Into Cell on a field of an element stepped into as a column.
+    assert!(v.step_into(0, "meta", true));
+    assert_eq!(paths(&v), [(0, "items.0.meta".to_string())]);
+    assert_eq!(v.resolved().get(0).map(|r| r.value.clone()), Some(Bson::Document(doc! { "k": 1 })));
+
+    // And on an element (an object) from the array's level.
+    v.set_drill(vec![Step::Field("items".into())]);
+    assert!(v.step_into(0, "1", true));
+    assert!(matches!(v.drill.as_slice(), [Step::Field(_), Step::Cell { row: 0, field, .. }] if field == "1"), "{:?}", v.drill);
+    assert_eq!(paths(&v), [(0, "items.1".to_string())]);
+    assert_eq!(v.resolved().get(0).map(|r| r.value.clone()), Some(Bson::Document(doc! { "name": "b" })));
+}
+
+/// An array has only its elements: a field step by a name that is not an
+/// index leaves out the rows where the value is an array, as it does a
+/// scalar (no null row whose path the server would refuse to write). An
+/// index step gives each array's element, null where it is missing, and
+/// null for an object without that key.
+#[test]
+fn only_an_index_steps_into_an_array() {
+    let mut v = view(vec![doc! { "x": { "name": { "first": "a" } } }, doc! { "x": [1, 2] }, doc! { "x": 5 }, doc! { "x": [] }]);
+    v.drill = vec![Step::Field("x".into()), Step::Field("name".into())];
+    assert_eq!(paths(&v), [(0, "x.name".to_string())]);
+    v.drill = vec![Step::Field("x".into()), Step::Field("0".into())];
+    assert_eq!(paths(&v), [(0, "x.0".to_string()), (1, "x.0".to_string()), (3, "x.0".to_string())]);
+    let values: Vec<Bson> = (0..3).filter_map(|i| v.resolved().get(i).map(|r| r.value.clone())).collect();
+    assert_eq!(values, [Bson::Null, Bson::Int32(1), Bson::Null]);
+}
+
+/// Step Into Cell on an array is still that row's elements as rows,
+/// each at its own index.
+#[test]
+fn step_into_cell_on_an_array_lists_its_elements() {
+    let mut v = view(vec![doc! { "_id": 1, "gameType": ["POKER"] }, doc! { "_id": 2, "gameType": ["LUCKY", "WHEEL"] }]);
+    assert!(v.step_into(1, "gameType", true));
+    assert!(matches!(v.drill.as_slice(), [Step::Elements { row: 1, .. }]));
+    assert_eq!(paths(&v), [(1, "gameType.0".to_string()), (1, "gameType.1".to_string())]);
+    assert_eq!(compute_columns(&v.resolved()), ["(value)"]);
 }
 
 #[test]
@@ -75,6 +198,99 @@ fn copy_selection_as_csv_and_for_excel() {
     assert_eq!(v.selection_text('\t', true).lines().next(), Some("name\t_id\tf\t'=1+1"), "a formula-like column name is defused in the header");
     v.selection.selected.clear();
     assert_eq!(v.selection_text(',', true), "name,_id,f,'=1+1", "no rows: just the header");
+}
+
+/// At a drilled level, Copy › Selected as CSV and for Excel start with
+/// the `{Document id}` column: each row's document's `_id`, on a column
+/// step's level and on one row's elements alike. The top level has none.
+#[test]
+fn copied_drilled_rows_start_with_the_document_id() {
+    let mut v = view(vec![
+        doc! { "_id": 1, "gameName": { "en": "Dragon", "th": "มังกร" }, "tags": ["x"] },
+        doc! { "_id": "two", "gameName": { "en": "Wheel" }, "tags": ["a", "b"] },
+    ]);
+    v.selection.selected = BTreeSet::from([0, 1]);
+    assert!(v.selection_text(',', true).starts_with("_id,gameName,tags\n"), "{}", v.selection_text(',', true));
+    v.set_drill(vec![Step::Field("gameName".into())]);
+    v.selection.selected = BTreeSet::from([0, 1]);
+    assert_eq!(v.selection_text(',', true), "{Document id},en,th\n1,Dragon,มังกร\ntwo,Wheel,");
+    assert_eq!(v.selection_text('\t', false), "1\tDragon\tมังกร\ntwo\tWheel\t");
+    // Hidden and moved columns leave it first.
+    v.columns(&Rows::new(&v.rows.clone(), v.level()));
+    v.move_column("th", Some("en"));
+    v.hidden_mut().insert("en".into());
+    assert_eq!(v.selection_text(',', true), "{Document id},th\n1,มังกร\ntwo,");
+    v.set_drill(vec![Step::Elements { row: 1, doc: DocKey { place: 1, id: Some(Bson::String("two".into())) }, field: "tags".into() }]);
+    v.selection.selected = BTreeSet::from([0, 1]);
+    assert_eq!(v.selection_text(',', true), "{Document id},(value)\ntwo,a\ntwo,b");
+}
+
+/// The columns a table lays out are those in view and one more each
+/// side; a spacer stands for those before and one for those after, as
+/// wide as they are with the gaps between them, so each column laid out
+/// starts where it would with them all.
+#[test]
+fn the_table_lays_out_the_columns_in_view() {
+    // Column k spans 110k..110k + 100.
+    let w = [100.0; 10];
+    let at = |from: f32, to: f32| {
+        let v = Window::of(&w, 10.0, egui::Rangef::new(from, to));
+        (v.lo, v.hi, v.left, v.right)
+    };
+    assert_eq!(at(0.0, 250.0), (0, 4, 0.0, 650.0), "0 to 2 in view, and 3");
+    assert_eq!(at(335.0, 500.0), (2, 6, 210.0, 430.0), "3 and 4 in view, and 2 and 5");
+    assert_eq!(at(5_000.0, 5_500.0), (9, 10, 980.0, 0.0), "past the end: the last column");
+    assert_eq!(at(0.0, 2_000.0), (0, 10, 0.0, 0.0), "all in view: no spacer");
+    let none = Window::of(&[], 10.0, egui::Rangef::new(0.0, 500.0));
+    assert_eq!((none.lo, none.hi, none.left, none.right), (0, 0, 0.0, 0.0));
+
+    // Columns of all widths, the view anywhere: the first column laid out
+    // starts where it would with them all, the spacer after the last one
+    // ends where the table does, and the columns laid out cover the view.
+    let (w, gap): (Vec<f32>, f32) = ((0..30).map(|k| 40.0 + (k * 37 % 200) as f32).collect(), 7.0);
+    let starts: Vec<f32> = w.iter().scan(0.0, |x, w| {
+        let start = *x;
+        *x += w + gap;
+        Some(start)
+    }).collect();
+    let table_end = starts[29] + w[29];
+    for from in (0..80).map(|i| i as f32 * 97.0 - 300.0) {
+        let view = egui::Rangef::new(from, from + 500.0);
+        let v = Window::of(&w, gap, view);
+        assert!(v.lo < v.hi, "{from}: something laid out");
+        let first = if v.lo == 0 { 0.0 } else { v.left + gap };
+        assert_eq!(first, starts[v.lo], "{from}: column {} starts after the spacer", v.lo);
+        let last_end = starts[v.hi - 1] + w[v.hi - 1];
+        let end = if v.hi == w.len() { last_end } else { last_end + gap + v.right };
+        assert_eq!(end, table_end, "{from}: the table ends where it would");
+        assert!(starts[v.lo] <= view.min.max(0.0) && last_end >= view.max.min(table_end), "{from}: {}..{} covers the view", v.lo, v.hi);
+    }
+}
+
+/// A document without an `_id` has an empty `{Document id}` cell.
+#[test]
+fn a_document_without_an_id_has_an_empty_document_id() {
+    let mut v = view(vec![doc! { "o": { "x": "y" } }, doc! { "_id": 2, "o": { "x": "z" } }]);
+    v.set_drill(vec![Step::Field("o".into())]);
+    let rows = v.resolved();
+    assert_eq!(rows.get(0).and_then(|r| rows.cell(r, "{Document id}")), None);
+    assert_eq!(rows.get(1).and_then(|r| rows.cell(r, "{Document id}")), Some(&Bson::Int32(2)));
+    drop(rows);
+    v.selection.selected = BTreeSet::from([0, 1]);
+    assert_eq!(v.selection_text(',', true), "{Document id},x\n,y\n2,z");
+}
+
+/// A real field named `{Document id}` is a column like any other at the
+/// top level; at a drilled level the table shows one `{Document id}`, the
+/// document's `_id` (README, Limitations).
+#[test]
+fn a_field_named_document_id_gives_way_when_drilled() {
+    let mut v = view(vec![doc! { "_id": 1, "{Document id}": "TOP", "o": { "{Document id}": "REAL", "x": "y" } }]);
+    v.selection.selected = BTreeSet::from([0]);
+    assert_eq!(v.selection_text(',', true).lines().collect::<Vec<_>>(), ["_id,{Document id},o", "1,TOP,\"{\"\"{Document id}\"\":\"\"REAL\"\",\"\"x\"\":\"\"y\"\"}\""]);
+    v.set_drill(vec![Step::Field("o".into())]);
+    v.selection.selected = BTreeSet::from([0]);
+    assert_eq!(v.selection_text(',', true), "{Document id},x\n1,y");
 }
 
 /// Copied documents paste back as the same BSON: one document or many,

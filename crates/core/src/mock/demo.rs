@@ -31,15 +31,22 @@ db.orders.aggregate([
 /// the `test-data` feature, which the app's tests turn on.
 const TESTING: bool = cfg!(any(test, feature = "test-data"));
 
+/// Whether this process hands out the test data. `RONGO_DEMO_DATA` set
+/// makes a test build serve the demo instead, for the README's
+/// screenshots (`readme_screenshots`); a release build never reads it.
+fn testing() -> bool {
+    TESTING && std::env::var_os("RONGO_DEMO_DATA").is_none()
+}
+
 /// What the demo connection serves.
 pub fn served() -> MockStore {
-    if TESTING { MockStore::test_data() } else { MockStore::demo() }
+    if testing() { MockStore::test_data() } else { MockStore::demo() }
 }
 
 /// The database the demo's IntelliShell tab opens on and the script in
 /// it, for the data `served` hands out.
 pub fn served_shell() -> (&'static str, &'static str) {
-    if TESTING { (super::TEST_DB, super::TEST_SCRIPT) } else { (DEMO_DB, DEMO_SCRIPT) }
+    if testing() { (super::TEST_DB, super::TEST_SCRIPT) } else { (DEMO_DB, DEMO_SCRIPT) }
 }
 
 const FIRST: [&str; 10] = ["Alice", "Ben", "Chloe", "Daniel", "Emma", "Felix", "Grace", "Hugo", "Iris", "Jack"];

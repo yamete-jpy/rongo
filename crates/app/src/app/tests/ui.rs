@@ -295,6 +295,55 @@ fn ui_tour() {
     }
 }
 
+/// The README's screenshots, drawn from the demo data (`--mock`'s shop and
+/// blog) at twice the size for sharp text:
+/// `RONGO_DEMO_DATA=1 RONGO_SCREENSHOT_DIR=$PWD/assets/screenshots cargo test -p rongo -- --ignored readme_screenshots`
+/// from the repository's root (a whole path: the test runs in crates/app).
+#[test]
+#[ignore = "draws the README's screenshots: needs RONGO_DEMO_DATA and RONGO_SCREENSHOT_DIR"]
+fn readme_screenshots() {
+    use egui_kittest::Harness;
+    assert!(std::env::var_os("RONGO_DEMO_DATA").is_some(), "set RONGO_DEMO_DATA=1, so the demo connection serves the demo data, not the tests'");
+    let dir = std::path::PathBuf::from(std::env::var("RONGO_SCREENSHOT_DIR").expect("RONGO_SCREENSHOT_DIR"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 760.0)).with_pixels_per_point(2.0).wgpu().build_eframe(|cc| RongoApp::new(cc, runtime(true), true));
+    let settle = |h: &mut Harness<RongoApp>, ms: u64| {
+        let end = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < end {
+            h.step();
+            std::thread::sleep(Duration::from_millis(16));
+        }
+    };
+    let shot = |h: &mut Harness<RongoApp>, name: &str| {
+        h.step();
+        let img = h.render().expect("render");
+        img.save(dir.join(format!("{name}.png"))).unwrap();
+    };
+    // The demo opens on IntelliShell and runs its sample script.
+    settle(&mut h, 2500);
+    shot(&mut h, "shell");
+
+    let cid = ConnectionProfile::mock().conn_id();
+    h.state_mut().tree_action(TreeAction::OpenCollectionTab(cid, Namespace::new("shop", "customers")));
+    settle(&mut h, 1200);
+    let view = |h: &mut Harness<RongoApp>, f: &dyn Fn(&mut crate::result_view::ResultView)| {
+        let app = h.state_mut();
+        let i = app.active_tab;
+        if let TabKind::Collection(c) = &mut app.tabs[i].kind {
+            f(&mut c.view);
+        }
+    };
+    // Row 10 is a customer with three tags.
+    view(&mut h, &|v| v.select_rows(&[10]));
+    settle(&mut h, 300);
+    shot(&mut h, "table");
+
+    // Every customer's tags, one column per element, row 10's first tag selected.
+    view(&mut h, &|v| assert!(v.step_into_and_select(10, "tags", "0"), "tags is an array to step into"));
+    settle(&mut h, 600);
+    shot(&mut h, "drill");
+}
+
 /// Run the whole app (demo server, theme, sidebar, shell results, a
 /// collection tab) and check that, with no input, nothing on screen moves
 /// from one frame to the next. Two splitters used to creep a pixel or so
@@ -656,4 +705,60 @@ fn previous_and_next_tab_go_by_the_bracket_keys() {
     assert_eq!(press(&mut app, Key::CloseCurlyBracket, Key::CloseBracket), 0, "Windows, US layout: Ctrl+Shift+]");
     assert_eq!(press(&mut app, Key::Comma, Key::CloseBracket), 1, "Thai layout: Ctrl+Shift+]");
     assert!(app.settings_dialog.is_none(), "the Thai Ctrl+Shift+] opened Settings");
+}
+
+/// In a collection tab, an array double-clicked steps in as columns 0,
+/// 1, …; Field › Edit Value… on a cell there edits that element: it saves
+/// a `$set` of `gameType.0`, the server's document has it, and the
+/// drilled table shows it.
+#[test]
+fn edit_value_on_an_element_column_sets_that_element() {
+    let (ctx, mut app, cid) = connected_mock_app();
+    let ns = Namespace::new("demo-games", "drill_games");
+    let docs = vec![doc! { "_id": 1, "name": "Dragon", "gameType": ["POKER"] }, doc! { "_id": 2, "name": "Wheel", "gameType": ["LUCKY", "WHEEL"] }];
+    app.net().send(Origin::Notify { view: None, tree: None }, Some(cid), Command::InsertMany { ns: ns.clone(), docs });
+    step_until(&ctx, &mut app, "the documents are inserted", writes_done);
+    app.open_collection(cid, ns.clone());
+    let view = match &app.tabs[app.active_tab].kind {
+        TabKind::Collection(c) => c.view.id,
+        _ => unreachable!(),
+    };
+    step_until(&ctx, &mut app, "the page is shown", |a| a.tabs.iter().any(|t| matches!(&t.kind, TabKind::Collection(c) if c.view.id == view && c.view.shown().is_some_and(|d| d.len() == 2))));
+
+    // Double-click Wheel's gameType: every document's elements as columns.
+    let mut frame = eframe::Frame::_new_kittest();
+    let mut at = None;
+    for _ in 0..3 {
+        let mut out = ctx.run_ui(frame_input(), |ui| eframe::App::ui(&mut app, ui, &mut frame));
+        out.textures_delta.clear();
+        at = text_shapes(&out).find(|t| t.galley.text() == "[ 2 elements ]").map(|t| t.galley.rect.translate(t.pos.to_vec2()).center());
+    }
+    let at = at.expect("Wheel's gameType is drawn");
+    let press = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+    for events in [vec![egui::Event::PointerMoved(at)], vec![press(true)], vec![press(false)], vec![press(true)], vec![press(false)], vec![]] {
+        ctx.run_ui(egui::RawInput { events, ..frame_input() }, |ui| eframe::App::ui(&mut app, ui, &mut frame)).textures_delta.clear();
+    }
+    let texts = drawn_texts(&ctx, &mut app);
+    assert!(["{Document id}", "0", "1", "POKER", "LUCKY", "WHEEL"].iter().all(|t| texts.iter().any(|s| s == t)), "stepped in as columns: {texts:?}");
+
+    // Right-click LUCKY (Wheel's element 0): Field › Edit Value….
+    click_text_with(&ctx, &mut app, "LUCKY", egui::PointerButton::Secondary, |t| t == "LUCKY");
+    click_text(&ctx, &mut app, "the Field menu", |t| t.ends_with("  Field"));
+    click_text(&ctx, &mut app, "Edit Value…", |t| t == "Edit Value…");
+    let tool = app.tool.as_mut().expect("Edit Value opens");
+    match &mut tool.kind {
+        ToolKind::Value { path, id, text, .. } => {
+            assert_eq!((path.as_str(), &*id), ("gameType.0", &Bson::Int32(2)));
+            *text = "\"SPIN\"".into();
+        }
+        _ => panic!("not the Edit Value dialog"),
+    }
+    let cmd = tool.build().unwrap();
+    assert!(matches!(&cmd, Command::UpdateMany { update, .. } if *update == doc! { "$set": { "gameType.0": "SPIN" } }), "{cmd:?}");
+    app.tool_send(cmd);
+    step_until(&ctx, &mut app, "the value is saved and the document read again", |a| writes_done(a) && a.tool.is_none() && !a.requests.pending.values().any(|s| matches!(s.origin, Origin::View(..))));
+    let saved = find_docs(&app, cid, &ns, doc! { "_id": 2 });
+    assert_eq!(saved[0].get_array("gameType").unwrap(), &vec![Bson::String("SPIN".into()), Bson::String("WHEEL".into())], "only that element changed");
+    let texts = drawn_texts(&ctx, &mut app);
+    assert!(texts.iter().any(|t| t == "SPIN") && !texts.iter().any(|t| t == "LUCKY"), "the drilled table shows it: {texts:?}");
 }

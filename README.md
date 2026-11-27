@@ -1,4 +1,8 @@
-# rongo
+<p align="center">
+  <img src="assets/icon-1024.png" width="128" height="128" alt="rongo's icon: a green leaf">
+</p>
+
+<h1 align="center">rongo</h1>
 
 A fast desktop MongoDB client for macOS and Windows, written in Rust. If you have used Studio 3T, it will feel familiar: a connection manager, a database tree, collection tabs with Table, Tree and JSON views, a document editor, and an IntelliShell-style JavaScript shell.
 

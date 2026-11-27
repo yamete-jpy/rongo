@@ -133,6 +133,9 @@ pub struct RongoApp {
     /// Where the Operations panel began last frame (its header, folded),
     /// while the sidebar shows: the corner floats above it.
     ops_top: Option<f32>,
+    /// The pointer move macOS reports in the wrong place after a press in
+    /// full screen on another display, dropped before egui sees it.
+    stray_moves: crate::stray_move::StrayMoves,
     /// Tests: the app's own folder (connections, settings, history, vault),
     /// removed with the app.
     #[cfg(test)]
@@ -235,6 +238,7 @@ impl RongoApp {
             ops: Operations::default(),
             revealing: None,
             ops_top: None,
+            stray_moves: Default::default(),
             #[cfg(test)]
             _temp: temp,
         };
@@ -342,6 +346,10 @@ fn initial_vault(paths: &AppPaths, _store: Option<&ProfileStore>) -> (Option<Arc
 }
 
 impl eframe::App for RongoApp {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.stray_moves.filter(&mut raw_input.events);
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         // What the last frame's dialogs sent goes into the Operations log.
         self.log_sent();

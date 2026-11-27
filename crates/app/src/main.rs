@@ -21,6 +21,7 @@ mod result_view;
 mod settings;
 mod shortcut;
 mod sidebar;
+mod stray_move;
 mod tabs;
 #[cfg(test)]
 mod test_support;

@@ -344,6 +344,45 @@ fn readme_screenshots() {
     shot(&mut h, "drill");
 }
 
+/// In full screen on a display other than the main one, macOS follows a
+/// press near the window's top with one move far off (logged on a 34"
+/// display above a MacBook: a press on Connect at (66, 26), then a move to
+/// (1778, 1143), under the table's rows). Through the app's input filter,
+/// Connect still opens its menu, and the table there selects nothing.
+#[test]
+fn connect_clicks_through_the_full_screen_stray_move() {
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+    let mut h = harness(egui::vec2(3440.0, 1440.0), true);
+    let cid = ConnectionProfile::mock().conn_id();
+    harness_until(&mut h, "the demo connects and the sample script ends", |a| {
+        matches!(a.conns.get(&cid).map(|c| &c.status), Some(Status::Connected(_)))
+            && a.requests.pending.is_empty()
+            && a.tabs.iter().all(|t| !matches!(&t.kind, TabKind::Shell(s) if s.run_when_ready || s.is_running()))
+    });
+    h.state_mut().tree_action(TreeAction::OpenCollectionTab(cid, Namespace::new("demo-games", "providers")));
+    harness_until(&mut h, "the collection's first page", |a| a.requests.pending.is_empty());
+    assert!(h.get_by_label_contains("Connect  ").rect().contains(egui::pos2(66.0, 26.0)), "the press is on Connect");
+
+    // What eframe does with each frame's events: the app's hook, then egui.
+    let send = |h: &mut Harness<RongoApp>, mut events: Vec<egui::Event>| {
+        h.state_mut().stray_moves.filter(&mut events);
+        h.input_mut().events.extend(events);
+        h.step();
+    };
+    let at = |x, y| egui::Event::PointerMoved(egui::pos2(x, y));
+    let press = |pressed| egui::Event::PointerButton { pos: egui::pos2(66.0, 26.0), button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+    send(&mut h, vec![at(66.0, 26.0)]);
+    send(&mut h, vec![at(66.0, 26.0), press(true), at(1778.0, 1143.0)]);
+    send(&mut h, vec![at(66.0, 26.0), press(false)]);
+    h.run_steps(3);
+
+    assert!(h.query_by_label_contains("Connection Manager…").is_some(), "the Connect menu opened");
+    let app = h.state();
+    let TabKind::Collection(c) = &app.tabs[app.active_tab].kind else { panic!("the collection tab is in front") };
+    assert!(c.view.selected_rows().is_empty(), "no rows selected: {:?}", c.view.selected_rows());
+}
+
 /// Run the whole app (demo server, theme, sidebar, shell results, a
 /// collection tab) and check that, with no input, nothing on screen moves
 /// from one frame to the next. Two splitters used to creep a pixel or so
